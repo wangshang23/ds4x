@@ -373,6 +373,118 @@ cleanup:
     return rc;
 }
 
+static int check_packed_batch_attention_exact_parity(void) {
+    const uint32_t n_tokens = 29u;
+    const uint32_t pos0 = 3u;
+    const uint32_t n_head = 8u;
+    const uint32_t head_dim = 512u;
+    const uint32_t n_raw = pos0 + n_tokens;
+    const uint32_t n_comp = n_raw / 4u;
+    const uint64_t q_stride = (uint64_t)n_head * head_dim;
+    const uint64_t q_count = (uint64_t)n_tokens * q_stride;
+    const uint64_t raw_count = (uint64_t)n_raw * head_dim;
+    const uint64_t comp_count = (uint64_t)n_comp * head_dim;
+    float *sinks = calloc(n_head, sizeof(*sinks));
+    float *q_host = malloc((size_t)q_count * sizeof(*q_host));
+    float *raw_host = malloc((size_t)raw_count * sizeof(*raw_host));
+    float *comp_host = malloc((size_t)comp_count * sizeof(*comp_host));
+    float *ref_host = malloc((size_t)q_count * sizeof(*ref_host));
+    float *batch_host = malloc((size_t)q_count * sizeof(*batch_host));
+    if (!sinks || !q_host || !raw_host || !comp_host ||
+        !ref_host || !batch_host) return 1;
+
+    for (uint64_t i = 0; i < q_count; i++) q_host[i] = qat_value(i + 101u);
+    for (uint64_t i = 0; i < raw_count; i++) raw_host[i] = qat_value(i + 1009u);
+    for (uint64_t i = 0; i < comp_count; i++) comp_host[i] = qat_value(i + 10007u);
+
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *raw_src = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    ds4_gpu_tensor *comp_src = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(
+        (uint64_t)n_raw * DS4_SPARK_KV_ROW_BYTES);
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(
+        (uint64_t)n_comp * DS4_SPARK_KV_ROW_BYTES);
+    ds4_gpu_tensor *heads_ref = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *heads_batch = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    int rc = 1;
+    if (!q || !raw_src || !comp_src || !raw || !comp ||
+        !heads_ref || !heads_batch ||
+        !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(raw_src, 0, raw_host, raw_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(comp_src, 0, comp_host, comp_count * sizeof(float)) ||
+        !ds4_gpu_spark_pack_kv_rows_tensor(raw, 0, raw_src, 0, n_raw) ||
+        !ds4_gpu_spark_pack_kv_rows_tensor(comp, 0, comp_src, 0, n_comp)) {
+        goto cleanup;
+    }
+
+    setenv("DS4_CUDA_SPARK_PREFILL_EXACT", "1", 1);
+    if (!ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+            heads_batch, sinks, n_head * sizeof(float), 0,
+            q, raw, comp, DS4_GPU_CACHE_SPARK_KV, NULL, 0,
+            n_tokens, pos0, n_raw, n_raw, 0, n_comp,
+            128u, 4u, n_head, head_dim)) {
+        goto cleanup;
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t qpos = pos0 + t;
+        const uint32_t visible_comp = (qpos + 1u) / 4u;
+        ds4_gpu_tensor *q_row = ds4_gpu_tensor_view(
+            q, (uint64_t)t * q_stride * sizeof(float),
+            q_stride * sizeof(float));
+        ds4_gpu_tensor *head_row = ds4_gpu_tensor_view(
+            heads_ref, (uint64_t)t * q_stride * sizeof(float),
+            q_stride * sizeof(float));
+        if (!q_row || !head_row ||
+            !ds4_gpu_attention_decode_heads_tensor(
+                head_row, sinks, n_head * sizeof(float), 0,
+                q_row, raw, qpos + 1u, n_raw, 0,
+                comp, DS4_GPU_CACHE_SPARK_KV, visible_comp,
+                NULL, 0, n_head, head_dim)) {
+            ds4_gpu_tensor_free(head_row);
+            ds4_gpu_tensor_free(q_row);
+            goto cleanup;
+        }
+        ds4_gpu_tensor_free(head_row);
+        ds4_gpu_tensor_free(q_row);
+    }
+    if (!ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(heads_ref, 0, ref_host,
+                             q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(heads_batch, 0, batch_host,
+                             q_count * sizeof(float))) {
+        goto cleanup;
+    }
+
+    float max_abs = 0.0f;
+    double sum_sq = 0.0;
+    for (uint64_t i = 0; i < q_count; i++) {
+        const float delta = fabsf(ref_host[i] - batch_host[i]);
+        if (delta > max_abs) max_abs = delta;
+        sum_sq += (double)delta * delta;
+    }
+    fprintf(stderr,
+            "cuda-regression: packed batch exact max_abs=%g rmse=%g\n",
+            (double)max_abs, sqrt(sum_sq / (double)q_count));
+    rc = max_abs == 0.0f ? 0 : 1;
+
+cleanup:
+    unsetenv("DS4_CUDA_SPARK_PREFILL_EXACT");
+    ds4_gpu_tensor_free(heads_batch);
+    ds4_gpu_tensor_free(heads_ref);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(comp_src);
+    ds4_gpu_tensor_free(raw_src);
+    ds4_gpu_tensor_free(q);
+    free(batch_host);
+    free(ref_host);
+    free(comp_host);
+    free(raw_host);
+    free(q_host);
+    free(sinks);
+    return rc;
+}
+
 static int check_large_packed_indexer_zero(void) {
     const uint32_t n_comp = 262144u;
     const uint32_t n_head = 64u;
@@ -441,6 +553,7 @@ int main(void) {
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_b1_indexer_wmma() != 0) rc = 1;
     if (check_packed_attention_parity() != 0) rc = 1;
+    if (check_packed_batch_attention_exact_parity() != 0) rc = 1;
     if (check_large_packed_indexer_zero() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");

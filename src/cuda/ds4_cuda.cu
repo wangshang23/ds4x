@@ -17443,6 +17443,176 @@ __global__ static void spark_unpack_kv_rows_kernel(
         spark_kv_decode(packed, threadIdx.x + 256u);
 }
 
+static int spark_attention_exact_rows_launch(
+        int logical_tier,
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_f32,
+        const float *comp_f32,
+        const int32_t *topk,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head) {
+    if (!heads || !sinks || !q || !raw_f32 || n_tokens == 0u ||
+        n_raw == 0u || n_head == 0u || (n_comp != 0u && !comp_f32) ||
+        (topk && (top_k == 0u || top_k > 512u || ratio == 0u))) {
+        return 0;
+    }
+
+    const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    const uint32_t last_qpos = pos0 + n_tokens - 1u;
+    uint32_t last_raw_lo = first_raw_pos;
+    if (window != 0u && last_qpos + 1u > window) {
+        const uint32_t window_lo = last_qpos + 1u - window;
+        if (window_lo > last_raw_lo) last_raw_lo = window_lo;
+    }
+    const uint32_t max_raw_count = last_qpos - last_raw_lo + 1u;
+    uint32_t max_visible_comp = n_comp;
+    if (ratio != 0u) {
+        max_visible_comp = (last_qpos + 1u) / ratio;
+        if (max_visible_comp > n_comp) max_visible_comp = n_comp;
+    }
+    const uint32_t max_dense_comp = topk && max_visible_comp > top_k
+        ? top_k : max_visible_comp;
+    const uint32_t score_stride = max_raw_count + max_dense_comp;
+    if (score_stride <= 1u ||
+        score_stride > DS4_CUDA_ATTENTION_SCORE_CAP) {
+        return 0;
+    }
+
+    const uint32_t wave_cap = DS4_GPU_ATTENTION_DECODE_BATCH_MAX;
+    const uint64_t score_count =
+        (uint64_t)wave_cap * n_head * score_stride;
+    float *scores = (float *)cuda_tmp_alloc_on(
+        logical_tier, score_count * sizeof(float),
+        "Spark packed prefill exact rows");
+    if (!scores) return 0;
+
+    const size_t tile_shmem =
+        (size_t)(DS4_SCORE_TILE_HEADS + DS4_SCORE_TILE_ROWS) *
+        DS4_SCORE_TILE_STRIDE * sizeof(float);
+    static int tile_shmem_ready[DS4_MAX_GPUS] = {0};
+    int physical_device = 0;
+    if (cudaGetDevice(&physical_device) != cudaSuccess ||
+        physical_device < 0 || physical_device >= DS4_MAX_GPUS) {
+        return 0;
+    }
+    if (!tile_shmem_ready[physical_device]) {
+        if (!cuda_ok(cudaFuncSetAttribute(
+                attention_decode_score_split_scores_tile512_rows_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)tile_shmem),
+                "Spark packed prefill score rows shared-memory opt-in")) {
+            return 0;
+        }
+        tile_shmem_ready[physical_device] = 1;
+    }
+
+    const uint64_t q_stride = (uint64_t)n_head * 512u;
+    for (uint32_t wave0 = 0; wave0 < n_tokens; wave0 += wave_cap) {
+        const uint32_t wave_rows = n_tokens - wave0 < wave_cap
+            ? n_tokens - wave0 : wave_cap;
+        cuda_attention_decode_row_table table;
+        memset(&table, 0, sizeof(table));
+        uint32_t wave_max_dense_score = 0u;
+        bool have_dense = false;
+        bool have_indexed = false;
+
+        for (uint32_t i = 0; i < wave_rows; i++) {
+            const uint32_t t = wave0 + i;
+            const uint32_t qpos = pos0 + t;
+            uint32_t raw_lo = first_raw_pos;
+            if (window != 0u && qpos + 1u > window) {
+                const uint32_t window_lo = qpos + 1u - window;
+                if (window_lo > raw_lo) raw_lo = window_lo;
+            }
+            const uint32_t raw_count = qpos - raw_lo + 1u;
+            uint32_t visible_comp = n_comp;
+            if (ratio != 0u) {
+                visible_comp = (qpos + 1u) / ratio;
+                if (visible_comp > n_comp) visible_comp = n_comp;
+            }
+
+            ds4_gpu_attention_decode_row *row = &table.row[i];
+            row->raw_kv = (uint64_t)(uintptr_t)(
+                raw_f32 + (uint64_t)(raw_lo - first_raw_pos) * 512u);
+            row->comp_kv = (uint64_t)(uintptr_t)(
+                visible_comp ? comp_f32 : raw_f32);
+            row->n_raw = raw_count;
+            row->raw_cap = raw_count;
+            row->raw_start = 0u;
+            row->n_comp = visible_comp;
+
+            if (topk && visible_comp > top_k) {
+                row->topk = (uint64_t)(uintptr_t)(
+                    topk + (uint64_t)t * top_k);
+                row->pos = qpos;
+                row->top_k = top_k;
+                row->window = window;
+                row->ratio = ratio;
+                row->indexed = 1u;
+                have_indexed = true;
+            } else {
+                row->pos = raw_count - 1u;
+                row->ratio = 0u;
+                const uint32_t n_score = raw_count + visible_comp;
+                if (n_score <= 1u ||
+                    n_score > DS4_CUDA_ATTENTION_SCORE_CAP) {
+                    return 0;
+                }
+                if (n_score > wave_max_dense_score) {
+                    wave_max_dense_score = n_score;
+                }
+                have_dense = true;
+            }
+        }
+
+        float *wave_heads = heads + (uint64_t)wave0 * q_stride;
+        const float *wave_q = q + (uint64_t)wave0 * q_stride;
+        if (have_dense) {
+            dim3 score_grid(
+                (wave_max_dense_score + DS4_SCORE_TILE_ROWS - 1u) /
+                    DS4_SCORE_TILE_ROWS,
+                (n_head + DS4_SCORE_TILE_HEADS - 1u) /
+                    DS4_SCORE_TILE_HEADS,
+                wave_rows);
+            attention_decode_score_split_scores_tile512_rows_kernel
+                <<<score_grid, 256, tile_shmem>>>(
+                    scores, wave_q, table, wave_rows,
+                    score_stride, n_head, 512u);
+            if (!cuda_ok(cudaGetLastError(),
+                         "Spark packed prefill exact score rows launch")) {
+                return -1;
+            }
+            dim3 final_grid(wave_rows, n_head, 1u);
+            attention_decode_score_split_finalize_rows_kernel
+                <<<final_grid, 512>>>(
+                    wave_heads, sinks, scores, table, wave_rows,
+                    score_stride, n_head, 512u);
+            if (!cuda_ok(cudaGetLastError(),
+                         "Spark packed prefill exact finalize rows launch")) {
+                return -1;
+            }
+        }
+        if (have_indexed) {
+            dim3 indexed_grid(wave_rows, n_head, 1u);
+            attention_indexed_mixed_decode_rows_kernel<<<indexed_grid, 256>>>(
+                wave_heads, sinks, wave_q, table, wave_rows, n_head, 512u);
+            if (!cuda_ok(cudaGetLastError(),
+                         "Spark packed prefill exact indexed rows launch")) {
+                return -1;
+            }
+        }
+    }
+    return 1;
+}
+
 static int spark_attention_unpack_launch(
         int logical_tier,
         float *heads,
@@ -17523,6 +17693,128 @@ static int spark_indexed_attention_unpack_launch(
         1u, pos0, n_raw, n_raw, 0u, top_k, top_k,
         window, ratio, n_head, 512u);
     return cuda_ok(cudaGetLastError(), "Spark indexed attention launch") ? 1 : -1;
+}
+
+/* Prefill keeps the persistent rows packed but expands each layer's visible
+ * history once into reusable scratch. Multi-token attention reuses those
+ * mirrors; the optional exact mode uses grouped decode-order reductions.
+ * Scratch does not change the persistent cache ABI. */
+static int spark_attention_unpack_batch_launch(
+        int logical_tier,
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const unsigned char *raw_kv,
+        const unsigned char *comp_kv,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head) {
+    if (n_tokens <= 1u || n_raw == 0u || raw_cap < n_raw ||
+        raw_start >= raw_cap || (n_comp != 0u && !comp_kv)) {
+        return 0;
+    }
+    const uint64_t raw_bytes = (uint64_t)n_raw * 512u * sizeof(float);
+    const uint64_t comp_offset = tt_align256_u64(raw_bytes);
+    const uint64_t comp_bytes = (uint64_t)n_comp * 512u * sizeof(float);
+    unsigned char *scratch = (unsigned char *)tt_scratch_ensure(
+        comp_offset + (comp_bytes ? comp_bytes : 256u),
+        "allocate Spark packed prefill scratch");
+    if (!scratch) return 0;
+    float *raw_f32 = (float *)scratch;
+    float *comp_f32 = (float *)(scratch + comp_offset);
+    spark_unpack_kv_rows_kernel<<<n_raw, 256>>>(
+        raw_f32, raw_kv, NULL, n_raw, raw_cap, raw_start, 1u);
+    if (!cuda_ok(cudaGetLastError(), "unpack Spark prefill raw KV launch")) {
+        return -1;
+    }
+    if (n_comp != 0u) {
+        spark_unpack_kv_rows_kernel<<<n_comp, 256>>>(
+            comp_f32, comp_kv, NULL, n_comp, n_comp, 0u, 0u);
+        if (!cuda_ok(cudaGetLastError(),
+                     "unpack Spark prefill compressed KV launch")) {
+            return -1;
+        }
+    }
+    if (getenv("DS4_CUDA_SPARK_PREFILL_EXACT") == NULL) {
+        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1u);
+        attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>(
+            heads, sinks, q, raw_f32, n_comp ? comp_f32 : raw_f32,
+            n_tokens, pos0, n_raw, n_raw, 0u, n_comp, window, ratio,
+            n_head, 512u);
+        return cuda_ok(cudaGetLastError(),
+                       "Spark packed online prefill attention launch")
+            ? 1 : -1;
+    }
+    return spark_attention_exact_rows_launch(
+        logical_tier, heads, sinks, q, raw_f32,
+        n_comp ? comp_f32 : raw_f32, NULL,
+        n_tokens, pos0, n_raw, n_comp, 0u, window, ratio, n_head);
+}
+
+static int spark_indexed_attention_unpack_batch_launch(
+        int logical_tier,
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const unsigned char *raw_kv,
+        const unsigned char *comp_kv,
+        const int32_t *topk,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head) {
+    if (n_tokens <= 1u || n_raw == 0u || raw_cap < n_raw ||
+        raw_start >= raw_cap || n_comp == 0u || top_k == 0u ||
+        top_k > 512u || !comp_kv || !topk) {
+        return 0;
+    }
+    const uint64_t raw_bytes = (uint64_t)n_raw * 512u * sizeof(float);
+    const uint64_t comp_offset = tt_align256_u64(raw_bytes);
+    const uint64_t comp_bytes = (uint64_t)n_comp * 512u * sizeof(float);
+    unsigned char *scratch = (unsigned char *)tt_scratch_ensure(
+        comp_offset + comp_bytes,
+        "allocate Spark packed indexed prefill scratch");
+    if (!scratch) return 0;
+    float *raw_f32 = (float *)scratch;
+    float *comp_f32 = (float *)(scratch + comp_offset);
+    spark_unpack_kv_rows_kernel<<<n_raw, 256>>>(
+        raw_f32, raw_kv, NULL, n_raw, raw_cap, raw_start, 1u);
+    if (!cuda_ok(cudaGetLastError(),
+                 "unpack Spark indexed prefill raw KV launch")) {
+        return -1;
+    }
+    spark_unpack_kv_rows_kernel<<<n_comp, 256>>>(
+        comp_f32, comp_kv, NULL, n_comp, n_comp, 0u, 0u);
+    if (!cuda_ok(cudaGetLastError(),
+                 "unpack Spark indexed prefill compressed KV launch")) {
+        return -1;
+    }
+    if (getenv("DS4_CUDA_SPARK_PREFILL_EXACT") == NULL) {
+        dim3 grid(n_tokens, (n_head + 15u) / 16u, 1u);
+        attention_indexed_mixed_heads8_online_kernel<8, 16>
+            <<<grid, 512>>>(
+                heads, sinks, q, raw_f32, comp_f32, topk,
+                n_tokens, pos0, n_raw, n_raw, 0u, n_comp, top_k,
+                window, ratio, n_head, 512u);
+        return cuda_ok(cudaGetLastError(),
+                       "Spark packed online indexed prefill attention launch")
+            ? 1 : -1;
+    }
+    return spark_attention_exact_rows_launch(
+        logical_tier, heads, sinks, q, raw_f32, comp_f32, topk,
+        n_tokens, pos0, n_raw, n_comp, top_k, window, ratio, n_head);
 }
 
 extern "C" int ds4_gpu_attention_decode_heads_tensor(
@@ -18282,6 +18574,28 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                window,
         uint32_t                n_head,
         uint32_t                head_dim) {
+#ifdef DS4_CUDA_SPARK_ONLY
+    if (n_tokens > 1u && head_dim == 512u && heads && q && raw_kv && model_map &&
+        n_raw != 0u && raw_cap >= n_raw && raw_start < raw_cap &&
+        sinks_offset <= model_size &&
+        (uint64_t)n_head * sizeof(float) <= model_size - sinks_offset &&
+        heads->bytes >= (uint64_t)n_tokens * n_head * head_dim * sizeof(float) &&
+        q->bytes >= (uint64_t)n_tokens * n_head * head_dim * sizeof(float) &&
+        raw_kv->bytes >= (uint64_t)raw_cap * DS4_SPARK_KV_ROW_BYTES) {
+        const int logical_tier = ds4_tensor_device_idx(heads);
+        const float *sinks = (const float *)cuda_resolve_weight_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
+            logical_tier, "attn_sinks");
+        if (!sinks) return 0;
+        const int rc = spark_attention_unpack_batch_launch(
+            logical_tier,
+            (float *)heads->ptr, sinks, (const float *)q->ptr,
+            (const unsigned char *)raw_kv->ptr, NULL,
+            n_tokens, pos0, n_raw, raw_cap, raw_start, 0u,
+            window, 1u, n_head);
+        return rc == 1;
+    }
+#endif
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
@@ -18296,7 +18610,7 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
+        uint32_t                comp_kv_format,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -18309,9 +18623,33 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
+    if (comp_kv_format == DS4_GPU_CACHE_SPARK_KV && n_tokens > 1u &&
+        head_dim == 512u && !use_comp_mask && heads && q && raw_kv &&
+        model_map && n_raw != 0u && raw_cap >= n_raw && raw_start < raw_cap &&
+        (n_comp == 0u || comp_kv) && sinks_offset <= model_size &&
+        (uint64_t)n_head * sizeof(float) <= model_size - sinks_offset &&
+        heads->bytes >= (uint64_t)n_tokens * n_head * head_dim * sizeof(float) &&
+        q->bytes >= (uint64_t)n_tokens * n_head * head_dim * sizeof(float) &&
+        raw_kv->bytes >= (uint64_t)raw_cap * DS4_SPARK_KV_ROW_BYTES &&
+        (n_comp == 0u || comp_kv->bytes >=
+            (uint64_t)n_comp * DS4_SPARK_KV_ROW_BYTES)) {
+        const int logical_tier = ds4_tensor_device_idx(heads);
+        const float *sinks = (const float *)cuda_resolve_weight_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
+            logical_tier, "attn_sinks");
+        if (!sinks) return 0;
+        const int rc = spark_attention_unpack_batch_launch(
+            logical_tier,
+            (float *)heads->ptr, sinks, (const float *)q->ptr,
+            (const unsigned char *)raw_kv->ptr,
+            n_comp ? (const unsigned char *)comp_kv->ptr : NULL,
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+            window, ratio, n_head);
+        return rc == 1;
+    }
+    if (comp_kv_format != DS4_GPU_CACHE_F32) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
+                                      q, raw_kv, comp_kv, comp_kv_format, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim);
 }
@@ -18367,6 +18705,17 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             return cuda_ok(cudaGetLastError(), "Spark packed indexed attention launch");
         }
         return 0;
+    }
+    if (comp_kv_format == DS4_GPU_CACHE_SPARK_KV && n_tokens > 1u &&
+        head_dim == 512u) {
+        const int rc = spark_indexed_attention_unpack_batch_launch(
+            logical_tier,
+            (float *)heads->ptr, sinks, (const float *)q->ptr,
+            (const unsigned char *)raw_kv->ptr,
+            (const unsigned char *)comp_kv->ptr, topk_ptr,
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+            window, ratio, n_head);
+        return rc == 1;
     }
     if (comp_kv_format != DS4_GPU_CACHE_F32) return 0;
     if (g_n_gpus == 1 && n_tokens >= 128u && head_dim == kTTHeadDim &&

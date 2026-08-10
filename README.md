@@ -287,21 +287,21 @@ default 4,096-token prefill chunks, and 32 greedy target-only generation
 steps. Each context was a separate process and was actually prefilled; these
 are not synthetic frontier numbers.
 
-| Context | Upstream prefill (tok/s) | DS4X prefill (tok/s) | DS4X prefill slowdown | Upstream steady decode (tok/s) | DS4X steady decode (tok/s) | DS4X decode speedup |
-|---:|---:|---:|---:|---:|---:|---:|
-| 16K | 888.13 | 148.55 | 5.98x | 14.37 | 15.41 | 1.072x |
-| 32K | 898.90 | 142.02 | 6.33x | 13.58 | 15.05 | 1.108x |
-| 128K | 641.62 | 103.81 | 6.18x | 10.59 | 14.33 | 1.353x |
+| Context | Upstream prefill (tok/s) | DS4X prefill (tok/s) | DS4X vs upstream | DS4X vs pre-fix | Upstream steady decode (tok/s) | DS4X steady decode (tok/s) | DS4X decode speedup |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16K | 888.13 | 616.89 | 1.44x slower | 4.15x faster | 14.37 | 15.30 | 1.065x |
+| 32K | 898.90 | 603.64 | 1.49x slower | 4.25x faster | 13.58 | 15.22 | 1.121x |
+| 128K | 641.62 | 534.74 | 1.20x slower | 5.15x faster | 10.59 | 14.14 | 1.335x |
 
 `steady decode` excludes the first generated token and covers the remaining
-31 tokens. The 128K DS4X result of 14.33 tok/s closely matches the independent
+31 tokens. The 128K DS4X result of 14.14 tok/s is within 1.7% of the independent
 synthetic-frontier result of 14.374 tok/s.
 
 | Context | Upstream first token (ms) | DS4X first token (ms) | Latency reduction | Upstream context buffers (MiB) | DS4X context buffers (MiB) | Memory reduction |
 |---:|---:|---:|---:|---:|---:|---:|
-| 16K | 92.400 | 82.839 | 10.3% | 711.41 | 289.84 | 59.3% |
-| 32K | 91.990 | 81.299 | 11.6% | 1,054.41 | 472.67 | 55.2% |
-| 128K | 140.432 | 85.270 | 39.3% | 3,112.41 | 1,569.62 | 49.6% |
+| 16K | 92.400 | 83.433 | 9.7% | 711.41 | 289.84 | 59.3% |
+| 32K | 91.990 | 82.713 | 10.1% | 1,054.41 | 472.67 | 55.2% |
+| 128K | 140.432 | 89.864 | 36.0% | 3,112.41 | 1,569.62 | 49.6% |
 
 The prompt was a deterministic repeated-text fixture stored outside the
 repository (`6,000,000` bytes, SHA-256
@@ -309,31 +309,32 @@ repository (`6,000,000` bytes, SHA-256
 logs and CSV files are intentionally kept outside the public repository for
 the privacy reasons described in the Nsight section.
 
-### Why packed prefill is currently slower
+### Packed prefill implementation
 
-The regression is a software coverage gap, not an inherent cost of the packed
-formats. Upstream DS4's multi-token CUDA attention kernels consume F32 cache
-rows. DS4X keeps the persistent raw, HCA, and CSA histories physically packed,
-but its packed attention kernels currently cover single-token decode only:
+Packed prefill now keeps batch score/top-k and multi-token attention active on
+a single DGX Spark GPU. Each layer expands its visible packed raw and
+compressed KV rows once into transient F32 scratch, then reuses that mirror for
+all query rows in the chunk. Persistent KV and checkpoint files remain in the
+583-byte KV and 68-byte indexer formats.
 
-- the packed indexed-attention entry accepts the Spark cache format only when
-  `n_tokens == 1`;
-- the mixed batch-attention entry rejects every non-F32 compressed-cache
-  format;
-- the graph therefore disables the F32 raw/mixed batch paths when
-  `DS4_GPU_RAW_CACHE_SPARK` or `DS4_GPU_ATTN_COMP_CACHE_SPARK` is active;
-- the correctness fallback loops over the prefill chunk and runs B1
-  indexer score/top-k and attention separately for each token and layer.
+The first compressed row is not available until token 3 in CSA or token 127 in
+HCA. Those short zero-prefix spans continue to read the current batch's F32 KV
+directly; round-tripping them through the persistent packed cache changed early
+attention outputs and could be amplified by downstream MoE routing. The
+remaining rows use the packed multi-token dense or indexed path.
 
-Q/KV projections, compressor projections, and FFN work remain batched, which
-is why the measured penalty is about 6x rather than proportional to the full
-4,096-token chunk. Packing the newly compressed rows adds work, but it is
-secondary to the lost multi-token attention parallelism.
+Three modes are available:
 
-Recovering upstream-class prefill requires packed multi-token kernels for raw
-SWA, dense HCA, and indexed CSA attention. They should decode packed tiles in
-registers/shared memory while retaining batch score/top-k and token-tile
-attention, with numerical parity tests against the current exact fallback.
+- default: heads-grouped online softmax for the highest prefill throughput;
+- `DS4_CUDA_SPARK_PREFILL_EXACT=1`: 32-row grouped score/finalize kernels that
+  are bit-identical to the promoted exact decode reduction order;
+- `DS4_CUDA_SPARK_PREFILL_REFERENCE=1`: the old per-token unpack and attention
+  path, retained as the slow A/B oracle.
+
+At 8K on the repeated-text fixture, the default path reached 619.20 tok/s, the
+grouped exact path reached 283.03 tok/s, and the old reference reached 172.88
+tok/s. The default is 3.58x faster than the old packed path; grouped exact is
+1.64x faster while retaining full-logit bit parity.
 
 ## Accuracy results
 
@@ -342,8 +343,18 @@ The CUDA kernel smoke test passes all of the following:
 ```text
 B1 indexer n_comp=8192: max_abs=0, topk_diff=0
 packed attention: max_abs=0, rmse=0
+packed batch exact: max_abs=0, rmse=0
 large packed indexer: max_abs=0, topk_diff=0
 ```
+
+The grouped exact prefill mode matches the old packed reference at 128 and
+8,192 tokens over the full 129,280-element vocabulary (`max_abs=0`, `rmse=0`,
+identical argmax). The default online mode deliberately changes floating-point
+reduction order. On the adversarial 8K repeated-token fixture, its full logits
+had `max_abs=2.62764` and `rmse=0.509800` versus the bit-exact reference, while
+the argmax and all 32 subsequent greedy tokens remained identical. A layer-2
+attention dump before MoE amplification measured `max_abs=4.52995e-6` and
+`rmse=1.37528e-7`.
 
 At 128K, 256K, 512K, and 1M, the optimized SM121 indexer scorer and a scalar B1
 oracle that decodes the same persistent 68-byte rows produced bit-identical
@@ -355,7 +366,7 @@ The 8K packed checkpoint test produced a 42.614 MiB payload and bit-identical
 post-restore decode logits (`max_abs=0`, `rmse=0`, identical argmax).
 
 The real-text regression prefills a 30,474-token generated story, asks for the
-embedded facts, and passes all assignments:
+embedded facts, and passes all assignments on the default fast path:
 
 ```text
 ds4-test: long-context prefill 30474/30474
@@ -363,17 +374,34 @@ long-context: OK
 ```
 
 The same release run passed the clean `sm_121a` build, CUDA kernel smoke suite,
-packed checkpoint round trip, all four full-logit A/B frontiers, and the real
-text recall test.
+packed checkpoint round trip, all four decode full-logit A/B frontiers, the
+8K exact-prefill full-logit A/B, and the default-path real-text recall test.
 
 An old F32-slot build and this packed build need not produce identical logits:
 the persistent formats are intentionally different. In particular, a
 synthetic all-zero million-token history is numerically fragile because tiny
-quantization changes can alter downstream MoE routing. The acceptance gates
-are packed-format reference parity, independent pack/unpack tests, checkpoint
-round-trip parity, and real-text recall.
+quantization changes can alter downstream MoE routing. Exact-mode gates are
+packed-format reference parity and independent pack/unpack tests. Default
+fast-mode gates are stable greedy output, checkpoint round-trip parity, and
+real-text recall; use exact mode when bit-reproducible prefill logits are
+required.
 
 ## Nsight Systems
+
+The 16K prefill A/B was captured as two full-process traces with the same
+model, prompt, 4,096-token chunk, and zero generated tokens. Nsight measured
+608.46 tok/s on the default path and 145.68 tok/s on the old reference path,
+a 4.18x improvement. The trace explains the gain:
+
+| Kernel group | Old reference instances / GPU time | Default instances / GPU time |
+|---|---:|---:|
+| Packed KV unpack | 1,362,858 / 2.668 s | 334 / 0.011 s |
+| Indexed CSA attention | 300,993 / 34.430 s | 84 / 4.678 s |
+| Dense attention score/finalize | 785,448 / 11.221 s | 86 online calls / 1.535 s |
+| Indexer top-k | 300,993 / 14.239 s | 84 / 0.268 s |
+
+The optimized trace is 1.9 MiB; the launch-heavy reference trace is 320 MiB.
+Both reports and generated SQLite databases remain outside the repository.
 
 The 1M trace was captured around one profiled decode step. Profiling
 raises TPOT to 103.376 ms. The largest GPU kernel groups were:
@@ -400,10 +428,12 @@ score/top-k, not persistent-cache expansion.
 
 - Only the documented DeepSeek-V4-Flash layout is supported.
 - The performance table is target-only and batch one.
-- Packed prefill is functional. Multi-token compressed attention currently
-  uses an exact per-token fallback while Q/KV projections and FFN work remain
-  batched; the pristine-upstream comparison above measures the resulting
-  roughly 6x prefill penalty.
+- Packed multi-token prefill is enabled only for one CUDA GPU. Multi-GPU
+  placement retains the old fallback until packed row-table ownership and
+  communication are implemented.
+- Default prefill prioritizes throughput and is not bit-identical to the exact
+  reduction order. Set `DS4_CUDA_SPARK_PREFILL_EXACT=1` for grouped bit-exact
+  attention or `DS4_CUDA_SPARK_PREFILL_REFERENCE=1` for the old oracle.
 - The 1M result is a decode-frontier test, not a 1M-token prefill result.
 - Checkpoint files from the old F32 persistent-cache ABI are intentionally
   incompatible and must be regenerated.

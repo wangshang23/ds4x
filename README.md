@@ -263,15 +263,77 @@ the 84.25 GiB total shown earlier.
 | 512K | 80.419 | 12.435 |
 | 1M | 93.993 | 10.639 |
 
-The release A/B run alternated the legacy F32-slot path and packed path from
-the same process and reports the median of three timed steps per path:
+The release A/B run alternated two scorers over the same persistent 68-byte
+packed indexer rows: a transparent scalar oracle that decodes each row to F32,
+and the production SM121 block-scaled MXFP4 MMA scorer. It reports the median
+of three timed steps per path. This is an indexer-kernel comparison, not an
+upstream DS4 comparison.
 
-| Context | F32-slot tok/s | Packed tok/s | Speedup |
+| Context | Packed scalar oracle (tok/s) | SM121 MXFP4 scorer (tok/s) | Speedup |
 |---:|---:|---:|---:|
 | 128K | 12.744 | 14.166 | 1.112x |
 | 256K | 10.910 | 13.169 | 1.207x |
 | 512K | 8.759 | 12.225 | 1.396x |
 | 1M | 6.234 | 10.517 | 1.687x |
+
+## Pristine upstream DS4 comparison
+
+The comparison below uses an unmodified checkout of
+[`antirez/ds4@84cc882`](https://github.com/antirez/ds4/commit/84cc882352757baf628a1776badf7cc54d584e28)
+and the current DS4X release on the same DGX Spark. Both were built with their
+native Spark target (`make cuda-spark` upstream and `make spark` in DS4X) and
+run with their native `ds4-bench`, the same Q2/Q8 GGUF, the same prompt,
+default 4,096-token prefill chunks, and 32 greedy target-only generation
+steps. Each context was a separate process and was actually prefilled; these
+are not synthetic frontier numbers.
+
+| Context | Upstream prefill (tok/s) | DS4X prefill (tok/s) | DS4X prefill slowdown | Upstream steady decode (tok/s) | DS4X steady decode (tok/s) | DS4X decode speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16K | 888.13 | 148.55 | 5.98x | 14.37 | 15.41 | 1.072x |
+| 32K | 898.90 | 142.02 | 6.33x | 13.58 | 15.05 | 1.108x |
+| 128K | 641.62 | 103.81 | 6.18x | 10.59 | 14.33 | 1.353x |
+
+`steady decode` excludes the first generated token and covers the remaining
+31 tokens. The 128K DS4X result of 14.33 tok/s closely matches the independent
+synthetic-frontier result of 14.374 tok/s.
+
+| Context | Upstream first token (ms) | DS4X first token (ms) | Latency reduction | Upstream context buffers (MiB) | DS4X context buffers (MiB) | Memory reduction |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16K | 92.400 | 82.839 | 10.3% | 711.41 | 289.84 | 59.3% |
+| 32K | 91.990 | 81.299 | 11.6% | 1,054.41 | 472.67 | 55.2% |
+| 128K | 140.432 | 85.270 | 39.3% | 3,112.41 | 1,569.62 | 49.6% |
+
+The prompt was a deterministic repeated-text fixture stored outside the
+repository (`6,000,000` bytes, SHA-256
+`b06ca02e5b13704619f9ed06632bba29f197cb04882f774e6dabeb5711e98deb`). Raw
+logs and CSV files are intentionally kept outside the public repository for
+the privacy reasons described in the Nsight section.
+
+### Why packed prefill is currently slower
+
+The regression is a software coverage gap, not an inherent cost of the packed
+formats. Upstream DS4's multi-token CUDA attention kernels consume F32 cache
+rows. DS4X keeps the persistent raw, HCA, and CSA histories physically packed,
+but its packed attention kernels currently cover single-token decode only:
+
+- the packed indexed-attention entry accepts the Spark cache format only when
+  `n_tokens == 1`;
+- the mixed batch-attention entry rejects every non-F32 compressed-cache
+  format;
+- the graph therefore disables the F32 raw/mixed batch paths when
+  `DS4_GPU_RAW_CACHE_SPARK` or `DS4_GPU_ATTN_COMP_CACHE_SPARK` is active;
+- the correctness fallback loops over the prefill chunk and runs B1
+  indexer score/top-k and attention separately for each token and layer.
+
+Q/KV projections, compressor projections, and FFN work remain batched, which
+is why the measured penalty is about 6x rather than proportional to the full
+4,096-token chunk. Packing the newly compressed rows adds work, but it is
+secondary to the lost multi-token attention parallelism.
+
+Recovering upstream-class prefill requires packed multi-token kernels for raw
+SWA, dense HCA, and indexed CSA attention. They should decode packed tiles in
+registers/shared memory while retaining batch score/top-k and token-tile
+attention, with numerical parity tests against the current exact fallback.
 
 ## Accuracy results
 
@@ -340,7 +402,8 @@ score/top-k, not persistent-cache expansion.
 - The performance table is target-only and batch one.
 - Packed prefill is functional. Multi-token compressed attention currently
   uses an exact per-token fallback while Q/KV projections and FFN work remain
-  batched.
+  batched; the pristine-upstream comparison above measures the resulting
+  roughly 6x prefill penalty.
 - The 1M result is a decode-frontier test, not a 1M-token prefill result.
 - Checkpoint files from the old F32 persistent-cache ABI are intentionally
   incompatible and must be regenerated.

@@ -8,10 +8,13 @@ ds4x
 ds4x-server
 ds4x-bench
 ds4x-eval
-tests/cuda_long_context_smoke
-tests/cuda_long_context_perf
-tests/synth_frontier_bench
-tests/packed_checkpoint_smoke
+tests/ds4x_kernel/cuda_long_context_smoke
+tests/ds4x_kernel/cuda_long_context_perf
+tests/ds4x_kernel/qkvo_fp4_probe
+tests/ds4x_kernel/mmq/test_mmq_parity
+tests/integration/synth_frontier_bench
+tests/integration/packed_checkpoint_smoke
+ds4_test
 *.gguf
 *.nsys-rep
 *.sqlite

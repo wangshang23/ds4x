@@ -7,7 +7,8 @@ Metal, ROCm, older CUDA architectures, or other model families is out of scope.
 # Performance Rules
 
 - Persistent KV and indexer caches must remain physically packed.
-- Do not add an expanded Q8-to-FP16 weight cache.
+- Keep prefill aligned with upstream's selective Q8-to-FP16 weight cache and
+  FP16 cuBLAS/HMMA path; do not make activation-Q8 exact MMA the default.
 - Preserve the model's 512-row CSA top-k and exact attention semantics.
 - Optimize steady-state decode after prefill; benchmark prefill separately.
 - Every kernel change needs a numerical comparison and a 128K-1M benchmark.

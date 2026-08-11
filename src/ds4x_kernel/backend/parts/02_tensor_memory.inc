@@ -295,6 +295,7 @@ extern "C" int ds4_gpu_moe_handoff_pack_tensor(
     return cuda_ok(cudaGetLastError(), "moe handoff pack launch");
 }
 
+#if 0
 /* Cross-device copy primitive. Path selection (highest priority first):
  *   DS4_FORCE_HOST_BOUNCE=1  -> always pinned-host bounce
  *   DS4_FORCE_CUDA_PEER=1    -> always cudaMemcpyPeerAsync (manual-testing
@@ -705,6 +706,7 @@ extern "C" int ds4_gpu_tensor_wait_xdev_default(
     }
     return ok;
 }
+#endif
 
 extern "C" int ds4_gpu_q8_cache_suppressed(void) {
     return g_q8_cache_suppressed;
@@ -764,7 +766,6 @@ extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
-    cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -869,7 +870,6 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
 
-    cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -997,4 +997,3 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
     }
     return ds4_gpu_set_current_device(logical_tier);
 }
-

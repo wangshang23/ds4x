@@ -1,17 +1,6 @@
 
 typedef struct ds4_vocab ds4_vocab;
 
-static void embed_prompt(
-        const ds4_model   * model,
-        const ds4_weights * weights,
-        const token_vec   * tokens,
-        uint32_t            n_embd,
-        float             * out) {
-    for (int i = 0; i < tokens->len; i++) {
-        embed_token_any(model, weights, tokens->v[i], out + (uint64_t)i * n_embd);
-    }
-}
-
 /* =========================================================================
  * Tokenizer and Chat Prompt Encoding.
  * =========================================================================
@@ -126,138 +115,38 @@ struct ds4_vocab {
     int n_vocab;
     int bos_id;
     int eos_id;
-    int system_id;
     int user_id;
     int assistant_id;
-    int observation_id;
-    int sop_id;
     int think_start_id;
     int think_end_id;
-    int tool_call_start_id;
-    int tool_call_end_id;
-    int tool_response_start_id;
-    int tool_response_end_id;
-    int arg_key_start_id;
-    int arg_key_end_id;
-    int arg_value_start_id;
-    int arg_value_end_id;
     int dsml_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
 
-/* Engine-side tensor-parallel state.  The transport context is owned by the
- * frontend (CLI leader or ds4_tp_worker_run); the engine owns the GPU slab,
- * the per-slot views and the gate machinery lifetime. */
-typedef struct {
-    struct ds4_tp *ctx;
-    ds4_gpu_tensor *slab;
-    ds4_gpu_tensor **out_views;
-    ds4_gpu_tensor **in_views;
-    ds4_gpu_tensor **batch_out_views;   /* [layer] verify-block row partials */
-    ds4_gpu_tensor **batch_in_views;
-    ds4_gpu_tensor *zero_vec;
-    uint64_t eval_seq;          /* leader: mirrored eval counter */
-    uint64_t next_session_id;   /* leader: stable worker-session handle */
-    int rank;
-    bool vocab_split;           /* DS4-only: logits halves cross the wire */
-    bool active;
-} ds4_engine_tp_state;
-
 struct ds4_engine {
     ds4_model model;
-    ds4_model mtp_model;
+    ds4_model support_model;
     ds4_vocab vocab;
     ds4_weights weights;
-    ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
     ds4_backend backend;
     ds4_support_kind support_kind;
     int dspark_exec_tier;
     uint32_t support_stages;
-    int mtp_draft_tokens;
-    float mtp_margin;
     float dspark_confidence_threshold;
     char *directional_steering_file;
-    float *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
     int power_percent;
     uint32_t prefill_chunk;
-    uint32_t ssd_streaming_cache_experts;
-    uint64_t ssd_streaming_cache_bytes;
-    uint64_t ssd_streaming_prefill_headroom_bytes;
-    uint64_t ssd_streaming_full_layer_bytes;
-    uint32_t ssd_streaming_full_layers;
-    uint32_t ssd_streaming_preload_experts;
     uint64_t startup_model_span_bytes;
-    ds4_ssd_memory_lock simulated_memory;
+    ds4_memory_lock simulated_memory;
     bool quality;
-    bool glm_mtp;
-    bool glm_mtp_timing;
     bool dspark;
     bool dspark_strict;
-    bool cuda_tensor_parallel;
-    bool glm_tp_token_prefill;
-    bool ssd_streaming;
-    bool ssd_streaming_cold;
-    bool ssd_streaming_full_layers_set;
-    ds4_distributed_options distributed;
-    ds4_engine_tp_state tp;
     bool metal_ready;
-    bool mtp_ready;
-    bool share_session_prefill_workspace;
-#ifndef DS4_NO_GPU
-    bool shared_prefill_workspace_ready;
-    ds4_gpu_graph shared_prefill_workspace;
-#endif
-
-    /* Wave-2 multi-GPU placement scaffolding: optional multi-GPU placement
-     * state. Zero-initialized for every existing caller (gpu_cfg == NULL)
-     * via xcalloc, so the single-tier path observes identical engine
-     * state to pre-multi-GPU CLI main. multi_tier == 1 is the gate for all
-     * new code paths. */
-    ds4_gpu_config gpu_cfg;
-    int            placement[DS4_MAX_LAYER + 2];
-    int            n_placement_entries;
-    int            multi_tier;
-
-    /* Max-context hint copied from
-     * ds4_engine_options.placement_ctx_hint. Used by
-     * engine_compute_entry_bytes for per-layer KV estimation.
-     * Zero / negative = legacy 4096 fallback (single-tier paths and any
-     * caller that doesn't set the option observe the prior behavior). */
-    int            placement_ctx_hint;
-    int            placement_session_count_hint;
 };
-
-static uint64_t ds4_engine_dynamic_expert_cache_bytes(
-        const ds4_engine *e) {
-    if (!e || !e->ssd_streaming) return 0;
-    if (e->ssd_streaming_cache_bytes != 0) {
-        return e->ssd_streaming_cache_bytes;
-    }
-    if (e->ssd_streaming_cache_experts == 0) return 0;
-
-    uint64_t per_expert_bytes = 0;
-    if (!ds4_streaming_routed_expert_bytes(&e->weights,
-                                           &per_expert_bytes)) {
-        return 0;
-    }
-    if (e->ssd_streaming_cache_experts > UINT64_MAX / per_expert_bytes) {
-        return UINT64_MAX;
-    }
-    return (uint64_t)e->ssd_streaming_cache_experts * per_expert_bytes;
-}
-
-static uint64_t ds4_engine_streaming_transient_guard_bytes(
-        const ds4_engine *e) {
-    if (!e || !e->ssd_streaming) return 0;
-    uint64_t total = ds4_engine_dynamic_expert_cache_bytes(e);
-    total = ds4_add_sat_u64(total, e->ssd_streaming_full_layer_bytes);
-    total = ds4_add_sat_u64(total, e->ssd_streaming_prefill_headroom_bytes);
-    return total;
-}
 
 static void ds4_engine_print_startup_memory(
         const ds4_engine *e,
@@ -265,47 +154,13 @@ static void ds4_engine_print_startup_memory(
     if (!e || ctx_size <= 0) return;
 
     ds4_context_memory mem;
-#ifndef DS4_NO_GPU
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
-        e->distributed.role != DS4_DISTRIBUTED_NONE &&
-        e->distributed.layers.set) {
-        const uint32_t normal_layers = glm_graph_normal_layer_count();
-        const uint32_t layer_end = e->distributed.layers.has_output ?
-            (normal_layers ? normal_layers - 1u : 0u) :
-            e->distributed.layers.end;
-        const uint32_t ctx = (uint32_t)ctx_size;
-        const uint32_t work_ctx =
-            glm_graph_full_attention_cap(ctx, e->ssd_streaming);
-        const uint32_t compact_cap =
-            glm_graph_compact_cache_initial_cap(ctx, work_ctx);
-        mem = glm_graph_context_memory_estimate_for_compact_cap_slice(
-                ctx,
-                work_ctx,
-                compact_cap,
-                e->ssd_streaming,
-                e->distributed.layers.start,
-                layer_end);
-    } else {
-#endif
-        mem = ds4_context_memory_estimate_with_prefill_mode(e->backend,
-                                                            ctx_size,
-                                                            e->prefill_chunk,
-                                                            e->ssd_streaming);
-#ifndef DS4_NO_GPU
-    }
-#endif
+    mem = ds4_context_memory_estimate_with_prefill(e->backend, ctx_size,
+                                                   e->prefill_chunk);
     const uint64_t kv_bytes =
         ds4_add_sat_u64(mem.raw_bytes, mem.compressed_bytes);
-    const uint64_t dynamic_expert_cache_bytes =
-        ds4_engine_dynamic_expert_cache_bytes(e);
-    const uint64_t expert_reserved_bytes =
-        e->ssd_streaming_prefill_headroom_bytes;
     uint64_t total = kv_bytes;
     total = ds4_add_sat_u64(total, mem.scratch_bytes);
     total = ds4_add_sat_u64(total, e->startup_model_span_bytes);
-    total = ds4_add_sat_u64(total, dynamic_expert_cache_bytes);
-    total = ds4_add_sat_u64(total, e->ssd_streaming_full_layer_bytes);
-    total = ds4_add_sat_u64(total, expert_reserved_bytes);
 
     const bool color = ds4_log_is_tty(stderr);
     const char *green = color ? "\x1b[32m" : "";
@@ -321,21 +176,6 @@ static void ds4_engine_print_startup_memory(
             ds4_bytes_to_gib(mem.compressed_bytes),
             ds4_bytes_to_gib(mem.scratch_bytes),
             ds4_bytes_to_gib(e->startup_model_span_bytes));
-    if (e->ssd_streaming_full_layer_bytes != 0) {
-        fprintf(stderr,
-                " + full-layer experts %.2f GiB",
-                ds4_bytes_to_gib(e->ssd_streaming_full_layer_bytes));
-    }
-    if (dynamic_expert_cache_bytes != 0) {
-        fprintf(stderr,
-                " + expert cache %.2f GiB",
-                ds4_bytes_to_gib(dynamic_expert_cache_bytes));
-    }
-    if (expert_reserved_bytes != 0) {
-        fprintf(stderr,
-                " + prefill expert reserve %.2f GiB",
-                ds4_bytes_to_gib(expert_reserved_bytes));
-    }
     fprintf(stderr,
             " = %s%.2f GiB planned%s\n",
             bright_green,
@@ -352,62 +192,6 @@ static void ds4_engine_print_startup_memory(
             mem.comp_cap,
             ds4_backend_name(e->backend),
             reset);
-}
-
-static bool cpu_directional_steering_enabled(
-        const float *dirs,
-        float        scale) {
-    return dirs && scale != 0.0f;
-}
-
-static void cpu_directional_steering_project_rows(
-        float       *x,
-        const float *dirs,
-        uint32_t     il,
-        uint32_t     rows,
-        float        scale) {
-    if (!cpu_directional_steering_enabled(dirs, scale) || !x || rows == 0) return;
-
-    const float *dir = dirs + (uint64_t)il * DS4_N_EMBD;
-    for (uint32_t row = 0; row < rows; row++) {
-        float *xr = x + (uint64_t)row * DS4_N_EMBD;
-        float dot = 0.0f;
-        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
-            dot += xr[i] * dir[i];
-        }
-        const float coeff = scale * dot;
-        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
-            xr[i] -= coeff * dir[i];
-        }
-    }
-}
-
-static bool cpu_load_directional_steering(ds4_engine *e) {
-    if (!e ||
-        (e->directional_steering_attn_scale == 0.0f &&
-         e->directional_steering_ffn_scale == 0.0f)) {
-        return true;
-    }
-
-    const char *path = e->directional_steering_file;
-    if (!path || !path[0]) {
-        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
-        return false;
-    }
-
-    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
-    e->directional_steering_dirs = xmalloc((size_t)n * sizeof(e->directional_steering_dirs[0]));
-    if (!read_f32_binary_file(path, e->directional_steering_dirs, n)) {
-        free(e->directional_steering_dirs);
-        e->directional_steering_dirs = NULL;
-        fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
-        return false;
-    }
-    fprintf(stderr, "ds4: CPU directional steering enabled: %s attn=%g ffn=%g\n",
-            path,
-            (double)e->directional_steering_attn_scale,
-            (double)e->directional_steering_ffn_scale);
-    return true;
 }
 
 static void utf8_put(char **p, uint32_t cp) {
@@ -652,244 +436,6 @@ static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
     return utf8_is_cjk_hira_kata(cp);
 }
 
-typedef struct {
-    uint32_t cp;
-    uint64_t next;
-    bool valid;
-    bool is_letter;
-    bool is_number;
-    bool is_whitespace;
-} glm4_char_info;
-
-static bool glm4_unicode_whitespace(uint32_t cp) {
-    if (cp < 128) return ascii_space((uint8_t)cp);
-    return cp == 0x0085 ||
-           cp == 0x00a0 ||
-           cp == 0x1680 ||
-           (cp >= 0x2000 && cp <= 0x200a) ||
-           cp == 0x2028 ||
-           cp == 0x2029 ||
-           cp == 0x202f ||
-           cp == 0x205f ||
-           cp == 0x3000;
-}
-
-static bool glm4_unicode_number(uint32_t cp) {
-    if (cp < 128) return ascii_digit((uint8_t)cp);
-    return (cp >= 0x0660 && cp <= 0x0669) ||
-           (cp >= 0x06f0 && cp <= 0x06f9) ||
-           (cp >= 0x07c0 && cp <= 0x07c9) ||
-           (cp >= 0x0966 && cp <= 0x096f) ||
-           (cp >= 0x09e6 && cp <= 0x09ef) ||
-           (cp >= 0x0a66 && cp <= 0x0a6f) ||
-           (cp >= 0x0ae6 && cp <= 0x0aef) ||
-           (cp >= 0x0b66 && cp <= 0x0b6f) ||
-           (cp >= 0x0be6 && cp <= 0x0bef) ||
-           (cp >= 0x0c66 && cp <= 0x0c6f) ||
-           (cp >= 0x0ce6 && cp <= 0x0cef) ||
-           (cp >= 0x0d66 && cp <= 0x0d6f) ||
-           (cp >= 0x0de6 && cp <= 0x0def) ||
-           (cp >= 0x0e50 && cp <= 0x0e59) ||
-           (cp >= 0x0ed0 && cp <= 0x0ed9) ||
-           (cp >= 0x0f20 && cp <= 0x0f29) ||
-           (cp >= 0x1040 && cp <= 0x1049) ||
-           (cp >= 0x1090 && cp <= 0x1099) ||
-           (cp >= 0x17e0 && cp <= 0x17e9) ||
-           (cp >= 0x1810 && cp <= 0x1819) ||
-           (cp >= 0xff10 && cp <= 0xff19);
-}
-
-static bool glm4_unicode_punct_symbol(uint32_t cp) {
-    if (cp < 128) return joyai_ascii_punct_symbol((uint8_t)cp);
-    return (cp >= 0x00a1 && cp <= 0x00a9) ||
-           (cp >= 0x00ab && cp <= 0x00ac) ||
-           (cp >= 0x00ae && cp <= 0x00b1) ||
-           cp == 0x00b4 ||
-           (cp >= 0x00b6 && cp <= 0x00b8) ||
-           cp == 0x00bb ||
-           cp == 0x00bf ||
-           cp == 0x00d7 ||
-           cp == 0x00f7 ||
-           (cp >= 0x02c2 && cp <= 0x02df) ||
-           (cp >= 0x02e5 && cp <= 0x02eb) ||
-           (cp >= 0x02ed && cp <= 0x02ff) ||
-           (cp >= 0x0375 && cp <= 0x037e) ||
-           (cp >= 0x0384 && cp <= 0x0385) ||
-           cp == 0x0387 ||
-           (cp >= 0x055a && cp <= 0x055f) ||
-           (cp >= 0x0589 && cp <= 0x058a) ||
-           (cp >= 0x05be && cp <= 0x05c0) ||
-           cp == 0x05c3 ||
-           (cp >= 0x05c6 && cp <= 0x05c7) ||
-           (cp >= 0x0609 && cp <= 0x060a) ||
-           (cp >= 0x060c && cp <= 0x060d) ||
-           cp == 0x061b ||
-           (cp >= 0x061e && cp <= 0x061f) ||
-           cp == 0x066a ||
-           cp == 0x066d ||
-           cp == 0x06d4 ||
-           (cp >= 0x2000 && cp <= 0x206f) ||
-           (cp >= 0x20a0 && cp <= 0x20cf) ||
-           (cp >= 0x2100 && cp <= 0x214f) ||
-           (cp >= 0x2190 && cp <= 0x23ff) ||
-           (cp >= 0x2460 && cp <= 0x24ff) ||
-           (cp >= 0x2500 && cp <= 0x2775) ||
-           (cp >= 0x2794 && cp <= 0x2bff) ||
-           (cp >= 0x2e00 && cp <= 0x2e7f) ||
-           (cp >= 0x3000 && cp <= 0x303f) ||
-           (cp >= 0xfd3e && cp <= 0xfd3f) ||
-           (cp >= 0xfe10 && cp <= 0xfe6f) ||
-           (cp >= 0xff01 && cp <= 0xff0f) ||
-           (cp >= 0xff1a && cp <= 0xff20) ||
-           (cp >= 0xff3b && cp <= 0xff40) ||
-           (cp >= 0xff5b && cp <= 0xff65) ||
-           (cp >= 0x1f000 && cp <= 0x1faff);
-}
-
-static glm4_char_info glm4_char_at(const char *s, uint64_t len, uint64_t pos) {
-    glm4_char_info info;
-    memset(&info, 0, sizeof(info));
-    if (pos >= len) return info;
-
-    info.valid = true;
-    info.cp = utf8_peek_one(s, len, pos, &info.next);
-    info.is_whitespace = glm4_unicode_whitespace(info.cp);
-    info.is_number = glm4_unicode_number(info.cp);
-    if (info.cp < 128) {
-        info.is_letter = ascii_alpha((uint8_t)info.cp);
-    } else {
-        info.is_letter =
-            !info.is_whitespace &&
-            !info.is_number &&
-            !glm4_unicode_punct_symbol(info.cp);
-    }
-    return info;
-}
-
-static uint32_t ascii_tolower_cp(uint32_t cp) {
-    if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
-    return cp;
-}
-
-/* ChatGLM4/GLM pre-tokenization.  GLM GGUFs use tokenizer.ggml.pre="glm4",
- * which shares the llama3-style split shape used by llama.cpp's CHATGLM4 path. */
-static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, token_vec *out) {
-    const uint64_t len = strlen(text);
-    uint64_t pos = 0;
-
-    while (pos < len) {
-        uint64_t start = pos;
-        glm4_char_info cur = glm4_char_at(text, len, pos);
-
-        if (!cur.valid) break;
-
-        if (cur.cp == '\'' && cur.next < len) {
-            glm4_char_info next = glm4_char_at(text, len, cur.next);
-            uint32_t n1 = ascii_tolower_cp(next.cp);
-            if (n1 == 's' || n1 == 't' || n1 == 'm' || n1 == 'd') {
-                pos = next.next;
-                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-                continue;
-            }
-            if (next.valid && next.next < len) {
-                glm4_char_info next2 = glm4_char_at(text, len, next.next);
-                uint32_t n2 = ascii_tolower_cp(next2.cp);
-                if ((n1 == 'r' && n2 == 'e') ||
-                    (n1 == 'v' && n2 == 'e') ||
-                    (n1 == 'l' && n2 == 'l')) {
-                    pos = next2.next;
-                    bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-                    continue;
-                }
-            }
-        }
-
-        if (!(cur.cp == '\r' || cur.cp == '\n' || cur.is_number)) {
-            glm4_char_info next = glm4_char_at(text, len, cur.next);
-            if (cur.is_letter || next.is_letter) {
-                pos = cur.next;
-                while (pos < len) {
-                    glm4_char_info scan = glm4_char_at(text, len, pos);
-                    if (!scan.valid || !scan.is_letter) break;
-                    pos = scan.next;
-                }
-                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-                continue;
-            }
-        }
-
-        if (cur.is_number) {
-            int ndigits = 0;
-            while (pos < len && ndigits < 3) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
-                if (!scan.valid || !scan.is_number) break;
-                pos = scan.next;
-                ndigits++;
-            }
-            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-            continue;
-        }
-
-        glm4_char_info punct = cur;
-        uint64_t punct_pos = pos;
-        if (cur.cp == ' ') {
-            punct_pos = cur.next;
-            punct = glm4_char_at(text, len, punct_pos);
-        }
-        if (punct.valid &&
-            !punct.is_whitespace &&
-            !punct.is_letter &&
-            !punct.is_number) {
-            pos = punct_pos;
-            while (pos < len) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
-                if (!scan.valid ||
-                    scan.is_whitespace ||
-                    scan.is_letter ||
-                    scan.is_number) {
-                    break;
-                }
-                pos = scan.next;
-            }
-            while (pos < len) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
-                if (!scan.valid || !(scan.cp == '\r' || scan.cp == '\n')) break;
-                pos = scan.next;
-            }
-            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-            continue;
-        }
-
-        if (cur.is_whitespace) {
-            uint64_t p = pos;
-            uint64_t last_newline_end = 0;
-            uint64_t last_ws_start = pos;
-            int nspace = 0;
-            while (p < len) {
-                glm4_char_info scan = glm4_char_at(text, len, p);
-                if (!scan.valid || !scan.is_whitespace) break;
-                last_ws_start = p;
-                if (scan.cp == '\r' || scan.cp == '\n') last_newline_end = scan.next;
-                p = scan.next;
-                nspace++;
-            }
-            if (last_newline_end) {
-                pos = last_newline_end;
-            } else if (nspace > 1 && p < len) {
-                pos = last_ws_start;
-            } else {
-                pos = p;
-            }
-            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-            continue;
-        }
-
-        pos = cur.next;
-        if (pos == start) pos = next_utf8_char(text, len, pos);
-        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-    }
-}
-
 /*
  * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
  * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
@@ -909,11 +455,6 @@ static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, tok
  * token stream for code prompts and produces wrong long-context logits.
  */
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        bpe_tokenize_text_glm4(vocab, text, out);
-        return;
-    }
-
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -991,10 +532,3 @@ static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
     }
     return token;
 }
-
-static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
-    int token = -1;
-    if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) return -1;
-    return token;
-}
-

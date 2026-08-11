@@ -22,6 +22,8 @@
 
 #include "ds4_mmq.h"
 #include "ds4_repack.h"
+#include "ds4x/cutlass_fp16_gemm.h"
+#include "ds4x/fp16_projection.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -76,7 +78,7 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
-#include "ds4_gpu_mgpu.h"
+#include "ds4_gpu_runtime.h"
 #include "ds4_iq2_tables_cuda.inc"
 
 typedef struct {
@@ -126,58 +128,6 @@ static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
 static int g_current_logical_tier = -1;
-static int g_ssd_streaming_mode;
-
-typedef struct {
-    int valid;
-    int logical_tier;
-    const void *model_map;
-    uint32_t layer;
-    uint32_t n_total_expert;
-    uint32_t slot_count;
-    uint32_t compact_count;
-    uint64_t gate_offset;
-    uint64_t up_offset;
-    uint64_t down_offset;
-    uint64_t gate_expert_bytes;
-    uint64_t down_expert_bytes;
-    char *gate_ptr;
-    char *up_ptr;
-    char *down_ptr;
-    uint64_t gate_capacity;
-    uint64_t up_capacity;
-    uint64_t down_capacity;
-    int32_t *slot_selected_ptr;
-    uint64_t slot_selected_capacity;
-    ds4_gpu_tensor slot_selected_tensor;
-} cuda_stream_selected_cache;
-
-static cuda_stream_selected_cache g_stream_selected_cache;
-
-static void cuda_stream_selected_cache_invalidate(void) {
-    g_stream_selected_cache.valid = 0;
-}
-
-static void cuda_stream_selected_cache_release(void) {
-    const int tier = g_stream_selected_cache.logical_tier;
-    if (tier >= 0 && tier < g_n_gpus) {
-        (void)ds4_gpu_set_current_device(tier);
-    }
-    if (g_stream_selected_cache.gate_ptr) {
-        (void)cudaFree(g_stream_selected_cache.gate_ptr);
-    }
-    if (g_stream_selected_cache.up_ptr) {
-        (void)cudaFree(g_stream_selected_cache.up_ptr);
-    }
-    if (g_stream_selected_cache.down_ptr) {
-        (void)cudaFree(g_stream_selected_cache.down_ptr);
-    }
-    if (g_stream_selected_cache.slot_selected_ptr) {
-        (void)cudaFree(g_stream_selected_cache.slot_selected_ptr);
-    }
-    memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
-    g_stream_selected_cache.logical_tier = -1;
-}
 
 typedef struct {
     cudaGraph_t     graph;
@@ -243,7 +193,7 @@ static void routed_moe_decode_graph_destroy_one(int logical_tier);
  * Multi-GPU plumbing (device-aware CUDA).
  * ========================================================================= */
 
-static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
+static_assert(DS4_MAX_GPUS == 1, "DS4X is a single-GB10 runtime");
 
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
@@ -444,11 +394,6 @@ static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
-static void *g_stream_selected_stage_raw[4];
-static void *g_stream_selected_stage[4];
-static cudaEvent_t g_stream_selected_stage_event[4];
-static uint64_t g_stream_selected_stage_bytes;
-static cudaStream_t g_stream_selected_upload_stream;
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);

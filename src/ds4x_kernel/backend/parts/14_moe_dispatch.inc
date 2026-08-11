@@ -926,6 +926,7 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
                                             split, n_embd, n_hc);
 }
 
+#if 0
 /* --gpu-vram auto probe. Defined here (in the .cu unit) so the
  * C-side parser (ds4_gpu_args.c) does not need to include
  * <cuda_runtime.h>. Returns 0 on success, nonzero on error
@@ -1031,7 +1032,9 @@ extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
     }
     return 0;
 }
+#endif
 
+#if 0
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;
@@ -1234,6 +1237,7 @@ static int cuda_stream_selected_cache_begin_load(
     g_stream_selected_cache.valid = 1;
     return 1;
 }
+#endif
 
 __device__ __forceinline__ static float glm_rope_yarn_corr_factor_dev(
         int n_dims, int n_ctx_orig, float n_rot, float base) {
@@ -1266,4 +1270,3 @@ static int cuda_current_tier(void) {
     if (cudaGetDevice(&dev) != cudaSuccess) return 0;
     return dev;
 }
-

@@ -196,7 +196,6 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 void ds4_session_gpu_warmup(ds4_session *s) {
 #ifndef DS4_NO_GPU
     if (!s || ds4_session_is_cpu(s)) return;
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return;
     if (!metal_graph_batch_hc_mix(&s->graph) ||
         !metal_graph_batch_flat_hc(&s->graph)) return;
     if (!s->engine->weights.layer[0].hc_attn_fn) return;
@@ -233,54 +232,6 @@ static bool ds4_session_dspark_capture_batch_current(const ds4_session *s) {
     return batch_end >= g->dspark_capture_batch_start &&
            batch_end <= (uint32_t)s->checkpoint.len;
 }
-
-static void ds4_session_note_legacy_mtp_probe(ds4_session *s,
-                                              int token,
-                                              bool mtp_probe_log) {
-    if (!s || !s->mtp_draft_valid) return;
-    if (mtp_probe_log) {
-        s->mtp_probe_total++;
-        if (s->mtp_draft_token == token) s->mtp_probe_hit++;
-        fprintf(stderr,
-                "ds4: mtp probe token=%d draft=%d hit=%llu/%llu\n",
-                token,
-                s->mtp_draft_token,
-                (unsigned long long)s->mtp_probe_hit,
-                (unsigned long long)s->mtp_probe_total);
-    }
-    s->mtp_draft_valid = false;
-}
-
-static bool ds4_session_prepare_legacy_mtp_draft(ds4_session *s,
-                                                 int token,
-                                                 uint32_t pos,
-                                                 bool mtp_probe_log) {
-    ds4_engine *e = s->engine;
-    if (!e->mtp_ready || !s->mtp_logits ||
-        (e->mtp_draft_tokens <= 1 && !mtp_probe_log)) {
-        return false;
-    }
-
-    int mtp_top = -1;
-    if (metal_graph_eval_mtp_draft(&s->graph,
-                                   &e->model,
-                                   &e->weights,
-                                   &e->mtp_model,
-                                   &e->mtp_weights,
-                                   token,
-                                   pos,
-                                   getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
-                                   &mtp_top)) {
-        s->mtp_draft_token = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
-        s->mtp_draft_valid = true;
-        return true;
-    }
-    if (mtp_probe_log) {
-        fprintf(stderr, "ds4: mtp probe draft failed\n");
-    }
-    return false;
-}
-
 static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                                                   int token,
                                                   uint32_t pos) {
@@ -312,7 +263,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
     if (enabled && !fake_argmax_enabled &&
         ds4_session_dspark_scheduler_should_skip(s)) {
         (void)metal_graph_dspark_ring_maintain(&s->graph,
-                                               &s->engine->mtp_model,
+                                               &s->engine->support_model,
                                                &s->engine->dspark_weights,
                                                pos);
         const double propose_ms =
@@ -336,7 +287,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
         if (capture_ok && stage0_ready && !runtime_fused_stage0_setup) {
             stage0_ok =
                 metal_graph_eval_dspark_stage0(&s->graph,
-                                               &s->engine->mtp_model,
+                                               &s->engine->support_model,
                                                dw);
         } else if (capture_ok && stage0_ready && runtime_fused_stage0_setup) {
             stage0_ok = true;
@@ -355,7 +306,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                             &s->graph,
                             &s->engine->model,
                             &s->engine->weights,
-                            &s->engine->mtp_model,
+                            &s->engine->support_model,
                             dw,
                             token,
                             pos);
@@ -391,7 +342,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
             initial_cache_ok =
                 metal_graph_seed_dspark_initial_cache_from_prefill(
                     &s->graph,
-                    &s->engine->mtp_model,
+                    &s->engine->support_model,
                     dw,
                     s->graph.dspark_capture_batch_start,
                     s->graph.dspark_capture_batch_tokens,
@@ -417,7 +368,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
         const bool noncausal_attn_ok =
             noncausal_attn_ready &&
             metal_graph_probe_dspark_noncausal_attention(&s->graph,
-                                                         &s->engine->mtp_model,
+                                                         &s->engine->support_model,
                                                          dw);
         const bool stage_block_ready =
             stage_input_ok &&
@@ -442,7 +393,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
         if (stage_chain_ready) {
             stage_chain_ok =
                 metal_graph_eval_dspark_stage_chain(&s->graph,
-                                                &s->engine->mtp_model,
+                                                &s->engine->support_model,
                                                 dw,
                                                 pos,
                                                 fuse_final_hidden,
@@ -477,7 +428,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
             const bool hidden_ok =
                 fuse_final_hidden ||
                 metal_graph_eval_dspark_final_hidden(&s->graph,
-                                                     &s->engine->mtp_model,
+                                                     &s->engine->support_model,
                                                      dw,
                                                      false);
             DS4_DSPARK_PROP_ADD(propose_hidden_ms, hidden_t0);
@@ -486,7 +437,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                 const double conf0_t0 = DS4_DSPARK_PROP_T0();
                 conf0_ok =
                     dspark_eval_confidence0_runtime(&s->graph,
-                                                    &s->engine->mtp_model,
+                                                    &s->engine->support_model,
                                                     dw,
                                                     token,
                                                     s->dspark_conf_features,
@@ -518,7 +469,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                 metal_graph_eval_dspark_base_logits(&s->graph,
                                                     &s->engine->model,
                                                     &s->engine->weights,
-                                                    &s->engine->mtp_model,
+                                                    &s->engine->support_model,
                                                     dw);
             DS4_DSPARK_PROP_ADD(propose_logits_ms, logits_t0);
         }
@@ -531,7 +482,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
             markov_ok =
                 dspark_apply_markov_confidence_lazy_runtime(
                         &s->graph,
-                        &s->engine->mtp_model,
+                        &s->engine->support_model,
                         dw,
                         token,
                         confidence_threshold,
@@ -565,7 +516,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                                         logits,
                                         logits_bytes) != 0 &&
                     dspark_apply_markov_greedy_probe(logits,
-                                                     &s->engine->mtp_model,
+                                                     &s->engine->support_model,
                                                      dw,
                                                      token,
                                                      markov_state,
@@ -616,7 +567,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                                         hidden_bytes) != 0 &&
                     dspark_eval_confidence_probe(confidence_logits,
                                                  hidden_rows,
-                                                 &s->engine->mtp_model,
+                                                 &s->engine->support_model,
                                                  dw,
                                                  token,
                                                  markov_proposal,
@@ -785,178 +736,26 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
     return s->dspark_draft_valid;
 }
 
-/* Support weights and DSpark scratch live on the configured executor tier. */
 static bool ds4_session_prepare_dspark_draft(ds4_session *s,
                                              int token,
                                              uint32_t pos) {
-    ds4_gpu_graph *g = &s->graph;
-    const int exec_tier =
-        g->dspark_exec_tier >= 0 && g->dspark_exec_tier < DS4_MAX_GPUS
-            ? g->dspark_exec_tier : 0;
-    const int saved_tier = g->active_tier;
-    if (exec_tier != saved_tier) {
-        if (ds4_gpu_set_current_device(exec_tier) != 0) return false;
-        g->active_tier = exec_tier;
-    }
-    const bool ok = ds4_session_prepare_dspark_draft_impl(s, token, pos);
-    if (exec_tier != saved_tier) {
-        g->active_tier = saved_tier;
-        if (ds4_gpu_set_current_device(saved_tier) != 0) return false;
-    }
-    return ok;
+    return ds4_session_prepare_dspark_draft_impl(s, token, pos);
 }
 
 static void ds4_session_prepare_support_draft(ds4_session *s,
                                               int token,
                                               uint32_t pos,
-                                              bool probe_mtp,
-                                              bool mtp_probe_log) {
-    if (!s || !probe_mtp || !s->engine) return;
-
-    switch (s->engine->support_kind) {
-    case DS4_SUPPORT_MTP_LEGACY:
-        (void)ds4_session_prepare_legacy_mtp_draft(s, token, pos, mtp_probe_log);
-        break;
-    case DS4_SUPPORT_DSPARK:
-        (void)ds4_session_prepare_dspark_draft(s, token, pos);
-        break;
-    case DS4_SUPPORT_NONE:
-    default:
-        break;
-    }
+                                              bool probe_support) {
+    if (!s || !probe_support || !s->engine ||
+        s->engine->support_kind != DS4_SUPPORT_DSPARK) return;
+    (void)ds4_session_prepare_dspark_draft(s, token, pos);
 }
 #endif
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
-    if (s->distributed) {
-        if (!s->checkpoint_valid) {
-            if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
-            return 1;
-        }
-        (void)probe_mtp;
-        return ds4_dist_session_eval(s->distributed,
-                                     s,
-                                     &s->checkpoint,
-                                     token,
-                                     s->logits,
-                                     err,
-                                     errlen);
-    }
-    if (ds4_session_is_cpu(s)) {
-        ds4_engine *e = s->engine;
-        forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                                                 &e->model,
-                                                 &e->weights,
-                                                 &s->cpu_cache,
-                                                 token,
-                                                 (uint32_t)s->checkpoint.len,
-                                                 e->directional_steering_dirs,
-                                                 e->directional_steering_attn_scale,
-                                                 e->directional_steering_ffn_scale,
-                                                 &s->cpu_scratch);
-        token_vec_push(&s->checkpoint, token);
-        s->checkpoint_valid = true;
-        s->mtp_draft_valid = false;
-        ds4_session_dspark_capture_note_checkpoint(s);
-        (void)probe_mtp;
-        return 0;
-    }
-#ifdef DS4_NO_GPU
-    (void)s;
-    (void)token;
-    (void)probe_mtp;
-    snprintf(err, errlen, "GPU support is not compiled in");
-    return 1;
-#else
     ds4_engine *e = s->engine;
-    if (ds4_session_is_glm(s)) {
-        /* TP worker under GLM MTP: run the full speculative cycle off the
-         * mirrored EVAL frame so drafts, verify batches, and gate traffic
-         * stay in lockstep with the leader's cycle. */
-        if (!s->glm_spec_inside && s->glm_graph_ready &&
-            e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 &&
-            e->tp.active && e->tp.rank != 0) {
-            int acc[2];
-            const int rc = ds4_session_glm_spec_cycle(s, token, acc, 2, err, errlen);
-            (void)probe_mtp;
-            return rc < 0 ? 1 : 0;
-        }
-        if (!s->glm_graph_ready) {
-            if (errlen) snprintf(err, errlen, "%s GLM graph is not initialized",
-                                 ds4_backend_name(e->backend));
-            return 1;
-        }
-        if ((uint32_t)s->checkpoint.len >= s->glm_graph.ctx_size) {
-            if (errlen) snprintf(err, errlen, "GLM Metal context reached (%u)",
-                                 s->glm_graph.ctx_size);
-            return 1;
-        }
-        const uint32_t pos = (uint32_t)s->checkpoint.len;
-        const bool updates_dense =
-            glm_graph_decode_updates_dense_cache(&s->glm_graph, pos, s->logits);
-        if (!glm_graph_forward_token(&s->glm_graph,
-                                     &e->model,
-                                     &e->weights,
-                                     token,
-                                     NULL,
-                                     pos,
-                                     NULL,
-                                     s->logits,
-                                     false))
-        {
-            if (errlen) snprintf(err, errlen, "%s GLM decode failed",
-                                 ds4_backend_name(e->backend));
-            s->checkpoint_valid = false;
-            s->mtp_draft_valid = false;
-            ds4_session_glm_cap_dense_cache(s);
-            return 1;
-        }
-        token_vec_push(&s->checkpoint, token);
-        s->checkpoint_valid = true;
-        s->mtp_draft_valid = false;
-        if (updates_dense) ds4_session_glm_note_dense_cache(s, pos, 1);
-        /* MTP acceptance probe (timing/quality only, output untouched):
-         * after each committed token, draft the token two positions ahead
-         * from the nextn block and score it against the next greedy pick.
-         * Both TP ranks must set the env (the draft's routed experts ride
-         * a big-gate exchange). */
-        if (getenv("DS4_GLM_MTP_PROBE") && DS4_N_NEXTN_PREDICT != 0) {
-            static int probe_hits, probe_total, probe_have, probe_draft;
-            static uint32_t probe_min_pos = UINT32_MAX;
-            int nmax = 0;
-            float nbest = s->logits[0];
-            for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
-                if (s->logits[i] > nbest) { nbest = s->logits[i]; nmax = (int)i; }
-            }
-            if (probe_have) {
-                probe_total++;
-                probe_hits += (probe_draft == nmax);
-                if ((probe_total % 16) == 0) {
-                    fprintf(stderr, "ds4: glm mtp probe: %d/%d hits (%.1f%%)\n",
-                            probe_hits, probe_total,
-                            100.0 * probe_hits / probe_total);
-                }
-            }
-            if (probe_min_pos == UINT32_MAX) probe_min_pos = pos;
-            int draft = -1;
-            if (glm_graph_mtp_step(&s->glm_graph, &e->model, &e->weights,
-                                   nmax, pos, probe_min_pos, &draft)) {
-                probe_draft = draft;
-                probe_have = 1;
-            } else {
-                probe_have = 0;
-                fprintf(stderr, "ds4: glm mtp probe: draft step failed at pos %u\n", pos);
-            }
-        }
-        (void)probe_mtp;
-        return 0;
-    }
-    const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
-    if (probe_mtp && e->support_kind == DS4_SUPPORT_MTP_LEGACY) {
-        ds4_session_note_legacy_mtp_probe(s, token, mtp_probe_log);
-    }
     const bool dspark_target_timing =
         e->support_kind == DS4_SUPPORT_DSPARK &&
         (ds4_dspark_stats_enabled() ||
@@ -985,55 +784,13 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     ds4_session_prepare_support_draft(s,
                                       token,
                                       (uint32_t)(s->checkpoint.len - 1),
-                                      probe_mtp,
-                                      mtp_probe_log);
+                                      probe_mtp);
     return 0;
-#endif
 }
 
-/* TP-aware eval: mirrors the eval to the worker, runs it locally with the
- * requested draft-probe flag, then merges the vocab-split logits halves.
- * Both ds4_session_eval and the speculative driver funnel through here so
- * the leader/worker lockstep survives every eval entry point. */
 static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
-    if (ds4_session_tp_leader(s)) {
-        ds4_engine *e = s->engine;
-        if (!ds4_tp_send_eval(e->tp.ctx, s->tp_session_id,
-                              ++e->tp.eval_seq, token)) {
-            snprintf(err, errlen, "tp: worker eval send failed");
-            return 1;
-        }
-    }
-    int rc = ds4_session_eval_internal(s, token, probe_mtp, err, errlen);
-    if (rc != 0 && ds4_session_tp_leader(s)) {
-        ds4_session_invalidate(s);
-        return rc;
-    }
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
-    if (rc == 0 && s->engine && s->engine->tp.active && ds4_gpu_tp_failed()) {
-        snprintf(err, errlen, "tp: gate transport failed");
-        if (ds4_session_tp_leader(s)) ds4_session_invalidate(s);
-        return 1;
-    }
-#endif
-    /* Vocab-split head: merge the halves after every eval (DS4 only). */
-    if (rc == 0 && s->engine && s->engine->tp.active && s->engine->tp.vocab_split) {
-        const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
-        if (s->engine->tp.rank == 0) {
-            if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, vhalf)) {
-                snprintf(err, errlen, "tp: worker logits half missing");
-                ds4_session_invalidate(s);
-                return 1;
-            }
-        } else {
-            if (!ds4_tp_send_logits_half(s->engine->tp.ctx, s->logits + vhalf, vhalf)) {
-                snprintf(err, errlen, "tp: logits half send failed");
-                return 1;
-            }
-        }
-    }
-    return rc;
+    return ds4_session_eval_internal(s, token, probe_mtp, err, errlen);
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
@@ -1045,4 +802,3 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
 #endif
     return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
 }
-

@@ -7,7 +7,6 @@ static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
     memset(f, 0, sizeof(*f));
     ds4_gpu_graph *g = &s->graph;
     if (!metal_graph_dspark_cache_current_window_valid(g)) return false;
-    f->mtp_n_raw = g->mtp_n_raw;
     f->dspark_cache_start = g->dspark_cache_start;
     f->dspark_cache_token_start = g->dspark_cache_token_start;
     f->dspark_cache_len = g->dspark_cache_len;
@@ -49,7 +48,6 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
         return false;
     }
     bool ok = ds4_gpu_begin_commands() != 0;
-    g->mtp_n_raw = f->mtp_n_raw;
     if (ok) {
         ok = metal_graph_dspark_cache_set_window(g,
                                                  f->dspark_cache_token_start,
@@ -126,4 +124,3 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
     s->greedy_splitkv_anchor_len = 0;
     spec_frontier_free(&s->greedy_splitkv_anchor);
 }
-

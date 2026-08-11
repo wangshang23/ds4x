@@ -2120,12 +2120,8 @@ typedef struct {
     ds4_tensor *attn_q_a_norm;
     ds4_tensor *attn_q_b;
     ds4_tensor *attn_kv;
-    ds4_tensor *attn_kv_a_mqa;
     ds4_tensor *attn_kv_a_norm;
-    ds4_tensor *attn_k_b;
-    ds4_tensor *attn_v_b;
     ds4_tensor *attn_sinks;
-    ds4_tensor *attn_output;
     ds4_tensor *attn_output_a;
     ds4_tensor *attn_output_b;
     ds4_tensor *attn_compressor_ape;
@@ -2133,9 +2129,6 @@ typedef struct {
     ds4_tensor *attn_compressor_gate;
     ds4_tensor *attn_compressor_norm;
     ds4_tensor *indexer_attn_q_b;
-    ds4_tensor *indexer_attn_k;
-    ds4_tensor *indexer_k_norm;
-    ds4_tensor *indexer_k_norm_b;
     ds4_tensor *indexer_proj;
     ds4_tensor *indexer_compressor_ape;
     ds4_tensor *indexer_compressor_kv;
@@ -2146,9 +2139,6 @@ typedef struct {
     ds4_tensor *hc_ffn_base;
     ds4_tensor *ffn_norm;
     ds4_tensor *ffn_gate_tid2eid;
-    ds4_tensor *ffn_gate;
-    ds4_tensor *ffn_up;
-    ds4_tensor *ffn_down;
     ds4_tensor *ffn_gate_inp;
     ds4_tensor *ffn_exp_probs_b;
     ds4_tensor *ffn_gate_exps;
@@ -2157,10 +2147,6 @@ typedef struct {
     ds4_tensor *ffn_gate_shexp;
     ds4_tensor *ffn_up_shexp;
     ds4_tensor *ffn_down_shexp;
-    ds4_tensor *nextn_eh_proj;
-    ds4_tensor *nextn_enorm;
-    ds4_tensor *nextn_hnorm;
-    ds4_tensor *nextn_shared_head_norm;
 } ds4_layer_weights;
 
 typedef struct {
@@ -2172,18 +2158,6 @@ typedef struct {
     ds4_tensor *output;
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
-
-typedef struct {
-    ds4_tensor *e_proj;
-    ds4_tensor *h_proj;
-    ds4_tensor *enorm;
-    ds4_tensor *hnorm;
-    ds4_tensor *norm;
-    ds4_tensor *hc_head_base;
-    ds4_tensor *hc_head_fn;
-    ds4_tensor *hc_head_scale;
-    ds4_layer_weights block;
-} ds4_mtp_weights;
 
 typedef struct {
     ds4_tensor *main_proj;
@@ -2215,4 +2189,3 @@ typedef struct {
     bool has_target_layers;
     ds4_dspark_stage_weights stage[DS4_DSPARK_MAX_STAGES];
 } ds4_dspark_weights;
-

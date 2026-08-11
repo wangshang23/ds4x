@@ -1006,6 +1006,7 @@ static int routed_moe_launch(
         uint32_t n_tokens,
         int allow_streaming,
         int owned_filtered) {
+    (void)allow_streaming;
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -1028,7 +1029,7 @@ static int routed_moe_launch(
     /* The aligned artifacts replace the raw expert tensors on integrated
      * CUDA systems.  Route both prefill and decode before resolving a raw
      * pointer, otherwise the fallback cache would duplicate tens of GiB. */
-    if (iq2_path && !owned_filtered && !g_ssd_streaming_mode &&
+    if (iq2_path && !owned_filtered &&
         cuda_aligned_iq2_enabled() && cuda_aligned_q2k_enabled()) {
         const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
         const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
@@ -1115,10 +1116,7 @@ static int routed_moe_launch(
     }
 
     /* Native MXFP4 routed experts use the vendored MMVQ decode kernels and
-     * MMQ matrix kernels. On Blackwell the latter dispatch to FP4 MMA; older
-     * CUDA devices use the mathematically equivalent DP4A implementation.
-     * SSD streaming presents a compact table containing only the selected
-     * experts, together with IDs remapped into that table. */
+     * MMQ matrix kernels. On Blackwell the latter dispatch to FP4 MMA. */
     if (mxfp4_path) {
         if (!cuda_use_mxfp4_mmq()) {
             fprintf(stderr, "ds4: CUDA MXFP4 requires the MMQ backend\n");
@@ -1134,52 +1132,19 @@ static int routed_moe_launch(
             return 0;
         }
 
-        const uint64_t slot_count = (uint64_t)n_tokens * n_expert;
         const int logical_tier = ds4_tensor_device_idx(out);
-        const int use_stream_selected_cache =
-            allow_streaming &&
-            g_ssd_streaming_mode &&
-            g_stream_selected_cache.valid &&
-            g_stream_selected_cache.logical_tier == logical_tier &&
-            g_stream_selected_cache.model_map == model_map &&
-            g_stream_selected_cache.layer == layer_index &&
-            g_stream_selected_cache.n_total_expert == n_total_expert &&
-            g_stream_selected_cache.slot_count >= slot_count &&
-            g_stream_selected_cache.gate_offset == gate_offset &&
-            g_stream_selected_cache.up_offset == up_offset &&
-            g_stream_selected_cache.down_offset == down_offset &&
-            g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes &&
-            g_stream_selected_cache.down_expert_bytes == down_expert_bytes &&
-            g_stream_selected_cache.gate_ptr &&
-            g_stream_selected_cache.up_ptr &&
-            g_stream_selected_cache.down_ptr &&
-            g_stream_selected_cache.slot_selected_tensor.ptr &&
-            g_stream_selected_cache.slot_selected_tensor.bytes >=
-                slot_count * sizeof(int32_t);
-        if (g_ssd_streaming_mode && allow_streaming &&
-            !use_stream_selected_cache) {
-            fprintf(stderr,
-                    "ds4: CUDA streaming MXFP4 experts are unavailable for layer %u\n",
-                    layer_index);
-            return 0;
-        }
-
-        const ds4_gpu_tensor *mx_selected = use_stream_selected_cache ?
-            &g_stream_selected_cache.slot_selected_tensor : selected;
-        const uint32_t weight_experts = use_stream_selected_cache ?
-            g_stream_selected_cache.compact_count : n_total_expert;
-        const char *gate_w = use_stream_selected_cache ?
-            g_stream_selected_cache.gate_ptr :
-            cuda_resolve_weight_ptr(model_map, gate_offset, gate_total,
-                                    logical_tier, "mxfp4 moe gate");
-        const char *up_w = use_stream_selected_cache ?
-            g_stream_selected_cache.up_ptr :
-            cuda_resolve_weight_ptr(model_map, up_offset, gate_total,
-                                    logical_tier, "mxfp4 moe up");
-        const char *down_w = use_stream_selected_cache ?
-            g_stream_selected_cache.down_ptr :
-            cuda_resolve_weight_ptr(model_map, down_offset, down_total,
-                                    logical_tier, "mxfp4 moe down");
+        const uint64_t slot_count = (uint64_t)n_tokens * n_expert;
+        const ds4_gpu_tensor *mx_selected = selected;
+        const uint32_t weight_experts = n_total_expert;
+        const char *gate_w = cuda_resolve_weight_ptr(
+                model_map, gate_offset, gate_total, logical_tier,
+                "mxfp4 moe gate");
+        const char *up_w = cuda_resolve_weight_ptr(
+                model_map, up_offset, gate_total, logical_tier,
+                "mxfp4 moe up");
+        const char *down_w = cuda_resolve_weight_ptr(
+                model_map, down_offset, down_total, logical_tier,
+                "mxfp4 moe down");
         if (!gate_w || !up_w || !down_w || weight_experts == 0u) return 0;
 
         const cudaStream_t stream =
@@ -1328,50 +1293,13 @@ static int routed_moe_launch(
         down_bytes > model_size - down_offset) {
         return 0;
     }
-    const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
     const int logical_tier = ds4_tensor_device_idx(out);
-    const int use_stream_selected_cache =
-        allow_streaming &&
-        g_ssd_streaming_mode &&
-        g_stream_selected_cache.valid &&
-        g_stream_selected_cache.logical_tier == logical_tier &&
-        g_stream_selected_cache.model_map == model_map &&
-        g_stream_selected_cache.layer == layer_index &&
-        g_stream_selected_cache.n_total_expert == n_total_expert &&
-        g_stream_selected_cache.slot_count >= required_slot_count &&
-        g_stream_selected_cache.gate_offset == gate_offset &&
-        g_stream_selected_cache.up_offset == up_offset &&
-        g_stream_selected_cache.down_offset == down_offset &&
-        g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes &&
-        g_stream_selected_cache.down_expert_bytes == down_expert_bytes &&
-        g_stream_selected_cache.gate_ptr &&
-        g_stream_selected_cache.up_ptr &&
-        g_stream_selected_cache.down_ptr &&
-        g_stream_selected_cache.slot_selected_tensor.ptr &&
-        g_stream_selected_cache.slot_selected_tensor.bytes >=
-            required_slot_count * sizeof(int32_t);
-    if (g_ssd_streaming_mode && allow_streaming &&
-        !use_stream_selected_cache) {
-        fprintf(stderr,
-                "ds4: CUDA streaming selected experts are unavailable for layer %u\n",
-                layer_index);
-        return 0;
-    }
-    if (use_stream_selected_cache) {
-        selected = &g_stream_selected_cache.slot_selected_tensor;
-    }
-    const char *gate_w = use_stream_selected_cache ?
-        g_stream_selected_cache.gate_ptr :
-        cuda_resolve_weight_ptr(model_map, gate_offset, gate_bytes,
-                                logical_tier, "moe_gate");
-    const char *up_w = use_stream_selected_cache ?
-        g_stream_selected_cache.up_ptr :
-        cuda_resolve_weight_ptr(model_map, up_offset, gate_bytes,
-                                logical_tier, "moe_up");
-    const char *down_w = use_stream_selected_cache ?
-        g_stream_selected_cache.down_ptr :
-        cuda_resolve_weight_ptr(model_map, down_offset, down_bytes,
-                                logical_tier, "moe_down");
+    const char *gate_w = cuda_resolve_weight_ptr(
+            model_map, gate_offset, gate_bytes, logical_tier, "moe_gate");
+    const char *up_w = cuda_resolve_weight_ptr(
+            model_map, up_offset, gate_bytes, logical_tier, "moe_up");
+    const char *down_w = cuda_resolve_weight_ptr(
+            model_map, down_offset, down_bytes, logical_tier, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
 
     int ok = 1;
@@ -2419,4 +2347,3 @@ static int routed_moe_launch(
     }
     return ok;
 }
-

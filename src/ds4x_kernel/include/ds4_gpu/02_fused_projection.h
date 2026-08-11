@@ -630,29 +630,6 @@ int ds4_gpu_glm_kv_lora_rms_norm_tensor(
         uint32_t              kv_lora_dim,
         float                 eps);
 
-int ds4_gpu_glm_k_b_project_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *kv_norm,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint32_t              n_tokens,
-        uint32_t              kv_lora_dim,
-        uint32_t              qk_nope,
-        uint32_t              n_head);
-
-int ds4_gpu_glm_k_b_project_typed_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *kv_norm,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint32_t              weight_type,
-        uint32_t              n_tokens,
-        uint32_t              kv_lora_dim,
-        uint32_t              qk_nope,
-        uint32_t              n_head);
-
 int ds4_gpu_glm_store_compact_kv_tensor(
         ds4_gpu_tensor       *kv_lora_cache,
         ds4_gpu_tensor       *k_rope_cache,
@@ -1220,4 +1197,3 @@ int ds4_gpu_store_raw_kv_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens,
         uint32_t                head_dim);
-

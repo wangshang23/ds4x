@@ -6,14 +6,13 @@ SRC_DIR := src
 APP_DIR := $(SRC_DIR)/apps
 ENGINE_DIR := $(SRC_DIR)/engine
 ENGINE_INCLUDE_DIR := $(ENGINE_DIR)/include
-ENGINE_MODEL_DIR := $(ENGINE_DIR)/model
-ENGINE_CONFIG_DIR := $(ENGINE_DIR)/config
 KERNEL_DIR := $(SRC_DIR)/ds4x_kernel
 KERNEL_BACKEND_DIR := $(KERNEL_DIR)/backend
+KERNEL_MODERN_BACKEND_DIR := $(KERNEL_DIR)/backends
 KERNEL_INCLUDE_DIR := $(KERNEL_DIR)/include
 KERNEL_TABLE_DIR := $(KERNEL_DIR)/tables
 MMQ_DIR := $(KERNEL_DIR)/quantization/mmq
-DIST_DIR := $(SRC_DIR)/distributed
+CUTLASS_DIR ?= third_party/cutlass
 STORAGE_DIR := $(SRC_DIR)/storage
 SUPPORT_DIR := $(SRC_DIR)/support
 
@@ -26,14 +25,15 @@ BUILD_DIR ?= build
 OBJ_DIR := $(BUILD_DIR)/obj
 
 INCLUDE_DIRS := -I$(SRC_DIR) -I$(APP_DIR) \
-	-I$(ENGINE_DIR) -I$(ENGINE_INCLUDE_DIR) -I$(ENGINE_MODEL_DIR) \
-	-I$(ENGINE_CONFIG_DIR) -I$(KERNEL_INCLUDE_DIR) -I$(KERNEL_TABLE_DIR) \
-	-I$(MMQ_DIR) -I$(DIST_DIR) -I$(STORAGE_DIR) -I$(SUPPORT_DIR) \
+	-I$(ENGINE_DIR) -I$(ENGINE_INCLUDE_DIR) \
+	-I$(KERNEL_INCLUDE_DIR) -I$(KERNEL_TABLE_DIR) \
+	-I$(MMQ_DIR) -I$(STORAGE_DIR) -I$(SUPPORT_DIR) \
 	-I$(KERNEL_MMQ_TEST_DIR) -I$(CUDA_HOME)/include
 CPPFLAGS += -D_GNU_SOURCE -DDS4_CUDA_SPARK_ONLY=1 $(INCLUDE_DIRS)
 CFLAGS ?= -O3 -g -ffast-math -fno-finite-math-only -march=native \
 	-Wall -Wextra -std=c99
 NVCC_DEFS := -DDS4_CUDA_HAVE_MXF4=1
+CUTLASS_CPPFLAGS := -I$(CUTLASS_DIR)/include
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math \
 	-gencode arch=compute_121a,code=sm_121a \
 	-Xcompiler -march=native -Xcompiler -pthread
@@ -54,23 +54,20 @@ MMQ_OBJS := \
 
 KERNEL_OBJS := \
 	$(OBJ_DIR)/ds4x_kernel/backend/ds4x_kernel.o \
+	$(OBJ_DIR)/ds4x_kernel/backends/cutlass_fp16_gemm.o \
+	$(OBJ_DIR)/ds4x_kernel/backends/fp16_projection.o \
+	$(OBJ_DIR)/ds4x_kernel/backends/operator_adapters.o \
 	$(MMQ_OBJS)
 
 RUNTIME_OBJS := \
 	$(OBJ_DIR)/engine/ds4_engine.o \
-	$(OBJ_DIR)/engine/model/ds4_layer_pack.o \
-	$(OBJ_DIR)/distributed/ds4_distributed.o \
-	$(OBJ_DIR)/distributed/ds4_tp.o \
-	$(OBJ_DIR)/storage/ds4_ssd.o \
+	$(OBJ_DIR)/storage/ds4_memory.o \
 	$(KERNEL_OBJS)
 
 APP_OBJS := \
 	$(OBJ_DIR)/apps/ds4_cli.o \
-	$(OBJ_DIR)/apps/ds4_server.o \
 	$(OBJ_DIR)/apps/ds4_bench.o \
-	$(OBJ_DIR)/apps/ds4_eval.o \
 	$(OBJ_DIR)/apps/ds4_help.o \
-	$(OBJ_DIR)/engine/config/ds4_gpu_args.o \
 	$(OBJ_DIR)/storage/ds4_kvstore.o \
 	$(OBJ_DIR)/support/linenoise.o \
 	$(OBJ_DIR)/support/rax.o
@@ -87,27 +84,19 @@ ALL_OBJS := $(sort $(RUNTIME_OBJS) $(APP_OBJS) $(TEST_OBJS))
 DEPS := $(ALL_OBJS:.o=.d)
 
 .PHONY: all spark smoke perf kernel-test kernel-perf kernel-mmq-test \
+	kernel-cutlass-test kernel-cutlass-bench \
+	kernel-projection-test kernel-operator-test \
 	checkpoint-smoke long-context qkvo-fp4-probe clean
 
 all: spark
 
-spark: ds4 ds4-server ds4-bench ds4-eval
+spark: ds4 ds4-bench
 
 ds4: $(OBJ_DIR)/apps/ds4_cli.o $(OBJ_DIR)/apps/ds4_help.o \
-	$(OBJ_DIR)/support/linenoise.o $(OBJ_DIR)/engine/config/ds4_gpu_args.o \
-	$(RUNTIME_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
-ds4-server: $(OBJ_DIR)/apps/ds4_server.o $(OBJ_DIR)/apps/ds4_help.o \
-	$(OBJ_DIR)/storage/ds4_kvstore.o $(OBJ_DIR)/support/rax.o \
-	$(OBJ_DIR)/engine/config/ds4_gpu_args.o $(RUNTIME_OBJS)
+	$(OBJ_DIR)/support/linenoise.o $(RUNTIME_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4-bench: $(OBJ_DIR)/apps/ds4_bench.o $(OBJ_DIR)/apps/ds4_help.o \
-	$(OBJ_DIR)/engine/config/ds4_gpu_args.o $(RUNTIME_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
-ds4-eval: $(OBJ_DIR)/apps/ds4_eval.o $(OBJ_DIR)/apps/ds4_help.o \
 	$(RUNTIME_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -118,6 +107,11 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 $(OBJ_DIR)/ds4x_kernel/backend/ds4x_kernel.o: $(KERNEL_BACKEND_DIR)/ds4x_kernel.cu
 	@mkdir -p $(dir $@)
 	$(NVCC) $(CPPFLAGS) $(NVCC_DEFS) $(NVCCFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+$(OBJ_DIR)/ds4x_kernel/backends/%.o: $(KERNEL_MODERN_BACKEND_DIR)/%.cu
+	@mkdir -p $(dir $@)
+	$(NVCC) $(CPPFLAGS) $(CUTLASS_CPPFLAGS) $(NVCC_DEFS) $(NVCCFLAGS) \
+		$(DEPFLAGS) -std=c++17 -c -o $@ $<
 
 $(OBJ_DIR)/ds4x_kernel/quantization/mmq/%.o: $(MMQ_DIR)/%.cu
 	@mkdir -p $(dir $@)
@@ -157,25 +151,19 @@ $(KERNEL_MMQ_TEST_DIR)/test_mmq_parity: \
 $(INTEGRATION_TEST_DIR)/synth_frontier_bench: \
 	$(OBJ_DIR)/tests/integration/synth_frontier_bench.o \
 	$(OBJ_DIR)/engine/ds4_test_hooks.o \
-	$(OBJ_DIR)/engine/config/ds4_gpu_args.o \
 	$(OBJ_DIR)/storage/ds4_kvstore.o \
 	$(OBJ_DIR)/support/rax.o \
-	$(OBJ_DIR)/distributed/ds4_distributed.o \
-	$(OBJ_DIR)/distributed/ds4_tp.o \
-	$(OBJ_DIR)/storage/ds4_ssd.o \
-	$(OBJ_DIR)/engine/model/ds4_layer_pack.o $(KERNEL_OBJS)
+	$(OBJ_DIR)/storage/ds4_memory.o \
+	$(KERNEL_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 $(INTEGRATION_TEST_DIR)/packed_checkpoint_smoke: \
 	$(OBJ_DIR)/tests/integration/packed_checkpoint_smoke.o \
 	$(OBJ_DIR)/engine/ds4_test_hooks.o \
-	$(OBJ_DIR)/engine/config/ds4_gpu_args.o \
 	$(OBJ_DIR)/storage/ds4_kvstore.o \
 	$(OBJ_DIR)/support/rax.o \
-	$(OBJ_DIR)/distributed/ds4_distributed.o \
-	$(OBJ_DIR)/distributed/ds4_tp.o \
-	$(OBJ_DIR)/storage/ds4_ssd.o \
-	$(OBJ_DIR)/engine/model/ds4_layer_pack.o $(KERNEL_OBJS)
+	$(OBJ_DIR)/storage/ds4_memory.o \
+	$(KERNEL_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 $(KERNEL_TEST_DIR)/qkvo_fp4_probe: $(KERNEL_TEST_DIR)/qkvo_fp4_probe.cu \
@@ -197,7 +185,37 @@ smoke: $(KERNEL_TEST_DIR)/cuda_long_context_smoke
 kernel-mmq-test: $(KERNEL_MMQ_TEST_DIR)/test_mmq_parity
 	DS4_CUDA_MMQ_Q81_PERSISTENT=1 ./$(KERNEL_MMQ_TEST_DIR)/test_mmq_parity
 
-kernel-test: smoke kernel-mmq-test
+$(KERNEL_TEST_DIR)/backends/test_cutlass_fp16_gemm: \
+	$(KERNEL_TEST_DIR)/backends/test_cutlass_fp16_gemm.cu \
+	$(OBJ_DIR)/ds4x_kernel/backends/cutlass_fp16_gemm.o
+	$(NVCC) $(CPPFLAGS) $(CUTLASS_CPPFLAGS) $(NVCC_DEFS) $(NVCCFLAGS) \
+		-std=c++17 -o $@ $^ $(CUDA_LDLIBS)
+
+kernel-cutlass-test: $(KERNEL_TEST_DIR)/backends/test_cutlass_fp16_gemm
+	./$(KERNEL_TEST_DIR)/backends/test_cutlass_fp16_gemm
+
+kernel-cutlass-bench: $(KERNEL_TEST_DIR)/backends/test_cutlass_fp16_gemm
+	./$(KERNEL_TEST_DIR)/backends/test_cutlass_fp16_gemm --benchmark
+
+$(KERNEL_TEST_DIR)/backends/test_fp16_projection: \
+	$(KERNEL_TEST_DIR)/backends/test_fp16_projection.cu \
+	$(OBJ_DIR)/ds4x_kernel/backends/fp16_projection.o
+	$(NVCC) $(CPPFLAGS) $(NVCC_DEFS) $(NVCCFLAGS) -std=c++17 \
+		-o $@ $^ $(CUDA_LDLIBS)
+
+kernel-projection-test: $(KERNEL_TEST_DIR)/backends/test_fp16_projection
+	./$(KERNEL_TEST_DIR)/backends/test_fp16_projection
+
+$(KERNEL_TEST_DIR)/backends/test_operator_adapters: \
+	$(KERNEL_TEST_DIR)/backends/test_operator_adapters.cu $(KERNEL_OBJS)
+	$(NVCC) $(CPPFLAGS) $(NVCC_DEFS) $(NVCCFLAGS) -std=c++17 \
+		-o $@ $^ $(CUDA_LDLIBS)
+
+kernel-operator-test: $(KERNEL_TEST_DIR)/backends/test_operator_adapters
+	./$(KERNEL_TEST_DIR)/backends/test_operator_adapters
+
+kernel-test: smoke kernel-mmq-test kernel-cutlass-test kernel-projection-test \
+	kernel-operator-test
 
 kernel-perf: $(KERNEL_TEST_DIR)/cuda_long_context_perf
 
@@ -214,10 +232,13 @@ long-context: ds4_test
 
 clean:
 	rm -rf $(BUILD_DIR)
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4_test \
+	rm -f ds4 ds4-bench ds4_test \
 		$(KERNEL_TEST_DIR)/cuda_long_context_smoke \
 		$(KERNEL_TEST_DIR)/cuda_long_context_perf \
 		$(KERNEL_TEST_DIR)/qkvo_fp4_probe \
+		$(KERNEL_TEST_DIR)/backends/test_cutlass_fp16_gemm \
+		$(KERNEL_TEST_DIR)/backends/test_fp16_projection \
+		$(KERNEL_TEST_DIR)/backends/test_operator_adapters \
 		$(KERNEL_MMQ_TEST_DIR)/test_mmq_parity \
 		$(INTEGRATION_TEST_DIR)/synth_frontier_bench \
 		$(INTEGRATION_TEST_DIR)/packed_checkpoint_smoke

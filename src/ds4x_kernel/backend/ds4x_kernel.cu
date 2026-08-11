@@ -14,7 +14,4 @@
 #include "parts/12_moe_reduction.inc"
 #include "parts/13_moe_tensorcore.inc"
 #include "parts/14_moe_dispatch.inc"
-#include "parts/15_glm_attention.inc"
-#include "parts/16_glm_moe.inc"
-#include "parts/17_glm_router.inc"
 #include "parts/18_compat_api.inc"

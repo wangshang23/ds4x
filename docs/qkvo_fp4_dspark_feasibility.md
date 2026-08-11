@@ -258,7 +258,7 @@ T_saved
 
 ```text
 8K B1: 约 17.5-18.9 tok/s，18.9 是 kernel-level 上界，不是整模型实测
-1M B1: 约 11.7-12.1 tok/s，基于 93.993 ms release TPOT 扣除固定 QKVO 时间
+1M B1: 约 11.7-12.1 tok/s，基于 94.502 ms Phase 2 release TPOT 扣除固定 QKVO 时间
 ```
 
 长上下文时 CSA/HCA history cost 增大，固定 QKVO 优化在绝对时间上仍近似固定，

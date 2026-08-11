@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#include "ds4_gpu/00_tensor_runtime_and_tp.h"
+#include "ds4_gpu/00_tensor_runtime.h"
 #include "ds4_gpu/01_linear_and_reduction.h"
 #include "ds4_gpu/02_fused_projection.h"
 #include "ds4_gpu/03_attention.h"

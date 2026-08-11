@@ -41,71 +41,16 @@
 #include <unistd.h>
 
 #include "ds4.h"
-#include "ds4_distributed.h"
-#include "ds4_tp.h"
-
-/* Wave-2 multi-GPU types are needed in every build because the engine
- * struct embeds ds4_gpu_config and the placement table. ds4_layer_pack.h
- * is included unconditionally for the same reason (engine helpers call
- * the packer in multi-tier mode, but the headers are tiny and C-safe). */
-#include "ds4_layer_pack.h"
-#include "ds4_gpu_mgpu.h"
-
-#define DS4_CUDA_TP_PEER_TMP_BYTES \
-    ((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float) + 128u)
-
-static uint32_t metal_graph_cuda_tp_output_requested_ways(void) {
-    const char *env = getenv("DS4_CUDA_TP_OUTPUT_WAYS");
-    if (!env || !env[0]) return 8;
-    char *end = NULL;
-    unsigned long v = strtoul(env, &end, 10);
-    if (end != env && *end == '\0' && v >= 2 && v <= DS4_MAX_GPUS) {
-        return (uint32_t)v;
-    }
-    fprintf(stderr,
-            "ds4: invalid DS4_CUDA_TP_OUTPUT_WAYS=%s; expected 2..%d\n",
-            env, DS4_MAX_GPUS);
-    return 2;
-}
-
-static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
-        int   head_tier,
-        bool  cuda_tp_output,
-        int   n_gpus,
-        int   tiers[DS4_MAX_GPUS]) {
-    if (!tiers || !cuda_tp_output || n_gpus < 2 || (n_gpus & 1) != 0) return 0;
-    if (head_tier < 0 || head_tier >= n_gpus) return 0;
-    const int half = n_gpus / 2;
-    if (head_tier >= half) return 0;
-    const int partner = head_tier + half;
-    if (partner >= n_gpus) return 0;
-
-    uint32_t want = metal_graph_cuda_tp_output_requested_ways();
-    if (want > (uint32_t)n_gpus) want = (uint32_t)n_gpus;
-    if (want < 2u) want = 2u;
-
-    uint32_t n = 0;
-    tiers[n++] = head_tier;
-    if (partner != head_tier && n < want) tiers[n++] = partner;
-    for (int pass = 0; pass < 2 && n < want; pass++) {
-        const int start = pass == 0 ? half : 0;
-        const int end = pass == 0 ? n_gpus : half;
-        for (int t = start; t < end && n < want; t++) {
-            bool seen = false;
-            for (uint32_t i = 0; i < n; i++) {
-                if (tiers[i] == t) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) tiers[n++] = t;
-        }
-    }
-    return n;
-}
+#include "ds4_gpu_runtime.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+#include "ds4x/ops/attention.h"
+#include "ds4x/ops/cache.h"
+#include "ds4x/ops/decode_graph.h"
+#include "ds4x/ops/hyper_connection.h"
+#include "ds4x/ops/indexer.h"
+#include "ds4x/ops/moe.h"
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
@@ -392,42 +337,6 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * asks for a reasoning budget the allocated context is not meant to hold. */
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
-static bool ds4_backend_uses_graph(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
-}
-
-static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
-    if (backend == DS4_BACKEND_METAL) return true;
-    if (backend == DS4_BACKEND_CUDA) {
-#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
-        return true;
-#else
-        return false;
-#endif
-    }
-    return false;
-}
-
-static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
-    if (backend == DS4_BACKEND_METAL) return true;
-#ifdef DS4_ROCM_BUILD
-    if (backend == DS4_BACKEND_CUDA) return true;
-#else
-    (void)backend;
-#endif
-    return false;
-}
-
-static bool ds4_backend_supports_glm_streaming_full_layers(ds4_backend backend) {
-    if (backend == DS4_BACKEND_METAL) return true;
-#ifdef DS4_ROCM_BUILD
-    if (backend == DS4_BACKEND_CUDA) return true;
-#else
-    (void)backend;
-#endif
-    return false;
-}
-
 static bool glm_graph_env_present(const char *rocm_name, const char *metal_name) {
 #ifdef DS4_ROCM_BUILD
     if (rocm_name && getenv(rocm_name) != NULL) return true;
@@ -459,44 +368,36 @@ static const char *glm_graph_env_value(const char *rocm_name,
  */
 
 enum {
-    DS4_MAX_LAYER            = 79,
-    DS4_MAX_EMBD             = 7168,
-    DS4_MAX_VOCAB            = 154880,
-    DS4_MAX_HEAD             = 128,
+    DS4_MAX_LAYER            = 43,
+    DS4_MAX_EMBD             = 4096,
+    DS4_MAX_VOCAB            = 129280,
+    DS4_MAX_HEAD             = 64,
     DS4_MAX_HEAD_KV          = 1,
-    DS4_MAX_HEAD_DIM         = 576,
+    DS4_MAX_HEAD_DIM         = 512,
     DS4_MAX_VALUE_DIM        = 512,
     DS4_MAX_ROT              = 64,
-    DS4_MAX_OUT_GROUP        = 16,
-    DS4_MAX_LORA_Q           = 2048,
+    DS4_MAX_OUT_GROUP        = 8,
+    DS4_MAX_LORA_Q           = 1024,
     DS4_MAX_LORA_O           = 1024,
-    DS4_MAX_EXPERT           = 384,
-    DS4_MAX_EXPERT_USED      = 8,
+    DS4_MAX_EXPERT           = 256,
+    DS4_MAX_EXPERT_USED      = 6,
     DS4_MAX_EXPERT_SHARED    = 1,
-    DS4_MAX_FF_EXP           = 3072,
+    DS4_MAX_FF_EXP           = 2048,
     DS4_MAX_HASH_LAYER       = 3,
     DS4_MAX_SWA              = 128,
     DS4_MAX_INDEXER_HEAD     = 64,
     DS4_MAX_INDEXER_HEAD_DIM = 128,
-    DS4_MAX_INDEXER_TOP_K    = 2048,
+    DS4_MAX_INDEXER_TOP_K    = 512,
     DS4_MAX_HC               = 4,
     DS4_MAX_HC_SINKHORN_ITER = 20,
 };
 
 typedef enum {
-    DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
-    DS4_MODEL_FAMILY_GLM_DSA   = 1,
-} ds4_model_family;
-
-typedef enum {
     DS4_VARIANT_FLASH = 0,
-    DS4_VARIANT_PRO   = 1,
-    DS4_VARIANT_GLM52 = 2,
 } ds4_variant;
 
 typedef struct {
     const char *name;
-    ds4_model_family family;
     ds4_variant variant;
     uint32_t n_layer;
     uint32_t n_embd;
@@ -513,7 +414,6 @@ typedef struct {
     uint32_t n_expert_used;
     uint32_t n_expert_shared;
     uint32_t n_ff_exp;
-    uint32_t n_ff_dense;
     uint32_t n_hash_layer;
     uint32_t n_swa;
     uint32_t n_indexer_head;
@@ -521,11 +421,6 @@ typedef struct {
     uint32_t n_indexer_top_k;
     uint32_t n_hc;
     uint32_t n_hc_sinkhorn_iter;
-    uint32_t n_nextn_predict;
-    uint32_t n_leading_dense;
-    uint32_t n_kv_lora;
-    uint32_t n_key_mla;
-    uint32_t n_value_mla;
     float rms_eps;
     float hc_eps;
     float expert_weight_scale;
@@ -540,7 +435,6 @@ typedef struct {
 
 static const ds4_shape DS4_SHAPE_FLASH = {
     .name = "DeepSeek V4 Flash",
-    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
     .variant = DS4_VARIANT_FLASH,
     .n_layer = 43,
     .n_embd = 4096,
@@ -576,91 +470,8 @@ static const ds4_shape DS4_SHAPE_FLASH = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
-static const ds4_shape DS4_SHAPE_PRO = {
-    .name = "DeepSeek V4 Pro",
-    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
-    .variant = DS4_VARIANT_PRO,
-    .n_layer = 61,
-    .n_embd = 7168,
-    .n_vocab = 129280,
-    .n_head = 128,
-    .n_head_kv = 1,
-    .n_head_dim = 512,
-    .n_value_dim = 512,
-    .n_rot = 64,
-    .n_out_group = 16,
-    .n_lora_q = 1536,
-    .n_lora_o = 1024,
-    .n_expert = 384,
-    .n_expert_used = 6,
-    .n_expert_shared = 1,
-    .n_ff_exp = 3072,
-    .n_hash_layer = 3,
-    .n_swa = 128,
-    .n_indexer_head = 64,
-    .n_indexer_head_dim = 128,
-    .n_indexer_top_k = 1024,
-    .n_hc = 4,
-    .n_hc_sinkhorn_iter = 20,
-    .rms_eps = DS4_DEFAULT_RMS_EPS,
-    .hc_eps = DS4_DEFAULT_HC_EPS,
-    .expert_weight_scale = 2.5f,
-    .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
-    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
-    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
-    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
-    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
-    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
-    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
-};
-
-static const ds4_shape DS4_SHAPE_GLM52 = {
-    .name = "GLM 5.2",
-    .family = DS4_MODEL_FAMILY_GLM_DSA,
-    .variant = DS4_VARIANT_GLM52,
-    .n_layer = 79,
-    .n_embd = 6144,
-    .n_vocab = 154880,
-    .n_head = 64,
-    .n_head_kv = 1,
-    .n_head_dim = 576,
-    .n_value_dim = 512,
-    .n_rot = 64,
-    .n_out_group = 0,
-    .n_lora_q = 2048,
-    .n_lora_o = 0,
-    .n_expert = 256,
-    .n_expert_used = 8,
-    .n_expert_shared = 1,
-    .n_ff_exp = 2048,
-    .n_ff_dense = 12288,
-    .n_hash_layer = 0,
-    .n_swa = 0,
-    .n_indexer_head = 32,
-    .n_indexer_head_dim = 128,
-    .n_indexer_top_k = 2048,
-    .n_hc = 0,
-    .n_hc_sinkhorn_iter = 0,
-    .n_nextn_predict = 1,
-    .n_leading_dense = 3,
-    .n_kv_lora = 512,
-    .n_key_mla = 256,
-    .n_value_mla = 256,
-    .rms_eps = 1.0e-5f,
-    .hc_eps = 0.0f,
-    .expert_weight_scale = 2.5f,
-    .swiglu_clamp_exp = 0.0f,
-    .rope_freq_base = 8000000.0f,
-    .rope_scale_factor = 1.0f,
-    .rope_yarn_beta_fast = 0.0f,
-    .rope_yarn_beta_slow = 0.0f,
-    .compress_rope_freq_base = 0.0f,
-    .rope_orig_ctx = 1048576,
-};
-
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
-    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
     .variant = DS4_VARIANT_FLASH,
     .n_layer = 43,
     .n_embd = 4096,
@@ -699,7 +510,6 @@ static ds4_shape g_ds4_shape = {
 static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 
 #define DS4_MODEL_SHAPE_NAME          (g_ds4_shape.name)
-#define DS4_MODEL_FAMILY              (g_ds4_shape.family)
 #define DS4_MODEL_VARIANT             (g_ds4_shape.variant)
 #define DS4_N_LAYER                   (g_ds4_shape.n_layer)
 #define DS4_N_EMBD                    (g_ds4_shape.n_embd)
@@ -716,7 +526,6 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_EXPERT_USED             (g_ds4_shape.n_expert_used)
 #define DS4_N_EXPERT_SHARED           (g_ds4_shape.n_expert_shared)
 #define DS4_N_FF_EXP                  (g_ds4_shape.n_ff_exp)
-#define DS4_N_FF_DENSE                (g_ds4_shape.n_ff_dense)
 #define DS4_N_HASH_LAYER              (g_ds4_shape.n_hash_layer)
 #define DS4_N_SWA                     (g_ds4_shape.n_swa)
 #define DS4_N_INDEXER_HEAD            (g_ds4_shape.n_indexer_head)
@@ -724,11 +533,6 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_INDEXER_TOP_K           (g_ds4_shape.n_indexer_top_k)
 #define DS4_N_HC                      (g_ds4_shape.n_hc)
 #define DS4_N_HC_SINKHORN_ITER        (g_ds4_shape.n_hc_sinkhorn_iter)
-#define DS4_N_NEXTN_PREDICT           (g_ds4_shape.n_nextn_predict)
-#define DS4_N_LEADING_DENSE           (g_ds4_shape.n_leading_dense)
-#define DS4_N_KV_LORA                 (g_ds4_shape.n_kv_lora)
-#define DS4_N_KEY_MLA                 (g_ds4_shape.n_key_mla)
-#define DS4_N_VALUE_MLA               (g_ds4_shape.n_value_mla)
 #define DS4_RMS_EPS                   (g_ds4_shape.rms_eps)
 #define DS4_HC_EPS                    (g_ds4_shape.hc_eps)
 #define DS4_EXPERT_WEIGHT_SCALE       (g_ds4_shape.expert_weight_scale)
@@ -1071,7 +875,6 @@ static void ds4_die(const char *msg) {
 /* Attention compression is read from GGUF metadata after validating that it
  * matches the exact layout expected for the loaded model shape. */
 static uint32_t ds4_layer_compress_ratio(uint32_t il) {
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return 0;
     if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
     return g_ds4_compress_ratios[il];
 }
@@ -1079,17 +882,8 @@ static uint32_t ds4_layer_compress_ratio(uint32_t il) {
 static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
     if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
 
-    switch (DS4_MODEL_VARIANT) {
-    case DS4_VARIANT_FLASH:
-        if (il < 2) return 0;
-        return (il & 1u) == 0 ? 4u : 128u;
-    case DS4_VARIANT_PRO:
-        if (il < 2) return 128u;
-        return (il & 1u) == 0 ? 4u : 128u;
-    default:
-        ds4_die("unsupported DeepSeek4 model variant");
-    }
-    return 0;
+    if (il < 2) return 0;
+    return (il & 1u) == 0 ? 4u : 128u;
 }
 
 static void ds4_die_errno(const char *what, const char *path) {
@@ -1207,465 +1001,6 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
-/* =========================================================================
- * Metal Routed Expert Locality Profiler.
- * =========================================================================
- *
- * SSD streaming decode needs routed-expert locality data before a cache policy
- * is meaningful. This profiler is intentionally Metal-decode-only for now:
- * it reads the tiny selected-expert and route-weight tensors after router
- * selection, records histograms, and simulates per-layer latest-N unique expert
- * caches without changing normal inference when disabled.
- */
-
-enum { DS4_EXPERT_PROFILE_MAX_CAPS = 10 };
-
-static const uint32_t ds4_expert_profile_cap_candidates[DS4_EXPERT_PROFILE_MAX_CAPS] = {
-    1, 2, 4, 8, 16, 32, 64, 128, 256, 384
-};
-
-typedef struct {
-    int      expert_id;
-    uint64_t count;
-    double   weight;
-} ds4_expert_profile_sort_entry;
-
-typedef struct {
-    bool active;
-    char *path;
-    char *hotlist_path;
-    char model_name[64];
-    uint32_t n_layer;
-    uint32_t n_expert;
-    uint32_t n_expert_used;
-    uint32_t n_caps;
-    uint32_t caps[DS4_EXPERT_PROFILE_MAX_CAPS];
-    uint64_t layer_records[DS4_MAX_LAYER];
-    uint64_t hist[DS4_MAX_LAYER][DS4_MAX_EXPERT];
-    double weight_hist[DS4_MAX_LAYER][DS4_MAX_EXPERT];
-    uint64_t cache_hits[DS4_EXPERT_PROFILE_MAX_CAPS][DS4_MAX_LAYER];
-    double cache_weight_hits[DS4_EXPERT_PROFILE_MAX_CAPS][DS4_MAX_LAYER];
-    int cache_entries[DS4_EXPERT_PROFILE_MAX_CAPS][DS4_MAX_LAYER][DS4_MAX_EXPERT];
-    uint32_t cache_count[DS4_EXPERT_PROFILE_MAX_CAPS][DS4_MAX_LAYER];
-    bool prev_valid[DS4_MAX_LAYER];
-    uint32_t prev_pos[DS4_MAX_LAYER];
-    int prev_selected[DS4_MAX_LAYER][DS4_MAX_EXPERT_USED];
-    uint64_t adjacent_pairs[DS4_MAX_LAYER];
-    double adjacent_overlap_sum[DS4_MAX_LAYER];
-    double adjacent_jaccard_sum[DS4_MAX_LAYER];
-    bool layer_is_hash[DS4_MAX_LAYER];
-    uint64_t total_records;
-    uint64_t total_selections;
-    double total_weight;
-} ds4_expert_profile;
-
-static ds4_expert_profile g_expert_profile;
-
-static int ds4_expert_profile_sort_cmp(const void *a, const void *b) {
-    const ds4_expert_profile_sort_entry *ea = a;
-    const ds4_expert_profile_sort_entry *eb = b;
-    if (ea->count < eb->count) return 1;
-    if (ea->count > eb->count) return -1;
-    if (ea->weight < eb->weight) return 1;
-    if (ea->weight > eb->weight) return -1;
-    return ea->expert_id - eb->expert_id;
-}
-
-typedef struct {
-    uint32_t layer;
-    uint32_t expert;
-    uint64_t count;
-    double weight;
-} ds4_expert_hotlist_entry;
-
-static int ds4_expert_hotlist_sort_cmp(const void *a, const void *b) {
-    const ds4_expert_hotlist_entry *ea = a;
-    const ds4_expert_hotlist_entry *eb = b;
-    if (ea->count < eb->count) return 1;
-    if (ea->count > eb->count) return -1;
-    if (ea->weight < eb->weight) return 1;
-    if (ea->weight > eb->weight) return -1;
-    if (ea->layer != eb->layer) return ea->layer < eb->layer ? -1 : 1;
-    if (ea->expert != eb->expert) return ea->expert < eb->expert ? -1 : 1;
-    return 0;
-}
-
-#include "ds4_streaming_hotlist.inc"
-#include "ds4_streaming_hotlist_glm52.inc"
-
-static void ds4_json_write_string(FILE *fp, const char *s) {
-    fputc('"', fp);
-    if (s) {
-        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-            switch (*p) {
-            case '"':  fputs("\\\"", fp); break;
-            case '\\': fputs("\\\\", fp); break;
-            case '\b': fputs("\\b", fp); break;
-            case '\f': fputs("\\f", fp); break;
-            case '\n': fputs("\\n", fp); break;
-            case '\r': fputs("\\r", fp); break;
-            case '\t': fputs("\\t", fp); break;
-            default:
-                if (*p < 0x20) fprintf(fp, "\\u%04x", (unsigned)*p);
-                else fputc((char)*p, fp);
-                break;
-            }
-        }
-    }
-    fputc('"', fp);
-}
-
-static void ds4_expert_profile_init(const char *path, const char *hotlist_path) {
-    if ((!path || !path[0]) && (!hotlist_path || !hotlist_path[0])) return;
-    if (g_expert_profile.active) {
-        free(g_expert_profile.path);
-        free(g_expert_profile.hotlist_path);
-        memset(&g_expert_profile, 0, sizeof(g_expert_profile));
-    }
-
-    g_expert_profile.active = true;
-    if (path && path[0]) g_expert_profile.path = ds4_strdup(path);
-    if (hotlist_path && hotlist_path[0]) {
-        g_expert_profile.hotlist_path = ds4_strdup(hotlist_path);
-    }
-    snprintf(g_expert_profile.model_name,
-             sizeof(g_expert_profile.model_name),
-             "%s",
-             DS4_MODEL_SHAPE_NAME);
-    g_expert_profile.n_layer = DS4_N_LAYER;
-    g_expert_profile.n_expert = DS4_N_EXPERT;
-    g_expert_profile.n_expert_used = DS4_N_EXPERT_USED;
-
-    for (uint32_t i = 0; i < DS4_EXPERT_PROFILE_MAX_CAPS; i++) {
-        const uint32_t cap = ds4_expert_profile_cap_candidates[i];
-        if (cap == 0 || cap > DS4_N_EXPERT) continue;
-        g_expert_profile.caps[g_expert_profile.n_caps++] = cap;
-    }
-    fprintf(stderr,
-            "ds4: Metal expert locality profiler active (profile: %s, hotlist: %s)\n",
-            g_expert_profile.path ? g_expert_profile.path : "disabled",
-            g_expert_profile.hotlist_path ? g_expert_profile.hotlist_path : "disabled");
-}
-
-static void ds4_expert_profile_cache_use(
-        uint32_t ci,
-        uint32_t il,
-        int      expert,
-        float    weight) {
-    ds4_expert_profile *p = &g_expert_profile;
-    const uint32_t cap = p->caps[ci];
-    int *entries = p->cache_entries[ci][il];
-    uint32_t *count = &p->cache_count[ci][il];
-    uint32_t found = UINT32_MAX;
-
-    for (uint32_t i = 0; i < *count; i++) {
-        if (entries[i] == expert) {
-            found = i;
-            break;
-        }
-    }
-
-    if (found != UINT32_MAX) {
-        p->cache_hits[ci][il]++;
-        p->cache_weight_hits[ci][il] += weight;
-        for (uint32_t i = found; i > 0; i--) entries[i] = entries[i - 1];
-        entries[0] = expert;
-        return;
-    }
-
-    uint32_t n = *count;
-    if (n < cap) {
-        (*count)++;
-    } else if (n > 0) {
-        n = cap - 1;
-    }
-    for (uint32_t i = n; i > 0; i--) entries[i] = entries[i - 1];
-    entries[0] = expert;
-}
-
-static void ds4_expert_profile_record(
-        uint32_t      il,
-        uint32_t      pos,
-        const int32_t selected[DS4_MAX_EXPERT_USED],
-        const float   weights[DS4_MAX_EXPERT_USED],
-        bool          is_hash) {
-    ds4_expert_profile *p = &g_expert_profile;
-    if (!p->active || il >= p->n_layer) return;
-
-    p->layer_records[il]++;
-    p->total_records++;
-    if (is_hash) p->layer_is_hash[il] = true;
-
-    if (p->prev_valid[il] && p->prev_pos[il] + 1u == pos) {
-        uint32_t intersection = 0;
-        for (uint32_t a = 0; a < p->n_expert_used; a++) {
-            for (uint32_t b = 0; b < p->n_expert_used; b++) {
-                if (p->prev_selected[il][a] == selected[b]) {
-                    intersection++;
-                    break;
-                }
-            }
-        }
-        const uint32_t union_size = 2u * p->n_expert_used - intersection;
-        p->adjacent_pairs[il]++;
-        p->adjacent_overlap_sum[il] +=
-            (double)intersection / (double)p->n_expert_used;
-        if (union_size != 0) {
-            p->adjacent_jaccard_sum[il] +=
-                (double)intersection / (double)union_size;
-        }
-    }
-
-    p->prev_valid[il] = true;
-    p->prev_pos[il] = pos;
-
-    for (uint32_t slot = 0; slot < p->n_expert_used; slot++) {
-        const int expert = selected[slot];
-        const float weight = weights[slot];
-        p->prev_selected[il][slot] = expert;
-        if (expert < 0 || (uint32_t)expert >= p->n_expert) continue;
-        p->hist[il][expert]++;
-        p->weight_hist[il][expert] += weight;
-        p->total_selections++;
-        p->total_weight += weight;
-        for (uint32_t ci = 0; ci < p->n_caps; ci++) {
-            ds4_expert_profile_cache_use(ci, il, expert, weight);
-        }
-    }
-}
-
-static void ds4_expert_profile_write_cache_summary(FILE *fp) {
-    ds4_expert_profile *p = &g_expert_profile;
-    fputs("  \"cache_summary\": [\n", fp);
-    for (uint32_t ci = 0; ci < p->n_caps; ci++) {
-        uint64_t hits = 0;
-        double weight_hits = 0.0;
-        for (uint32_t il = 0; il < p->n_layer; il++) {
-            hits += p->cache_hits[ci][il];
-            weight_hits += p->cache_weight_hits[ci][il];
-        }
-        const double hit_rate = p->total_selections ?
-            (double)hits / (double)p->total_selections : 0.0;
-        const double weight_hit_rate = p->total_weight > 0.0 ?
-            weight_hits / p->total_weight : 0.0;
-        fprintf(fp,
-                "    {\"n\":%u,\"hits\":%" PRIu64 ",\"selections\":%" PRIu64
-                ",\"hit_rate\":%.6f,\"weighted_hit_rate\":%.6f}%s\n",
-                p->caps[ci],
-                hits,
-                p->total_selections,
-                hit_rate,
-                weight_hit_rate,
-                ci + 1u == p->n_caps ? "" : ",");
-    }
-    fputs("  ],\n", fp);
-}
-
-static void ds4_expert_profile_write_layer(FILE *fp, uint32_t il) {
-    ds4_expert_profile *p = &g_expert_profile;
-    ds4_expert_profile_sort_entry entries[DS4_MAX_EXPERT];
-    uint32_t unique = 0;
-    uint64_t selections = 0;
-    double weight_total = 0.0;
-
-    for (uint32_t e = 0; e < p->n_expert; e++) {
-        const uint64_t count = p->hist[il][e];
-        selections += count;
-        weight_total += p->weight_hist[il][e];
-        if (count == 0) continue;
-        entries[unique++] = (ds4_expert_profile_sort_entry) {
-            .expert_id = (int)e,
-            .count = count,
-            .weight = p->weight_hist[il][e],
-        };
-    }
-    qsort(entries, unique, sizeof(entries[0]), ds4_expert_profile_sort_cmp);
-
-    const double avg_overlap = p->adjacent_pairs[il] ?
-        p->adjacent_overlap_sum[il] / (double)p->adjacent_pairs[il] : 0.0;
-    const double avg_jaccard = p->adjacent_pairs[il] ?
-        p->adjacent_jaccard_sum[il] / (double)p->adjacent_pairs[il] : 0.0;
-
-    fprintf(fp,
-            "    {\"layer\":%u,\"hash_router\":%s,\"records\":%" PRIu64
-            ",\"selections\":%" PRIu64 ",\"unique_experts\":%u"
-            ",\"avg_adjacent_overlap\":%.6f,\"avg_adjacent_jaccard\":%.6f,\n",
-            il,
-            p->layer_is_hash[il] ? "true" : "false",
-            p->layer_records[il],
-            selections,
-            unique,
-            avg_overlap,
-            avg_jaccard);
-
-    fputs("      \"top_experts\": [", fp);
-    const uint32_t top_n = unique < 16u ? unique : 16u;
-    for (uint32_t i = 0; i < top_n; i++) {
-        const double pct = selections ?
-            100.0 * (double)entries[i].count / (double)selections : 0.0;
-        const double weight_pct = weight_total > 0.0 ?
-            100.0 * entries[i].weight / weight_total : 0.0;
-        if (i) fputc(',', fp);
-        fprintf(fp,
-                "{\"id\":%d,\"count\":%" PRIu64 ",\"pct\":%.4f"
-                ",\"weight\":%.9g,\"weight_pct\":%.4f}",
-                entries[i].expert_id,
-                entries[i].count,
-                pct,
-                entries[i].weight,
-                weight_pct);
-    }
-    fputs("],\n", fp);
-
-    fputs("      \"cache\": [", fp);
-    for (uint32_t ci = 0; ci < p->n_caps; ci++) {
-        const uint64_t hits = p->cache_hits[ci][il];
-        const double weight_hits = p->cache_weight_hits[ci][il];
-        const double hit_rate = selections ?
-            (double)hits / (double)selections : 0.0;
-        const double weight_hit_rate = weight_total > 0.0 ?
-            weight_hits / weight_total : 0.0;
-        if (ci) fputc(',', fp);
-        fprintf(fp,
-                "{\"n\":%u,\"hits\":%" PRIu64 ",\"hit_rate\":%.6f"
-                ",\"weighted_hit_rate\":%.6f}",
-                p->caps[ci],
-                hits,
-                hit_rate,
-                weight_hit_rate);
-    }
-    fputs("]}", fp);
-}
-
-static void ds4_expert_profile_write_hotlist_file(ds4_expert_profile *p) {
-    if (!p || !p->hotlist_path || !p->hotlist_path[0]) return;
-    const size_t cap = (size_t)p->n_layer * p->n_expert;
-    ds4_expert_hotlist_entry *entries = xmalloc(cap * sizeof(entries[0]));
-    size_t n = 0;
-    for (uint32_t il = 0; il < p->n_layer; il++) {
-        for (uint32_t expert = 0; expert < p->n_expert; expert++) {
-            entries[n++] = (ds4_expert_hotlist_entry) {
-                .layer = il,
-                .expert = expert,
-                .count = p->hist[il][expert],
-                .weight = p->weight_hist[il][expert],
-            };
-        }
-    }
-    qsort(entries, n, sizeof(entries[0]), ds4_expert_hotlist_sort_cmp);
-
-    FILE *fp = fopen(p->hotlist_path, "wb");
-    if (!fp) {
-        fprintf(stderr,
-                "ds4: failed to open expert hotlist output %s: %s\n",
-                p->hotlist_path,
-                strerror(errno));
-        free(entries);
-        return;
-    }
-    fprintf(fp,
-            "# ds4 expert hotlist v1\n"
-            "# model %s\n"
-            "# layers %u\n"
-            "# experts %u\n"
-            "# layer_records %" PRIu64 "\n"
-            "# selections %" PRIu64 "\n"
-            "# columns: layer expert hits weight\n",
-            p->model_name,
-            p->n_layer,
-            p->n_expert,
-            p->total_records,
-            p->total_selections);
-    for (size_t i = 0; i < n; i++) {
-        fprintf(fp,
-                "%u %u %" PRIu64 " %.17g\n",
-                entries[i].layer,
-                entries[i].expert,
-                entries[i].count,
-                entries[i].weight);
-    }
-    free(entries);
-
-    if (fclose(fp) != 0) {
-        fprintf(stderr,
-                "ds4: failed to close expert hotlist output %s: %s\n",
-                p->hotlist_path,
-                strerror(errno));
-    } else {
-        fprintf(stderr,
-                "ds4: wrote Metal expert hotlist to %s "
-                "(%" PRIu64 " layer records, %" PRIu64 " selections)\n",
-                p->hotlist_path,
-                p->total_records,
-                p->total_selections);
-    }
-}
-
-static void ds4_expert_profile_close(void) {
-    ds4_expert_profile *p = &g_expert_profile;
-    if (!p->active) return;
-
-    if (p->path) {
-        FILE *fp = fopen(p->path, "wb");
-        if (!fp) {
-            fprintf(stderr,
-                    "ds4: failed to open expert profile output %s: %s\n",
-                    p->path,
-                    strerror(errno));
-        } else {
-
-            fputs("{\n", fp);
-            fputs("  \"source\": \"ds4 Metal expert locality profile\",\n", fp);
-            fputs("  \"model\": ", fp);
-            ds4_json_write_string(fp, p->model_name);
-            fputs(",\n", fp);
-            fprintf(fp,
-                    "  \"layers\": %u,\n"
-                    "  \"experts\": %u,\n"
-                    "  \"expert_used\": %u,\n"
-                    "  \"layer_records\": %" PRIu64 ",\n"
-                    "  \"selections\": %" PRIu64 ",\n",
-                    p->n_layer,
-                    p->n_expert,
-                    p->n_expert_used,
-                    p->total_records,
-                    p->total_selections);
-            fputs("  \"cache_ns\": [", fp);
-            for (uint32_t ci = 0; ci < p->n_caps; ci++) {
-                if (ci) fputc(',', fp);
-                fprintf(fp, "%u", p->caps[ci]);
-            }
-            fputs("],\n", fp);
-            ds4_expert_profile_write_cache_summary(fp);
-            fputs("  \"layers_detail\": [\n", fp);
-            for (uint32_t il = 0; il < p->n_layer; il++) {
-                ds4_expert_profile_write_layer(fp, il);
-                fputs(il + 1u == p->n_layer ? "\n" : ",\n", fp);
-            }
-            fputs("  ]\n}\n", fp);
-
-            if (fclose(fp) != 0) {
-                fprintf(stderr,
-                        "ds4: failed to close expert profile output %s: %s\n",
-                        p->path,
-                        strerror(errno));
-            } else {
-                fprintf(stderr,
-                        "ds4: wrote Metal expert locality profile to %s "
-                        "(%" PRIu64 " layer records, %" PRIu64 " selections)\n",
-                        p->path,
-                        p->total_records,
-                        p->total_selections);
-            }
-        }
-    }
-    ds4_expert_profile_write_hotlist_file(p);
-
-    free(p->path);
-    free(p->hotlist_path);
-    memset(p, 0, sizeof(*p));
-}
-
 static void sleep_sec(double sec) {
     if (sec <= 0.0 || !isfinite(sec)) return;
     struct timespec req;
@@ -1763,17 +1098,6 @@ static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
     }
     return true;
 }
-
-static bool cpu_directional_steering_enabled(
-        const float *dirs,
-        float        scale);
-
-static void cpu_directional_steering_project_rows(
-        float       *x,
-        const float *dirs,
-        uint32_t     il,
-        uint32_t     rows,
-        float        scale);
 
 typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
@@ -1986,4 +1310,3 @@ static uint64_t align_up(uint64_t value, uint64_t alignment) {
     uint64_t rem = value % alignment;
     return rem == 0 ? value : value + alignment - rem;
 }
-

@@ -1,0 +1,103 @@
+# CUDA backend architecture
+
+DS4X keeps the engine-facing `ds4_gpu_*` C ABI stable while moving kernel
+implementation toward ordinary, independently testable CUDA C++ translation
+units. This document defines that boundary so source cleanup does not silently
+change model semantics or DGX Spark performance.
+
+The complete migration order, including the later DSpark and Codex adapter
+phases, is defined in [`roadmap.md`](roadmap.md). This document covers only the
+device/backend boundary.
+
+## Layers
+
+```text
+engine C code
+    -> ds4_gpu_* compatibility and resource wrappers
+        -> measured backend dispatch
+            -> cuBLAS / existing packed kernels
+            -> standalone CUDA C++ operators
+            -> CUTLASS/CuTe operators
+```
+
+The temporary compatibility layer owns model offsets, cache residency,
+temporary-buffer allocation and user-visible diagnostics. A standalone
+operator receives resolved device pointers, dimensions, one stream and an
+explicit workspace. It does not know about GGUF, sessions, placement, DSpark
+acceptance or Codex protocols.
+
+As of the Phase 2 release, every model-visible target hot path enters this
+operator boundary. Some adapters deliberately call the already validated
+packed kernel implementation in `backend/parts/`; migration means the engine
+no longer depends on private kernel ordering or untyped argument lists, not
+that a slower replacement kernel must be selected.
+
+## Source ownership
+
+- `backend/ds4x_kernel.cu` is the dependency-ordered aggregation unit for code
+  that still shares private state across subsystem includes.
+- `backend/parts/` contains those historical subsystems. Moving a kernel out is
+  preferred to growing these files further.
+- `backends/` contains independent CUDA C++ implementations. Files expose a
+  narrow launch ABI through `include/ds4x/` and have focused tests under
+  `tests/ds4x_kernel/backends/`.
+- `backends/operator_adapters.cu` is the typed bridge for packed cache,
+  indexer, attention, routed MoE, hyper-connection and graph-capture paths.
+- `quantization/mmq/` retains the audited llama.cpp-derived quantized kernels
+  and its vendor record.
+
+## FP16 projection dispatch
+
+The logical operation is:
+
+```text
+output[tokens, out] = activations[tokens, in] * weights[in, out]
+```
+
+GGUF stores the FP16 weight bytes as row-major `[out, in]`. That is the same
+physical layout as the column-major `[in, out]` view used by cuBLAS and
+CUTLASS. Activations are converted from FP32 to FP16 once before either GEMM;
+accumulation and output remain FP32.
+
+The default backend policy is empirical:
+
+- small compressor, router and output projections remain on cuBLAS or their
+  exact fallback kernels;
+- `in=1024`, `out=8192`, `tokens>=2048` uses CUTLASS, matching the production
+  indexer `q_b` shape that wins on GB10;
+- unsupported or failed CUTLASS launches fall back to cuBLAS;
+- `DS4_CUDA_F16_BACKEND=cublas` disables CUTLASS, while `cutlass` is a research
+  override that attempts it for every supported batch shape.
+
+No runtime autotuning occurs in inference. It would add synchronization and
+first-request latency, and a noisy first sample is not a safe production
+policy. The checked-in threshold comes from the reproducible backend benchmark.
+
+## Blackwell boundary
+
+DGX Spark GB10 is `sm_121`. Its FP16 Tensor Core path is warp-level
+`mma.sync`, not the SM100 data-center `tcgen05` path. CUTLASS 4.6.2 supports
+SM120/SM121, but its SM120 CollectiveBuilder currently restricts the dense
+non-block-scaled mainloop to F8/F6/F4 inputs. DS4X therefore uses:
+
+- an SM80-tagged, forward-compatible CUTLASS FP16 TensorOp composition for
+  `mma.sync`;
+- native SM121/CuTe or CUTLASS SM120 features only when their input formats and
+  hardware contracts actually match;
+- cluster shape `1x1x1`, because GB10 does not expose the data-center
+  multicast assumptions used by SM100 kernels.
+
+## Change gate
+
+Every dispatch or kernel change must pass all of the following on DGX Spark:
+
+1. focused numerical parity for the operator;
+2. `make kernel-test` for packed cache, attention, indexer and MMQ coverage;
+3. full-logit or task-level comparison for any model-visible path;
+4. real prefill benchmarking when a batch kernel changes;
+5. the 128K, 256K, 512K and 1M synthetic decode sweep;
+6. fallback verification with the relevant backend override.
+
+A backend is enabled by default only for shapes where measured end-to-end
+performance does not regress. Faster isolated kernels are insufficient if they
+add conversion, workspace, synchronization or graph-capture overhead.

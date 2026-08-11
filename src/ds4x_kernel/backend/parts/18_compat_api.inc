@@ -14,86 +14,6 @@ extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     return ok;
 }
 
-extern "C" int ds4_gpu_pro_q4_expert_table_auto_available(void) {
-    return 0;
-}
-
-extern "C" int ds4_gpu_preload_q4_expert_tables(
-        const void *model_map, uint64_t model_size,
-        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
-        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
-        uint32_t n_total_expert) {
-    (void)model_map; (void)model_size;
-    (void)gate_offset; (void)up_offset; (void)down_offset;
-    (void)gate_expert_bytes; (void)down_expert_bytes;
-    (void)n_total_expert;
-    return 1;
-}
-
-extern "C" void ds4_gpu_set_glm_model(bool enabled) {
-    (void)enabled;
-}
-
-extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
-    g_ssd_streaming_mode = enabled ? 1 : 0;
-    cuda_stream_selected_cache_invalidate();
-    if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
-}
-
-extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    (void)experts;
-}
-
-extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
-    (void)bytes;
-}
-
-extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
-    return 0;
-}
-
-extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    return g_stream_selected_cache.valid ?
-        g_stream_selected_cache.compact_count : 0;
-}
-
-extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
-}
-
-extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
-    cuda_stream_selected_cache_release();
-}
-
-extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
-        const ds4_gpu_stream_expert_table *table,
-        const int32_t *selected_ids,
-        uint32_t n_selected) {
-    (void)table; (void)selected_ids; (void)n_selected;
-    return 1;
-}
-
-extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
-        const ds4_gpu_stream_expert_table *table,
-        const int32_t *selected_ids,
-        uint32_t n_tokens,
-        uint32_t n_selected) {
-    if (n_tokens == 0 || n_selected == 0 ||
-        (uint64_t)n_tokens * n_selected > UINT32_MAX) {
-        return 0;
-    }
-    return cuda_stream_selected_cache_begin_load(
-            table, selected_ids, n_tokens * n_selected);
-}
-
-extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
-        const ds4_gpu_stream_expert_table *table,
-        const int32_t *expert_ids,
-        const uint32_t *expert_priorities,
-        uint32_t n_experts) {
-    (void)table; (void)expert_ids; (void)expert_priorities; (void)n_experts;
-    return 1;
-}
-
 extern "C" int ds4_gpu_argmax_tensor(
         ds4_gpu_tensor *out_idx,
         const ds4_gpu_tensor *logits,
@@ -101,88 +21,48 @@ extern "C" int ds4_gpu_argmax_tensor(
     return ds4_gpu_indexer_topk_tensor(out_idx, logits, n_vocab, 1u, 1u);
 }
 
-extern "C" int ds4_gpu_embed_token_q8_0_tensor(
-        ds4_gpu_tensor *out,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t weight_offset,
-        uint32_t n_vocab,
-        uint32_t token,
-        uint32_t n_embd) {
-    return ds4_gpu_embed_token_quant_tensor(out, model_map, model_size,
-                                            weight_offset, 8u, n_vocab,
-                                            token, n_embd);
-}
-
-extern "C" int ds4_gpu_embed_tokens_q8_0_tensor(
-        ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *tokens,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t weight_offset,
-        uint32_t n_vocab,
-        uint32_t n_tokens,
-        uint32_t n_embd) {
-    return ds4_gpu_embed_tokens_quant_tensor(out, tokens, model_map,
-                                             model_size, weight_offset, 8u,
-                                             n_vocab, n_tokens, n_embd);
-}
-
-extern "C" int ds4_gpu_glm_k_b_project_tensor(
-        ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *kv_norm,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t weight_offset,
-        uint32_t n_tokens,
-        uint32_t kv_lora_dim,
-        uint32_t qk_nope,
-        uint32_t n_head) {
-    return ds4_gpu_glm_k_b_project_typed_tensor(
-            out, kv_norm, model_map, model_size, weight_offset, 8u,
-            n_tokens, kv_lora_dim, qk_nope, n_head);
-}
-
-extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
-        ds4_gpu_tensor *out,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t weight_offset,
-        uint64_t full_in_dim,
-        uint64_t k_off,
-        uint64_t k_cnt,
-        uint64_t out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t x_elem_off) {
-    if (!x || x_elem_off > x->bytes / sizeof(float) ||
-        k_cnt > x->bytes / sizeof(float) - x_elem_off) {
-        return 0;
-    }
-    ds4_gpu_tensor x_slice = *x;
-    x_slice.ptr = (char *)x->ptr + x_elem_off * sizeof(float);
-    x_slice.bytes = k_cnt * sizeof(float);
-    x_slice.owner = 0;
-    return ds4_gpu_matmul_q8_0_kslice_rows_tensor(
-            out, model_map, model_size, weight_offset,
-            full_in_dim, out_dim, k_off, k_cnt, &x_slice, 1u);
-}
-
-extern "C" int ds4_gpu_matmul_quant_kslice_tensor(
+extern "C" int ds4_gpu_matmul_quant_tensor(
         ds4_gpu_tensor *out,
         const void *model_map,
         uint64_t model_size,
         uint64_t weight_offset,
         uint32_t weight_type,
-        uint64_t full_in_dim,
-        uint64_t k_off,
-        uint64_t k_cnt,
+        uint64_t in_dim,
         uint64_t out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t x_elem_off) {
-    if (weight_type != 8u) return 0;
-    return ds4_gpu_matmul_q8_0_kslice_tensor(
-            out, model_map, model_size, weight_offset,
-            full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off);
+        uint64_t n_tok) {
+    switch (weight_type) {
+    case 1u:
+        return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
+                                         weight_offset, in_dim, out_dim,
+                                         x, n_tok);
+    case 8u:
+        return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
+                                          weight_offset, in_dim, out_dim,
+                                          x, n_tok);
+    default:
+        fprintf(stderr, "ds4: unsupported dense matrix type %u\n",
+                weight_type);
+        return 0;
+    }
+}
+
+extern "C" int ds4_gpu_set_model_map_spans(
+        const void *model_map,
+        uint64_t model_size,
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        uint32_t count,
+        uint64_t max_tensor_bytes) {
+    (void)max_tensor_bytes;
+    if (!model_map || !offsets || !sizes || count == 0u) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (offsets[i] > model_size || sizes[i] == 0u ||
+            sizes[i] > model_size - offsets[i]) {
+            return 0;
+        }
+    }
+    return ds4_gpu_set_model_map(model_map, model_size);
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
@@ -298,32 +178,4 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
     return 0;
 }
 
-extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
-    (void)suspend;
-}
-
-extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {
-    (void)paused;
-}
-
-extern "C" void ds4_gpu_model_residency_skip(int skip) {
-    (void)skip;
-}
-
-extern "C" uint64_t ds4_gpu_tp_big_gate_kick(
-        uint32_t layer, uint32_t rows, const ds4_gpu_tensor *out_t,
-        ds4_gpu_tensor *in_t, uint64_t bytes) {
-    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
-    return 0;
-}
-
-extern "C" int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
-    (void)seq;
-    return 0;
-}
-
-extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
-    (void)layer; (void)rows;
-    return 0;
-}
 #pragma GCC diagnostic pop

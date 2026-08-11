@@ -8,6 +8,8 @@ These binaries link the inference engine and kernel layer together.
   and measures exact decode without a million-token prefill.
 - `generate_long_context_story_prompt.py` and
   `long_context_story_prompt.txt` support semantic fact-recall regression.
+- `generate_prefill_benchmark_prompt.py` creates the exact 6,000,000-byte
+  fixture used for the documented 4K and 16K prefill/decode measurements.
 
 Build them with `make perf`; run the packed checkpoint test with
 `make checkpoint-smoke DS4_TEST_MODEL=/path/to/model.gguf`.

@@ -20,6 +20,11 @@
 enum { DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
 
 typedef struct {
+    /* Explicit operator launch state. The GB10 runtime currently uses CUDA's
+     * legacy default stream, but ownership lives with the session graph so a
+     * future stream migration does not reintroduce process-global dispatch. */
+    ds4x_runtime_context runtime;
+
     /* Class P — per-tier replicated kernel scratch buffers.
      * Each used tier has its own copy; active_tier names the slot the
      * current dispatch step reads/writes. Single-tier paths leave
@@ -44,12 +49,6 @@ typedef struct {
     ds4_gpu_tensor *kv_raw_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *kv_by_tier[DS4_MAX_GPUS];
     int active_tier;
-    /* cached engine placement[] (length DS4_N_LAYER + 2) for the
-     * dispatch loops. NULL in single-tier mode — active_tier stays 0 and
-     * dispatch wrappers no-op the tier-switch + cross-device copy. The
-     * pointer aliases e->placement; the engine outlives the graph so this
-     * is safe. */
-    const int *placement;
 
     /* Persistent KV state.  Raw KV is a sliding-window ring per layer.  Ratio-4
      * layers also keep an indexer-compressed cache; ratio-128 layers keep only
@@ -63,8 +62,6 @@ typedef struct {
     ds4_gpu_tensor *layer_index_comp_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_state_score[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_raw_cache_tp[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_attn_comp_cache_tp[DS4_MAX_LAYER];
 
     /* Speculative decoding scratch.  MTP is allowed to mutate graph state only
      * if the target verifier can either commit it or restore the saved
@@ -175,25 +172,7 @@ typedef struct {
     bool dspark_capture_batch_valid;
     int dspark_exec_tier;
     bool dspark_capture_enabled;
-    bool verify_small_batch_tp;
-    uint32_t pipeline_capture_chunk_start;
-    uint32_t pipeline_capture_chunk_len;
-    bool ssd_streaming; /* glm-branch SSD streaming; always false here */
 
-    /* Optional MTP model state.  It has its own raw cache because the drafter
-     * runs on speculative future tokens; target KV state is updated only after
-     * verification accepts draft tokens. */
-    ds4_gpu_tensor *mtp_embed;
-    ds4_gpu_tensor *mtp_enorm;
-    ds4_gpu_tensor *mtp_eproj;
-    ds4_gpu_tensor *mtp_eproj_hc;
-    ds4_gpu_tensor *mtp_hnorm_hc;
-    ds4_gpu_tensor *mtp_hproj_hc;
-    ds4_gpu_tensor *mtp_input_hc;
-    ds4_gpu_tensor *mtp_state_hc;
-    ds4_gpu_tensor *mtp_next_hc;
-    ds4_gpu_tensor *mtp_raw_cache;
-    uint32_t mtp_n_raw;
     uint32_t prefill_cap;
     uint32_t raw_window;
     uint32_t batch_token_offset;
@@ -260,34 +239,13 @@ typedef struct {
     ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
-    bool cuda_tp_decode;
-    bool cuda_tp_attn;
-    bool cuda_tp_attn_peer_read;
-    bool cuda_tp_attn_heads;
-    bool cuda_tp_attn_cache_dup;
-    bool cuda_tp_moe;
-    bool cuda_tp_ep;
-    bool cuda_tp_ep_pack_exact;
-    bool cuda_tp_moe_delay_reduce;
-    bool cuda_tp_moe_copy3_handoff;
-    bool cuda_tp_moe_pack_handoff;
-    bool cuda_tp_moe_peer_read;
-    bool cuda_tp_moe_peer_router;
-    bool cuda_tp_shared;
-    bool cuda_tp_shared_fold;
-    bool cuda_tp_q;
-    bool cuda_tp_output;
-    bool cuda_tp_prefill_ffn;
-    bool cuda_tp_prefill_attn_output;
     bool cuda_q_norm_rope_fuse;
     bool cuda_qkv_kv_rope_fuse;
     bool cuda_qkv_pair;
-    bool cuda_tp_attn_out_hc_fuse;
     bool shared_gate_up_swiglu_fuse;
     bool decode_stage_profile;
     bool decode_index_stage_profile;
     bool output_stage_profile;
-    ds4_gpu_tensor *tp_peer_tmp_by_tier[DS4_MAX_GPUS];
     uint32_t power_percent;
     double prefill_layer_avg_sec[DS4_MAX_LAYER];
     double decode_token_avg_sec;
@@ -295,31 +253,6 @@ typedef struct {
     bool mtp_enabled;
     /* Metal-only prefill helpers retained alongside the CUDA tiered workspace. */
     ds4_gpu_tensor *batch_q_half;
-    ds4_gpu_tensor *prefill_seed_router_selected;
-    uint32_t prefill_seed_tokens;
-    uint64_t prefill_selected_profile_rows;
-    uint64_t prefill_selected_profile_unique;
-    uint64_t prefill_selected_profile_selected_bytes;
-    uint64_t prefill_selected_profile_full_bytes;
-    uint32_t prefill_selected_profile_layers;
-    uint32_t prefill_selected_profile_min_unique;
-    uint32_t prefill_selected_profile_max_unique;
-    uint32_t streaming_preload_experts;
-    bool ssd_streaming_cold;
-    bool streaming_static_decode_map_current;
-    float *cpu_router_norm;
-
-    /* Metal network tensor parallelism. These views alias engine-owned
-     * transport slabs except tp_logits_half, whose view object is session-owned. */
-    uint32_t tp_world;
-    uint32_t tp_rank;
-    ds4_gpu_tensor **tp_out;
-    ds4_gpu_tensor **tp_in;
-    ds4_gpu_tensor **tp_batch_out;
-    ds4_gpu_tensor **tp_batch_in;
-    uint32_t tp_batch_rows;
-    ds4_gpu_tensor *tp_zero;
-    ds4_gpu_tensor *tp_logits_half;
 } ds4_gpu_graph;
 
 /* Tensors that are temporary for chunked prefill and grouped multi-session
@@ -374,6 +307,11 @@ typedef struct {
  * to placement[DS4_N_LAYER + 1]; other tier slots remain NULL. */
 static inline ds4_gpu_tensor *metal_graph_logits(const ds4_gpu_graph *g) {
     return g->logits_by_tier[g->head_tier];
+}
+
+static inline const ds4x_runtime_context *metal_graph_runtime(
+        const ds4_gpu_graph *g) {
+    return g ? &g->runtime : NULL;
 }
 static inline ds4_gpu_tensor *metal_graph_output_pre(const ds4_gpu_graph *g) {
     return g->output_pre_by_tier[g->head_tier];
@@ -493,33 +431,6 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_routed_out)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_ffn_out)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(directional_steering_dirs)
 
-/* dispatch-loop helpers for multi-tier per-layer execution.
- *
- * Single-tier (g->placement == NULL): all helpers are no-ops; active_tier
- * stays 0 from memset; behavior is byte-equivalent to legacy.
- *
- * Multi-tier: each helper switches g->active_tier to the requested tier
- * BEFORE the next kernel-dispatch wrapper reads any Class P accessor. If
- * the source-tier Class P cur_hc (or batch_cur_hc) differs from the new
- * tier's, ds4_gpu_tensor_copy_xdev ferries the active hidden state across
- * the boundary. copy_xdev returns 1 on success, 0 on failure. The
- * destination tensor's device_id was stamped at alloc_on time and is
- * immutable.
- *
- * For decode (one token at a time): metal_graph_set_active_tier_decode
- * swaps to the requested tier and copies cur_hc across the boundary.
- *
- * For batch (chunked prefill): metal_graph_set_active_tier_batch swaps
- * tier and copies batch_cur_hc across the boundary. The next/cur pair
- * is maintained per tier — after a copy, batch_next_hc on the destination
- * tier becomes the swap target for the next layer step on that tier.
- *
- * Helpers always invoke ds4_gpu_set_current_device(tier) so the next
- * kernel-launch sees the correct CUDA device. */
-
-/* ds4_gpu_set_current_device is declared in ds4_gpu_mgpu.h — single-tier
- * (g_n_gpus <= 1) callers no-op. Returns 0 on success. */
-
 #ifdef DS4_NO_GPU
 /* CPU-only builds do not include ds4_gpu.h: mirror the decode-graph key
  * type and stub the capture API (always eager). */
@@ -538,34 +449,6 @@ static inline int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { 
 static inline int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
 static inline void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 static inline void ds4_gpu_decode_graphs_invalidate(void) {}
-static inline int ds4_gpu_set_current_device(int tier) { (void)tier; return 0; }
-static inline int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
-                                            const ds4_gpu_tensor *src,
-                                            uint64_t bytes) {
-    (void)dst; (void)src; (void)bytes; return 1;
-}
-static inline int ds4_gpu_tensor_copy_xdev3(ds4_gpu_tensor       *dst0,
-                                             const ds4_gpu_tensor *src0,
-                                             uint64_t              bytes0,
-                                             ds4_gpu_tensor       *dst1,
-                                             const ds4_gpu_tensor *src1,
-                                             uint64_t              bytes1,
-                                             ds4_gpu_tensor       *dst2,
-                                             const ds4_gpu_tensor *src2,
-                                             uint64_t              bytes2) {
-    (void)dst0; (void)src0; (void)bytes0;
-    (void)dst1; (void)src1; (void)bytes1;
-    (void)dst2; (void)src2; (void)bytes2;
-    return 1;
-}
-static inline int ds4_gpu_tensor_copy_xdev_ordered(ds4_gpu_tensor *dst,
-                                                    const ds4_gpu_tensor *src,
-                                                    uint64_t bytes) {
-    (void)dst; (void)src; (void)bytes; return 1;
-}
-static inline int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier) {
-    (void)src; (void)dst_tier; return 1;
-}
 static inline int ds4_gpu_moe_handoff_pack_tensor(
         ds4_gpu_tensor       *packed,
         const ds4_gpu_tensor *ffn_norm,
@@ -621,69 +504,6 @@ static inline int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
 }
 #endif
 
-/* Returns true on success. Single-tier: no-op success. Multi-tier:
- * sets the CUDA device, then if tier differs from current active_tier,
- * copies cur_hc to the destination tier and updates active_tier. */
-static bool metal_graph_set_active_tier_decode(ds4_gpu_graph *g, int tier) {
-    if (!g->placement) {
-        /* Single-tier: just keep active_tier at 0; no device switch needed. */
-        (void)tier;
-        return true;
-    }
-    if (tier < 0 || tier >= DS4_MAX_GPUS) return false;
-    if (tier == g->active_tier) return true;
-    if (ds4_gpu_set_current_device(tier) != 0) return false;
-    /* Boundary hop: copy cur_hc from source-tier to destination-tier slot. */
-    if (g->active_tier >= 0) {
-        ds4_gpu_tensor *src = g->cur_hc_by_tier[g->active_tier];
-        ds4_gpu_tensor *dst = g->cur_hc_by_tier[tier];
-        if (src && dst) {
-            const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
-            if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) return false;
-        }
-    }
-    g->active_tier = tier;
-    return true;
-}
-
-/* Returns true on success. Same semantics as the decode helper but ferries
- * batch_cur_hc (which contains chunk_tokens * hc_dim floats — variable per
- * prefill call). The caller passes the chunk size in tokens; single-tier
- * paths ignore the argument. */
-static bool metal_graph_set_active_tier_batch(ds4_gpu_graph *g, int tier, uint32_t chunk_tokens) {
-    if (!g->placement) {
-        (void)tier;
-        (void)chunk_tokens;
-        return true;
-    }
-    if (tier < 0 || tier >= DS4_MAX_GPUS) return false;
-    if (tier == g->active_tier) return true;
-    if (ds4_gpu_set_current_device(tier) != 0) return false;
-    if (g->active_tier >= 0) {
-        ds4_gpu_tensor *src = g->batch_cur_hc_by_tier[g->active_tier];
-        ds4_gpu_tensor *dst = g->batch_cur_hc_by_tier[tier];
-        if (src && dst) {
-            const uint64_t hc_bytes =
-                (uint64_t)chunk_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
-            if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) return false;
-        }
-    }
-    g->active_tier = tier;
-    return true;
-}
-
-static bool metal_graph_set_active_tier_no_copy(ds4_gpu_graph *g, int tier) {
-    if (!g->placement) {
-        (void)tier;
-        return true;
-    }
-    if (tier < 0 || tier >= DS4_MAX_GPUS) return false;
-    if (tier == g->active_tier) return true;
-    if (ds4_gpu_set_current_device(tier) != 0) return false;
-    g->active_tier = tier;
-    return true;
-}
-
 /* Upstream: --power N GPU duty-cycle throttling helpers. The single-tier
  * --power=100 path is a no-op; multi-tier inherits the same helpers via
  * graph_power_note_prefill_layer / graph_power_note_decode_token which we
@@ -735,31 +555,6 @@ static void metal_graph_copy_prefill_workspace_pointers(
     DS4_GPU_PREFILL_WORKSPACE_FIELDS(DS4_COPY_PREFILL_FIELD)
 #undef DS4_COPY_PREFILL_FIELD
     dst->batch_q_half = src->batch_q_half;
-    dst->prefill_seed_router_selected = src->prefill_seed_router_selected;
-}
-
-static void metal_graph_transfer_prefill_workspace(
-        ds4_gpu_graph *dst,
-        ds4_gpu_graph *src) {
-    memset(dst, 0, sizeof(*dst));
-    dst->prefill_cap = src->prefill_cap;
-    dst->emb_tier = src->emb_tier;
-    dst->owns_prefill_workspace = true;
-    metal_graph_copy_prefill_workspace_pointers(dst, src);
-    src->owns_prefill_workspace = false;
-}
-
-static uint64_t metal_graph_prefill_workspace_bytes(const ds4_gpu_graph *g) {
-    uint64_t total = 0;
-    for (int t = 0; t < DS4_MAX_GPUS; t++) {
-#define DS4_COUNT_PREFILL_FIELD(name) \
-        total += ds4_gpu_tensor_bytes(g->name##_by_tier[t]);
-        DS4_GPU_PREFILL_WORKSPACE_FIELDS(DS4_COUNT_PREFILL_FIELD)
-#undef DS4_COUNT_PREFILL_FIELD
-    }
-    total += ds4_gpu_tensor_bytes(g->batch_q_half);
-    total += ds4_gpu_tensor_bytes(g->prefill_seed_router_selected);
-    return total;
 }
 
 static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
@@ -772,9 +567,7 @@ static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
 #undef DS4_FREE_PREFILL_FIELD
     }
     ds4_gpu_tensor_free(g->batch_q_half);
-    ds4_gpu_tensor_free(g->prefill_seed_router_selected);
     g->batch_q_half = NULL;
-    g->prefill_seed_router_selected = NULL;
     g->owns_prefill_workspace = false;
 }
 
@@ -799,16 +592,6 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->logits_by_tier[t]);
         g->logits_by_tier[t] = NULL;
     }
-    ds4_gpu_tensor_free(g->mtp_raw_cache);
-    ds4_gpu_tensor_free(g->mtp_next_hc);
-    ds4_gpu_tensor_free(g->mtp_state_hc);
-    ds4_gpu_tensor_free(g->mtp_input_hc);
-    ds4_gpu_tensor_free(g->mtp_hproj_hc);
-    ds4_gpu_tensor_free(g->mtp_hnorm_hc);
-    ds4_gpu_tensor_free(g->mtp_eproj_hc);
-    ds4_gpu_tensor_free(g->mtp_eproj);
-    ds4_gpu_tensor_free(g->mtp_enorm);
-    ds4_gpu_tensor_free(g->mtp_embed);
     ds4_gpu_tensor_free(g->spec_logits);
     /* Class H output-head free across all tier slots. */
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
@@ -831,7 +614,6 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->routed_mid_by_tier[t]);
         ds4_gpu_tensor_free(g->routed_up_by_tier[t]);
         ds4_gpu_tensor_free(g->routed_gate_by_tier[t]);
-        ds4_gpu_tensor_free(g->tp_peer_tmp_by_tier[t]);
         ds4_gpu_tensor_free(g->router_weights_by_tier[t]);
         ds4_gpu_tensor_free(g->router_selected_by_tier[t]);
         ds4_gpu_tensor_free(g->router_probs_by_tier[t]);
@@ -862,13 +644,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_raw_cache[il]);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        ds4_gpu_tensor_free(g->layer_raw_cache_tp[il]);
-    }
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
-    }
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        ds4_gpu_tensor_free(g->layer_attn_comp_cache_tp[il]);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_state_kv[il]);
@@ -931,8 +707,6 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->dspark_target_hidden);
     ds4_gpu_tensor_free(g->dspark_hc_mean_rows);
     ds4_gpu_tensor_free(g->dspark_hc_mean_weights);
-    ds4_gpu_tensor_free(g->tp_logits_half);
-    free(g->cpu_router_norm);
     memset(g, 0, sizeof(*g));
 }
 
@@ -1417,176 +1191,6 @@ static bool metal_graph_tp_env_flag(const char *name, bool dflt) {
     return strcmp(env, "0") != 0;
 }
 
-static bool metal_graph_cuda_tp_attn_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_ATTN", true);
-#endif
-}
-
-static bool metal_graph_cuda_tp_attn_peer_read_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_ATTN_PEER_READ", true);
-#endif
-}
-
-static bool metal_graph_cuda_tp_attn_heads_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_ATTN_HEADS", false);
-#endif
-}
-
-static bool metal_graph_cuda_tp_attn_cache_dup_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_ATTN_CACHE_DUP", false);
-#endif
-}
-
-static bool metal_graph_cuda_tp_moe_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_MOE", true);
-#endif
-}
-
-static bool metal_graph_cuda_tp_ep_pack_exact_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_EP_PACK_EXACT", true);
-#endif
-}
-
-static bool metal_graph_cuda_tp_ep_direct_return_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_EP_DIRECT_RETURN", true);
-#endif
-}
-
-static bool metal_graph_cuda_tp_ep_delay_reduce_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_EP_DELAY_REDUCE", true);
-#endif
-}
-
-static bool metal_graph_cuda_tp_ep_fused_hc_reduce_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_EP_FUSED_HC_REDUCE", true);
-#endif
-}
-
-static DS4_MAYBE_UNUSED bool metal_graph_cuda_tp_ep_fused_shared_mid_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_EP_FUSED_SHARED_MID", true);
-#endif
-}
-
-static DS4_MAYBE_UNUSED bool metal_graph_cuda_tp_ep_balanced_shared_mid_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag(
-            "DS4_CUDA_TP_EP_BALANCED_SHARED_MID", true);
-#endif
-}
-
-static DS4_MAYBE_UNUSED bool metal_graph_cuda_tp_ep_dual_prequant_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag(
-            "DS4_CUDA_TP_EP_DUAL_PREQUANT", true);
-#endif
-}
-
-static bool metal_graph_cuda_tp_moe_delay_reduce_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_MOE_DELAY_REDUCE", true);
-#endif
-}
-
-static bool metal_graph_cuda_tp_moe_pack_handoff_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_MOE_PACK", false);
-#endif
-}
-
-static bool metal_graph_cuda_tp_moe_copy3_handoff_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_MOE_COPY3", false);
-#endif
-}
-
-static bool metal_graph_cuda_tp_moe_peer_read_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_MOE_PEER_READ", false);
-#endif
-}
-
-static bool metal_graph_cuda_tp_moe_peer_router_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_MOE_PEER_ROUTER", false);
-#endif
-}
-
-static bool metal_graph_cuda_tp_shared_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_SHARED", false);
-#endif
-}
-
-static bool metal_graph_cuda_tp_shared_fold_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_SHARED_FOLD", true);
-#endif
-}
-
-static bool metal_graph_cuda_tp_q_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_Q", false);
-#endif
-}
-
-static bool metal_graph_cuda_tp_output_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_OUTPUT", true);
-#endif
-}
-
 static bool metal_graph_cuda_greedy_split_top1_requested(void) {
 #if defined(__APPLE__)
     return false;
@@ -1817,72 +1421,6 @@ static bool metal_graph_cuda_qkv_kv_rope_fuse_requested(void) {
     if (getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") != NULL) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_QKV_KV_ROPE_FUSE", true);
 #endif
-}
-
-static bool metal_graph_cuda_tp_prefill_ffn_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_PREFILL_FFN", true);
-#endif
-}
-
-static bool metal_graph_cuda_tp_prefill_attn_output_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_PREFILL_ATTN_OUTPUT", true);
-#endif
-}
-
-static bool metal_graph_cuda_prefill_pipeline_requested(const ds4_gpu_graph *g) {
-#if defined(__APPLE__)
-    (void)g;
-    return false;
-#else
-    const char *env = getenv("DS4_CUDA_PREFILL_PIPELINE");
-    if (env && env[0]) return strcmp(env, "0") != 0;
-    return g && g->cuda_tp_decode;
-#endif
-}
-
-static bool metal_graph_cuda_prefill_pipeline_q8_cache_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE", false);
-#endif
-}
-
-static uint32_t metal_graph_cuda_prefill_pipeline_microbatch(void) {
-    const char *env = getenv("DS4_CUDA_PREFILL_PIPELINE_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(env, &end, 10);
-        if (end != env && v > 0 && v <= UINT32_MAX) return (uint32_t)v;
-    }
-    return 512;
-}
-
-static int metal_graph_cuda_tp_partner_tier(int tier) {
-    if (g_n_gpus < 2 || (g_n_gpus & 1) != 0) return -1;
-    const int half = g_n_gpus / 2;
-    if (tier < 0 || tier >= half) return -1;
-    return tier + half;
-}
-
-static uint32_t metal_graph_cuda_tp_output_tiers(
-        const ds4_gpu_graph *g,
-        int                  tiers[DS4_MAX_GPUS]) {
-    if (!g) return 0;
-    return metal_graph_cuda_tp_output_tiers_for_head(g->head_tier,
-                                                    g->cuda_tp_output,
-                                                    g_n_gpus,
-                                                    tiers);
-}
-
-static uint64_t metal_graph_q8_0_row_bytes(uint64_t in_dim) {
-    return ((in_dim + 31u) / 32u) * 34u;
 }
 
 #endif /* !DS4_NO_GPU */

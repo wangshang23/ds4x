@@ -1092,13 +1092,14 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL &&
         getenv("DS4_CUDA_NO_F16_SMALL_OUT") == NULL;
     if (small_out_one_token) {
-        matmul_f16_small_out_hx_ordered_chunks_kernel<<<(unsigned)out_dim, 32, 0, cuda_decode_stream()>>>(
+        const int status = ds4x_launch_fp16_small_output_one(
                 (float *)out->ptr,
-                w,
+                (const uint16_t *)w,
                 (const float *)x->ptr,
                 in_dim,
-                out_dim);
-        return cuda_ok(cudaGetLastError(), "matmul_f16_small_out_hx_ordered_chunks launch");
+                out_dim,
+                (void *)cuda_decode_stream());
+        return cuda_ok((cudaError_t)status, "matmul_f16_small_output_one launch");
     }
     const int small_out_batch =
         !serial_f16 &&
@@ -1109,14 +1110,15 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         (g_quality_mode || getenv("DS4_CUDA_F16_SMALL_BATCH") != NULL) &&
         getenv("DS4_CUDA_NO_F16_SMALL_BATCH") == NULL;
     if (small_out_batch) {
-        matmul_f16_small_out_batch_kernel<<<(unsigned)n_tok, 256, 0, cuda_decode_stream()>>>(
+        const int status = ds4x_launch_fp16_small_output_batch(
                 (float *)out->ptr,
-                w,
+                (const uint16_t *)w,
                 (const float *)x->ptr,
                 in_dim,
                 out_dim,
-                n_tok);
-        return cuda_ok(cudaGetLastError(), "matmul_f16_small_out_batch launch");
+                n_tok,
+                (void *)cuda_decode_stream());
+        return cuda_ok((cudaError_t)status, "matmul_f16_small_output_batch launch");
     }
     const int cublas_one_token =
         n_tok == 1u &&
@@ -1130,6 +1132,37 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255) / 256, 256, 0, cuda_decode_stream()>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
+        /* On GB10, CUTLASS's explicit mma.sync kernel wins for the large
+         * indexer q_b projection while losing badly on latency-sized
+         * compressor/router GEMMs. Keep the measured auto policy narrow;
+         * the environment override exists for reproducible A/B work. */
+        static const int cutlass_mode = [] {
+            const char *backend = getenv("DS4_CUDA_F16_BACKEND");
+            return backend && strcmp(backend, "cutlass") == 0 ? 2 :
+                   backend && strcmp(backend, "cublas") == 0 ? 0 : 1;
+        }();
+        const int cutlass_auto_shape =
+            in_dim == 1024u && out_dim == 8192u && n_tok >= 2048u;
+        if (cutlass_mode == 2 || (cutlass_mode == 1 && cutlass_auto_shape)) {
+            const int rc = ds4x_cutlass_fp16_gemm(
+                    (float *)out->ptr,
+                    (const uint16_t *)xh,
+                    (const uint16_t *)w,
+                    n_tok,
+                    in_dim,
+                    out_dim,
+                    (void *)cuda_decode_stream());
+            if (rc == 1) return 1;
+            if (rc < 0) {
+                static int logged = 0;
+                if (!logged) {
+                    logged = 1;
+                    fprintf(stderr,
+                            "ds4: CUTLASS FP16 GEMM failed (%s); falling back to cuBLAS\n",
+                            ds4x_cutlass_status_string(rc));
+                }
+            }
+        }
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(logical_tier),
@@ -1153,17 +1186,23 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                                          CUBLAS_GEMM_DEFAULT);
         return cublas_ok(st, "f16 matmul");
     }
-    dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    if (serial_f16 || serial_router) {
-        matmul_f16_serial_kernel<<<grid, 1, 0, cuda_decode_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-        return cuda_ok(cudaGetLastError(), serial_router ? "matmul_f16_router_serial launch" : "matmul_f16_serial launch");
-    }
-    if (ordered_router) {
-        matmul_f16_ordered_chunks_kernel<<<grid, 32, 0, cuda_decode_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-        return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
-    }
-    matmul_f16_kernel<<<grid, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-    return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
+    const int mode = serial_f16 || serial_router ? DS4X_FP16_PROJECTION_SERIAL :
+                     ordered_router ? DS4X_FP16_PROJECTION_ORDERED :
+                                      DS4X_FP16_PROJECTION_PARALLEL;
+    const int status = ds4x_launch_fp16_projection(
+            (float *)out->ptr,
+            (const uint16_t *)w,
+            (const float *)x->ptr,
+            in_dim,
+            out_dim,
+            n_tok,
+            mode,
+            (void *)cuda_decode_stream());
+    const char *label = serial_router ? "matmul_f16_router_serial launch" :
+                        mode == DS4X_FP16_PROJECTION_SERIAL ? "matmul_f16_serial launch" :
+                        mode == DS4X_FP16_PROJECTION_ORDERED ? "matmul_f16_ordered launch" :
+                                                             "matmul_f16_parallel launch";
+    return cuda_ok((cudaError_t)status, label);
 }
 
 extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
@@ -1427,16 +1466,17 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
                                            in_dim, out_dim, x, n_tok);
     }
-    matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
+    const int status = ds4x_launch_fp16_pair_ordered(
         (float *)out0->ptr,
         (float *)out1->ptr,
-        w0,
-        w1,
+        (const uint16_t *)w0,
+        (const uint16_t *)w1,
         (const float *)x->ptr,
         in_dim,
         out_dim,
-        out_dim);
-    return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
+        out_dim,
+        NULL);
+    return cuda_ok((cudaError_t)status, "matmul_f16_pair_ordered launch");
 }
 
 extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
@@ -1520,5 +1560,3 @@ extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tenso
     repeat_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)row->ptr, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "repeat_hc launch");
 }
-
-

@@ -149,7 +149,6 @@ static void ds4_acquire_instance_lock(void) {
 typedef struct {
     uint32_t n_comp[DS4_MAX_LAYER];
     uint32_t n_index_comp[DS4_MAX_LAYER];
-    uint32_t mtp_n_raw;
     uint32_t dspark_cache_start;
     uint32_t dspark_cache_token_start;
     uint32_t dspark_cache_len;
@@ -203,29 +202,14 @@ typedef struct ds4_dspark_spec_stats {
 
 struct ds4_session {
     ds4_engine *engine;
-    ds4_dist_session *distributed;
-    uint64_t tp_session_id;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
-    ds4_glm_gpu_graph glm_graph;
-    bool glm_graph_ready;
-    uint32_t glm_dense_cache_len;
-    /* GLM MTP speculative state (--glm-mtp, greedy only). */
-    int glm_mtp_draft;
-    int glm_mtp_have;
-    int glm_spec_inside;
-    uint32_t glm_mtp_min_pos;
-    float *glm_mtp_hc;
-    float *glm_mtp_logits0;
     ds4_spec_frontier greedy_splitkv_anchor;
 #endif
-    ds4_kv_cache cpu_cache;
-    ds4_cpu_decode_scratch cpu_scratch;
     token_vec checkpoint;
     token_vec greedy_splitkv_segment;
     float *logits;
     float *sample_probs;
-    float *mtp_logits;
     int greedy_splitkv_anchor_len;
 #ifndef DS4_NO_GPU
     float *spec_row_logits;
@@ -233,7 +217,6 @@ struct ds4_session {
     float *dspark_conf_features;
     size_t dspark_conf_features_cap;
 #endif
-    int mtp_draft_token;
 #ifndef DS4_NO_GPU
     int dspark_draft_tokens[DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t dspark_draft_len;
@@ -255,8 +238,6 @@ struct ds4_session {
     bool dspark_last_confidence0_valid;
     ds4_dspark_spec_stats dspark_stats;
 #endif
-    uint64_t mtp_probe_total;
-    uint64_t mtp_probe_hit;
     ds4_session_progress_fn progress;
     void *progress_ud;
     ds4_session_progress_fn display_progress;
@@ -266,7 +247,6 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
-    bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
 
@@ -525,4 +505,3 @@ static void ds4_session_dspark_scheduler_note(
     ds4_session_dspark_scheduler_reset(s);
 }
 #endif
-

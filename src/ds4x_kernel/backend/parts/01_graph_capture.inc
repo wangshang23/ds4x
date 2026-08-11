@@ -1302,6 +1302,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
     return cuda_pread_full(g_model_fd, stage, bytes, offset);
 }
 
+#if 0
 static void cuda_stream_selected_stage_release(void) {
     for (size_t i = 0; i < 4; i++) {
         if (g_stream_selected_stage_event[i]) {
@@ -1450,6 +1451,7 @@ static int cuda_model_copy_to_device_streamed(
     }
     return 1;
 }
+#endif
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
     uint64_t gb = 0;
@@ -1745,6 +1747,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+#if 0
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
     cuda_xdev_env_refresh();
@@ -1936,20 +1939,55 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     return 1;
 }
 
+#endif
+
 extern "C" int ds4_gpu_init(void) {
-    ds4_gpu_config cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.device_indices[0] = 0;
-    cfg.n_gpus = 1;
-    return ds4_gpu_init_multi(&cfg);
+    cuda_decode_dispatch_env_refresh();
+    g_current_logical_tier = -1;
+    memset(&g_gpu[0], 0, sizeof(g_gpu[0]));
+    ds4_gpu_ctx *context = &g_gpu[0];
+    context->device_id = 0;
+    g_n_gpus = 1;
+    g_gpu_peer_ok[0][0] = 1;
+
+    if (!cuda_ok(cudaSetDevice(0), "init set device")) return 0;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=0\n",
+                prop.name, prop.major, prop.minor);
+    }
+    cudaStream_t stream = NULL;
+    if (!cuda_ok(cudaStreamCreate(&stream), "init stream")) return 0;
+    context->stream = (void *)stream;
+
+    cudaEvent_t event = NULL;
+    if (!cuda_ok(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+                 "init event")) {
+        ds4_gpu_cleanup();
+        return 0;
+    }
+    context->boundary_event = (void *)event;
+
+    cublasHandle_t cublas = NULL;
+    if (!cublas_ok(cublasCreate(&cublas), "init cublas")) {
+        ds4_gpu_cleanup();
+        return 0;
+    }
+    context->cublas = (void *)cublas;
+    const cublasMath_t math_mode =
+        (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+            ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH;
+    (void)cublasSetMathMode(cublas, math_mode);
+    context->cublas_ready = 1;
+    g_cublas_ready = 1;
+    return 1;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     g_current_logical_tier = -1;
 
-    /* Multi-GPU teardown: events, streams, cublas handles, scratch
-     * slabs, per-pair bounce buffers. */
+    /* The single GB10 owns one stream, one cuBLAS handle, and one scratch set. */
     for (int i = 0; i < g_n_gpus; i++) {
         ds4_gpu_ctx *c = &g_gpu[i];
         (void)cudaSetDevice(c->device_id);
@@ -1989,17 +2027,6 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
 #endif
     }
-    for (int i = 0; i < DS4_MAX_GPUS; i++) {
-        for (int j = 0; j < DS4_MAX_GPUS; j++) {
-            if (g_xdev_bounce[i][j]) {
-                (void)cudaFreeHost(g_xdev_bounce[i][j]);
-                g_xdev_bounce[i][j] = NULL;
-                g_xdev_bounce_bytes[i][j] = 0;
-            }
-        }
-    }
-    cuda_stream_selected_cache_release();
-    cuda_stream_selected_stage_release();
     g_n_gpus = 0;
     g_cublas_ready = 0;
 

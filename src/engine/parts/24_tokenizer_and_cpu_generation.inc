@@ -33,49 +33,12 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
-            vocab->bos_id = vocab_lookup_optional(vocab, "<sop>");
-        }
-        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
-            vocab->eos_id = vocab_lookup_optional(vocab, "<|endoftext|>");
-        }
-        vocab->system_id = vocab_lookup_optional(vocab, "<|system|>");
-        vocab->user_id = vocab_lookup_optional(vocab, "<|user|>");
-        vocab->assistant_id = vocab_lookup_optional(vocab, "<|assistant|>");
-        vocab->observation_id = vocab_lookup_optional(vocab, "<|observation|>");
-        vocab->sop_id = vocab_lookup_optional(vocab, "<sop>");
-        vocab->think_start_id = vocab_lookup_optional(vocab, "<think>");
-        vocab->think_end_id = vocab_lookup_optional(vocab, "</think>");
-        vocab->tool_call_start_id = vocab_lookup_optional(vocab, "<tool_call>");
-        vocab->tool_call_end_id = vocab_lookup_optional(vocab, "</tool_call>");
-        vocab->tool_response_start_id = vocab_lookup_optional(vocab, "<tool_response>");
-        vocab->tool_response_end_id = vocab_lookup_optional(vocab, "</tool_response>");
-        vocab->arg_key_start_id = vocab_lookup_optional(vocab, "<arg_key>");
-        vocab->arg_key_end_id = vocab_lookup_optional(vocab, "</arg_key>");
-        vocab->arg_value_start_id = vocab_lookup_optional(vocab, "<arg_value>");
-        vocab->arg_value_end_id = vocab_lookup_optional(vocab, "</arg_value>");
-        vocab->dsml_id = -1;
-        return;
-    }
-
     vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
     vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
-    vocab->system_id    = -1;
     vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
     vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
-    vocab->observation_id = -1;
-    vocab->sop_id = -1;
     vocab->think_start_id = vocab_lookup(vocab, "<think>");
     vocab->think_end_id = vocab_lookup(vocab, "</think>");
-    vocab->tool_call_start_id = -1;
-    vocab->tool_call_end_id = -1;
-    vocab->tool_response_start_id = -1;
-    vocab->tool_response_end_id = -1;
-    vocab->arg_key_start_id = -1;
-    vocab->arg_key_end_id = -1;
-    vocab->arg_value_start_id = -1;
-    vocab->arg_value_end_id = -1;
     vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
 }
 
@@ -91,29 +54,12 @@ static void vocab_free(ds4_vocab *vocab) {
  * thinking is only a prompt prefix: the model still enters through <think>. */
 static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
     token_vec_push(out, vocab->bos_id);
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->sop_id >= 0)
-        token_vec_push(out, vocab->sop_id);
-}
-
-const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
-    switch (mode) {
-    case DS4_THINK_HIGH: return "Reasoning Effort: High";
-    case DS4_THINK_MAX:  return "Reasoning Effort: Max";
-    case DS4_THINK_NONE: return NULL;
-    }
-    return NULL;
 }
 
 static void chat_push_think_prefix(const ds4_vocab *vocab,
                                    ds4_think_mode   think_mode,
                                    token_vec       *out) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        const char *effort = ds4_glm_reasoning_effort_text(think_mode);
-        if (effort) {
-            token_vec_push(out, vocab->system_id);
-            bpe_tokenize_text(vocab, effort, out);
-        }
-    } else if (think_mode == DS4_THINK_MAX) {
+    if (think_mode == DS4_THINK_MAX) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
     }
 }
@@ -124,14 +70,11 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
-    const bool need_think_start =
-        ds4_think_mode_enabled(think_mode) ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+    const bool need_think_start = ds4_think_mode_enabled(think_mode);
     if (vocab->bos_id < 0 ||
         vocab->user_id < 0 ||
         vocab->assistant_id < 0 ||
         vocab->think_end_id < 0 ||
-        (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->system_id < 0) ||
         (need_think_start && vocab->think_start_id < 0)) {
         ds4_die("this tokenizer does not provide the DeepSeek chat markers; use raw prompt tokenization");
     }
@@ -139,8 +82,6 @@ static void encode_chat_prompt(
     chat_push_bos_sequence(vocab, out);
     chat_push_think_prefix(vocab, think_mode, out);
     if (system && system[0]) {
-        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA)
-            token_vec_push(out, vocab->system_id);
         bpe_tokenize_text(vocab, system, out);
     }
     token_vec_push(out, vocab->user_id);
@@ -148,9 +89,6 @@ static void encode_chat_prompt(
     token_vec_push(out, vocab->assistant_id);
     if (ds4_think_mode_enabled(think_mode)) {
         token_vec_push(out, vocab->think_start_id);
-    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        token_vec_push(out, vocab->think_start_id);
-        token_vec_push(out, vocab->think_end_id);
     } else {
         token_vec_push(out, vocab->think_end_id);
     }
@@ -167,24 +105,10 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
     } specials[] = {
         {"<｜begin▁of▁sentence｜>", vocab->bos_id},
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
-        {"[gMASK]",                vocab->bos_id},
-        {"<sop>",                  vocab->sop_id},
-        {"<|system|>",             vocab->system_id},
         {"<｜User｜>",              vocab->user_id},
         {"<｜Assistant｜>",         vocab->assistant_id},
-        {"<|user|>",               vocab->user_id},
-        {"<|assistant|>",          vocab->assistant_id},
-        {"<|observation|>",        vocab->observation_id},
         {"<think>",                vocab->think_start_id},
         {"</think>",               vocab->think_end_id},
-        {"<tool_call>",            vocab->tool_call_start_id},
-        {"</tool_call>",           vocab->tool_call_end_id},
-        {"<tool_response>",        vocab->tool_response_start_id},
-        {"</tool_response>",       vocab->tool_response_end_id},
-        {"<arg_key>",              vocab->arg_key_start_id},
-        {"</arg_key>",             vocab->arg_key_end_id},
-        {"<arg_value>",            vocab->arg_value_start_id},
-        {"</arg_value>",           vocab->arg_value_end_id},
         {"｜DSML｜",                vocab->dsml_id},
     };
 
@@ -280,38 +204,10 @@ static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content,
     bpe_tokenize_wrapped_payload_text(vocab, content, "</tool_result>", out);
 }
 
-static void bpe_tokenize_tool_response_text(ds4_vocab *vocab, const char *content, token_vec *out) {
-    bpe_tokenize_wrapped_payload_text(vocab, content, "</tool_response>", out);
-}
-
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content) {
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
     if (!content) content = "";
-
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
-            if (vocab->system_id >= 0) token_vec_push(tokens, vocab->system_id);
-            tokenize_rendered_chat_vocab(vocab, content, tokens);
-        } else if (!strcmp(role, "assistant")) {
-            token_vec_push(tokens, vocab->assistant_id);
-            if (strncmp(content, "<think>", 7) != 0 &&
-                strncmp(content, "</think>", 8) != 0) {
-                token_vec_push(tokens, vocab->think_start_id);
-                token_vec_push(tokens, vocab->think_end_id);
-            }
-            tokenize_rendered_chat_vocab(vocab, content, tokens);
-        } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
-            if (vocab->observation_id >= 0) token_vec_push(tokens, vocab->observation_id);
-            tokenize_rendered_chat_vocab(vocab, "<tool_response>", tokens);
-            bpe_tokenize_tool_response_text(vocab, content, tokens);
-            tokenize_rendered_chat_vocab(vocab, "</tool_response>", tokens);
-        } else {
-            token_vec_push(tokens, vocab->user_id);
-            bpe_tokenize_text(vocab, content, tokens);
-        }
-        return;
-    }
 
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
         bpe_tokenize_text(vocab, content, tokens);
@@ -335,34 +231,8 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
     token_vec_push(tokens, e->vocab.assistant_id);
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
-        !ds4_think_mode_enabled(think_mode)) {
-        token_vec_push(tokens, e->vocab.think_start_id);
-        token_vec_push(tokens, e->vocab.think_end_id);
-        return;
-    }
     token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
                    e->vocab.think_start_id : e->vocab.think_end_id);
-}
-
-static void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {
-    fprintf(fp, "[");
-    for (int i = 0; i < tokens->len; i++) {
-        if (i) fprintf(fp, ", ");
-        fprintf(fp, "%d", tokens->v[i]);
-    }
-    fprintf(fp, "]\n");
-
-    for (int i = 0; i < tokens->len; i++) {
-        int id = tokens->v[i];
-        if (id >= 0 && id < vocab->n_vocab) {
-            fprintf(fp, "%6d  %.*s\n", id, (int)vocab->token[id].len, vocab->token[id].ptr);
-        }
-    }
-}
-
-static void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens) {
-    dump_tokens_fp(stdout, vocab, tokens);
 }
 
 static uint32_t utf8_decode_one(const char *s, uint64_t len, uint64_t *pos) {
@@ -453,12 +323,6 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
     if (!vocab || token < 0) return false;
     if (token == vocab->eos_id) return true;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        return (vocab->system_id >= 0 && token == vocab->system_id) ||
-               (vocab->user_id >= 0 && token == vocab->user_id) ||
-               (vocab->assistant_id >= 0 && token == vocab->assistant_id) ||
-               (vocab->observation_id >= 0 && token == vocab->observation_id);
-    }
     return false;
 }
 
@@ -1042,151 +906,5 @@ int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
 }
 #endif
 
-static void print_top_logits(
-        FILE          * fp,
-        const char    * label,
-        const ds4_vocab * vocab,
-        const float   * logits,
-        uint32_t        n_vocab,
-        int             k) {
-    int best[16];
-    if (k > 16) k = 16;
-    for (int i = 0; i < k; i++) best[i] = -1;
-
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        for (int j = 0; j < k; j++) {
-            if (best[j] < 0 || logits[i] > logits[best[j]]) {
-                for (int l = k - 1; l > j; l--) best[l] = best[l - 1];
-                best[j] = (int)i;
-                break;
-            }
-        }
-    }
-
-    fprintf(fp, "ds4: top logits %s:\n", label);
-    for (int i = 0; i < k && best[i] >= 0; i++) {
-        const int id = best[i];
-        fprintf(fp, "  %2d %7d % .9g  ", i, id, logits[id]);
-        if (id >= 0 && id < vocab->n_vocab) {
-            fprintf(fp, "%.*s", (int)vocab->token[id].len, vocab->token[id].ptr);
-        }
-        fputc('\n', fp);
-    }
-}
-
 /* CPU generation entry point.  It runs layer-major prefill once, then decodes
  * one token at a time using the persistent KV cache and scratch arena. */
-static int generate_raw_swa_cpu(
-        const ds4_model   * model,
-        const ds4_vocab   * vocab,
-        const ds4_weights * weights,
-        const token_vec   * prompt,
-        int                 n_predict,
-        int                 ctx_size,
-        const float       * directional_steering_dirs,
-        float               directional_steering_attn,
-        float               directional_steering_ffn,
-        ds4_token_emit_fn   emit,
-        ds4_generation_done_fn done,
-        void              * emit_ud,
-        ds4_session_progress_fn progress,
-        void              * progress_ud) {
-    (void)progress;
-    (void)progress_ud;
-    fprintf(stderr, "ds4: using CPU generation with layer-major prefill\n");
-
-    ds4_kv_cache cache;
-    kv_cache_init(&cache, (uint32_t)ctx_size, 0);
-    ds4_cpu_decode_scratch decode_scratch;
-    cpu_decode_scratch_init(&decode_scratch, (uint32_t)ctx_size);
-
-    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
-    int pos = prompt->len;
-    const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
-    const double t_prefill0 = now_sec();
-
-    if (prompt->len <= 0 || prompt->len > ctx_size) {
-        fprintf(stderr, "ds4: prompt is empty or exceeds context size\n");
-        free(logits);
-        cpu_decode_scratch_free(&decode_scratch);
-        kv_cache_free(&cache);
-        return 1;
-    }
-
-    prefill_layer_major_cpu(logits, model, weights, &cache, prompt,
-                            directional_steering_dirs,
-                            directional_steering_attn,
-                            directional_steering_ffn);
-
-    const double t_prefill1 = now_sec();
-    fprintf(stderr, "ds4: prefill %d/%d done\n", prompt->len, prompt->len);
-    const char *dump_prefill_logits = getenv("DS4_CPU_DUMP_PREFILL_LOGITS");
-    if (dump_prefill_logits && dump_prefill_logits[0]) {
-        if (!write_f32_binary_file(dump_prefill_logits, logits, DS4_N_VOCAB)) {
-            free(logits);
-            cpu_decode_scratch_free(&decode_scratch);
-            kv_cache_free(&cache);
-            return 1;
-        }
-        fprintf(stderr, "ds4: wrote CPU prefill logits to %s\n", dump_prefill_logits);
-    }
-
-    int n_generated = 0;
-    int n_decode_eval = 0;
-    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
-    const double t_decode0 = now_sec();
-    for (int i = 0; i < n_predict && pos < ctx_size; i++) {
-        if (trace_top) {
-            char label[64];
-            snprintf(label, sizeof(label), "step %d", i);
-            print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
-        }
-
-        int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (vocab_token_is_generation_stop(vocab, token)) break;
-
-        if (emit) emit(emit_ud, token);
-        n_generated++;
-
-        if (i == n_predict - 1 || pos + 1 >= ctx_size) {
-            pos++;
-            break;
-        }
-
-        const double t_eval0 = token_timing ? now_sec() : 0.0;
-        /* The CPU decode step is expected to reuse buffers from
-         * cpu_decode_scratch.  Keep the allocation guard tightly scoped to the
-         * decode math itself; sampling, token emission, tracing, and callbacks
-         * may allocate small temporary strings without invalidating that
-         * guarantee. */
-        ds4_alloc_guard_begin("CPU token decode");
-        forward_token_raw_swa_cpu_decode_scratch(logits, model, weights, &cache, token, (uint32_t)pos,
-                                                 directional_steering_dirs,
-                                                 directional_steering_attn,
-                                                 directional_steering_ffn,
-                                                 &decode_scratch);
-        ds4_alloc_guard_end();
-        if (token_timing) {
-            const double t_eval1 = now_sec();
-            fprintf(stderr, "ds4: decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
-        }
-        n_decode_eval++;
-        pos++;
-    }
-    const double t_decode1 = now_sec();
-    if (done) done(emit_ud);
-
-    const double prefill_s = t_prefill1 - t_prefill0;
-    const double decode_s = t_decode1 - t_decode0;
-    ds4_log(stderr,
-            DS4_LOG_TIMING,
-            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
-            prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
-            decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
-
-    free(logits);
-    cpu_decode_scratch_free(&decode_scratch);
-    kv_cache_free(&cache);
-    return 0;
-}
-

@@ -4,157 +4,6 @@
  * once, for the final committed state that normal sampling will continue from.
  * Keeping intermediate rows device-resident avoids turning verification into a
  * sequence of large CPU readbacks. */
-static bool metal_graph_eval_token_raw_swa_top(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
-        int                    token,
-        uint32_t               pos,
-        int                   *top_id,
-        float                 *logits,
-        bool                   allow_split_top1,
-        metal_graph_top2_result *top2,
-        bool                   force_fast_attention) {
-    if (!top_id) return false;
-    if (top2) memset(top2, 0, sizeof(*top2));
-
-    const bool fast_attention =
-        allow_split_top1 &&
-        logits == NULL &&
-        (force_fast_attention || metal_graph_cuda_greedy_splitkv_requested());
-    if (top2) top2->fast_attention = fast_attention;
-    const int old_fast_attention =
-        ds4_gpu_set_decode_fast_attention(fast_attention ? 1 : 0);
-    const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
-    const double t0 = profile ? now_sec() : 0.0;
-    const bool split_top1 =
-        allow_split_top1 &&
-        logits == NULL &&
-        top2 == NULL &&
-        g->cuda_tp_output &&
-        metal_graph_cuda_greedy_split_top1_requested();
-    if (split_top1) {
-        int output_tiers[DS4_MAX_GPUS] = {0};
-        uint32_t output_ways = 0;
-        bool ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
-                                                      token, pos, false, true);
-        if (ok) ok = metal_graph_encode_output_head_split_top1(g,
-                                                               model,
-                                                               weights,
-                                                               weights->output->dim[1],
-                                                               output_tiers,
-                                                               &output_ways);
-        const double t_encoded = profile ? now_sec() : 0.0;
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        const double t_done = profile ? now_sec() : 0.0;
-        if (ok) {
-            bool have_best = false;
-            uint32_t best_id = 0;
-            float best_value = 0.0f;
-            uint32_t cand_ids[DS4_MAX_GPUS] = {0};
-            float cand_values[DS4_MAX_GPUS] = {0.0f};
-            ok = output_ways <= DS4_MAX_GPUS &&
-                 ds4_gpu_tensor_read(g->comp_selected_by_tier[g->head_tier],
-                                      0,
-                                      cand_ids,
-                                      (uint64_t)output_ways * sizeof(cand_ids[0])) != 0 &&
-                 ds4_gpu_tensor_read(g->comp_mask_by_tier[g->head_tier],
-                                      0,
-                                      cand_values,
-                                      (uint64_t)output_ways * sizeof(cand_values[0])) != 0;
-            for (uint32_t i = 0; ok && i < output_ways; i++) {
-                const uint32_t cand_id = cand_ids[i];
-                const float cand_value = cand_values[i];
-                if (ok &&
-                    (!have_best ||
-                     cand_value > best_value ||
-                     (cand_value == best_value && cand_id < best_id))) {
-                    have_best = true;
-                    best_id = cand_id;
-                    best_value = cand_value;
-                }
-            }
-            ok = ok && have_best && best_id <= (uint32_t)INT32_MAX;
-            if (ok) *top_id = (int)best_id;
-        }
-        const double t_read = profile ? now_sec() : 0.0;
-        if (profile) {
-            fprintf(stderr,
-                    "ds4: metal graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=0 top=1 split_top1=1\n",
-                    pos,
-                    (t_encoded - t0) * 1000.0,
-                    (t_done - t_encoded) * 1000.0,
-                    (t_read - t_done) * 1000.0,
-                    (t_read - t0) * 1000.0);
-        }
-        if (!ok) {
-            if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: Metal synchronize after split-top graph eval failure also failed\n");
-            }
-        }
-        (void)ds4_gpu_set_decode_fast_attention(old_fast_attention);
-        return ok;
-    }
-
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
-                                                  token, pos, true, true);
-    if (ok) {
-        ok = ds4_gpu_argmax_tensor(metal_graph_comp_selected(g),
-                                   metal_graph_logits(g),
-                                   DS4_N_VOCAB) != 0;
-    }
-    const double t_encoded = profile ? now_sec() : 0.0;
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    const double t_done = profile ? now_sec() : 0.0;
-    if (ok && top2) {
-        uint32_t ids[2] = {0, 0};
-        float values[2] = {0.0f, 0.0f};
-        ok = ds4_gpu_tensor_read(metal_graph_comp_selected(g),
-                                 0,
-                                 ids,
-                                 sizeof(ids)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_comp_mask(g),
-                                 0,
-                                 values,
-                                 sizeof(values)) != 0;
-        if (ok && ids[0] <= (uint32_t)INT32_MAX && ids[1] <= (uint32_t)INT32_MAX) {
-            top2->id0 = (int)ids[0];
-            top2->id1 = (int)ids[1];
-            top2->value0 = values[0];
-            top2->value1 = values[1];
-            top2->valid = isfinite(values[0]) && isfinite(values[1]);
-            *top_id = top2->id0;
-        } else {
-            ok = false;
-        }
-    } else if (ok) {
-        ok = ds4_gpu_tensor_read(metal_graph_comp_selected(g), 0, top_id, sizeof(*top_id)) != 0;
-    }
-    if (ok && logits) {
-        ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-    }
-    const double t_read = profile ? now_sec() : 0.0;
-    if (profile) {
-        fprintf(stderr,
-                "ds4: metal graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d top=1 split_top1=0\n",
-                pos,
-                (t_encoded - t0) * 1000.0,
-                (t_done - t_encoded) * 1000.0,
-                (t_read - t_done) * 1000.0,
-                (t_read - t0) * 1000.0,
-                logits != NULL);
-    }
-    if (!ok) {
-        if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after top-only graph eval failure also failed\n");
-        }
-    }
-    (void)ds4_gpu_set_decode_fast_attention(old_fast_attention);
-    return ok;
-}
-
 static bool dspark_stage0_weights_ready(
         const ds4_gpu_graph     *g,
         const ds4_dspark_weights *dw) {
@@ -1124,9 +973,6 @@ static bool metal_graph_eval_dspark_stage_block(
               draft_attn_norm_view && draft_hc_view &&
               draft_hc_split_view && kv_target_view && kv_draft_view &&
               after_attn_hc_view;
-    const bool saved_streaming = g->ssd_streaming;
-    g->ssd_streaming = false;
-
     const float freq_base = DS4_ROPE_FREQ_BASE;
     const float freq_scale = 1.0f;
     const float ext_factor = 0.0f;
@@ -1352,9 +1198,7 @@ static bool metal_graph_eval_dspark_stage_block(
                                                      block,
                                                      stage,
                                                      pos,
-                                                     draft,
-                                                     NULL,
-                                                     0);
+                                                     draft);
     DS4_DSPARK_PROFILE_STAGE("ffn");
     if (ok &&
         !prepare_next_stage_input &&
@@ -1372,8 +1216,6 @@ static bool metal_graph_eval_dspark_stage_block(
     }
     DS4_DSPARK_PROFILE_STAGE("next_input");
     if (ok && !commands_open) ok = ds4_gpu_end_commands() != 0;
-    g->ssd_streaming = saved_streaming;
-
     ds4_gpu_tensor_free(after_attn_hc_view);
     ds4_gpu_tensor_free(kv_draft_view);
     ds4_gpu_tensor_free(kv_target_view);
@@ -1435,19 +1277,6 @@ static bool metal_graph_eval_dspark_stage_chain(
         if (!dspark_stage_block_ready(g, dw, stage)) return false;
     }
 
-    /* The support model runs only on the coordinator. Its generic layer
-     * helpers share the base graph object, so temporarily disarm TP or they
-     * would encode expert gates that the worker can never reach. The base
-     * model's later verification restores and uses the normal 50/50 split. */
-    const uint32_t saved_tp_world = g->tp_world;
-    const uint32_t saved_tp_batch_rows = g->tp_batch_rows;
-    g->tp_world = 0;
-    g->tp_batch_rows = 0;
-    const bool suspended_expert_sharding = saved_tp_world == 2;
-    if (suspended_expert_sharding) {
-        ds4_gpu_tp_suspend_expert_sharding(1);
-    }
-
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_tensor_copy(metal_graph_prefill_tokens(g),
@@ -1479,11 +1308,6 @@ static bool metal_graph_eval_dspark_stage_chain(
         ok = metal_graph_eval_dspark_final_hidden(g, dspark_model, dw, true);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (suspended_expert_sharding) {
-        ds4_gpu_tp_suspend_expert_sharding(0);
-    }
-    g->tp_world = saved_tp_world;
-    g->tp_batch_rows = saved_tp_batch_rows;
     if (!ok) {
         (void)ds4_gpu_synchronize();
         return false;

@@ -5,7 +5,8 @@ DeepSeek-V4-Flash-Q2 on the NVIDIA GB10 in DGX Spark. It intentionally trades
 portability for predictable long-context decode behavior on `sm_121a`.
 
 The existing `ds4_*` C API, source names, and executable names are retained for
-compatibility; DS4X is the repository and project name.
+compatibility during the CUDA C++ migration; DS4X is the repository and
+project name.
 
 It is not a llama.cpp backend and it is not intended to run arbitrary GGUF
 architectures. Metal, ROCm, older CUDA architectures, and other model families
@@ -19,19 +20,18 @@ an unmodified `antirez/ds4@84cc882` build on the same machine and GGUF.
 
 | Context | Upstream prefill latency (s) | DS4X prefill latency (s) | DS4X latency delta | Upstream steady decode (tok/s) | DS4X steady decode (tok/s) | Decode speedup |
 |---:|---:|---:|---:|---:|---:|---:|
-| 4K | 5.452 | 4.910 | -9.9% | 14.68 | 15.72 | 1.071x |
-| 8K | 9.403 | 9.465 | +0.7% | 14.33 | 15.59 | 1.088x |
-| 16K | 18.731 | 18.751 | +0.1% | 14.26 | 15.45 | 1.084x |
-| 32K | 37.430 | 37.423 | 0.0% | 13.70 | 15.09 | 1.102x |
-| 64K | 76.019 | 78.459 | +3.2% | 13.04 | 14.80 | 1.135x |
-| 128K | 159.041 | 163.564 | +2.8% | 12.00 | 14.12 | 1.177x |
+| 4K | 5.452 | 4.928 | -9.6% | 14.68 | 15.79 | 1.076x |
+| 16K | 18.731 | 18.984 | +1.3% | 14.26 | 15.36 | 1.077x |
 
-Each prefill row is a separate process with a real full-context prefill. DS4X
-uses the same selective Q8-weight-to-FP16 cuBLAS prefill path as upstream while
-keeping persistent KV/indexer history packed. The decode columns retain the
-established 31-token steady-state measurements; this change does not alter the
-B1 decode path. See [Benchmark details](#benchmark-details) for the exact
-prompt and methodology.
+Each row is a separate process with a real full-context prefill and 32 greedy
+decode steps. The decode rate excludes the first token and averages the final
+31. DS4X uses the same selective Q8-weight-to-FP16 prefill strategy as
+upstream while keeping persistent KV/indexer history packed. The reported DS4X
+rows are the warmed Phase 2 release runs; immediate same-machine checks of the
+pre-refactor DS4X snapshot measured 831.82 and 847.63 prefill tok/s at 4K and
+16K, versus 831.13 and 863.05 tok/s for the release build. Single-pass prefill
+is sensitive to page-cache and thermal state, so paired runs matter more than
+an isolated sample. See [Benchmark details](#benchmark-details).
 
 Long-context target-only decode uses an actually allocated packed KV/indexer
 cache at each frontier. These measurements seed deterministic cache contents
@@ -40,10 +40,10 @@ decode steps after 3 warmups:
 
 | Context | Upstream TPOT (ms) | DS4X TPOT (ms) | Upstream (tok/s) | DS4X (tok/s) | Decode speedup |
 |---:|---:|---:|---:|---:|---:|
-| 128K | 81.248 | 70.918 | 12.308 | 14.101 | 1.146x |
-| 256K | 92.640 | 75.092 | 10.794 | 13.317 | 1.234x |
-| 512K | 115.246 | 81.434 | 8.677 | 12.280 | 1.415x |
-| 1M | 363.286 | 94.206 | 2.753 | 10.615 | 3.856x |
+| 128K | 81.248 | 69.804 | 12.308 | 14.326 | 1.164x |
+| 256K | 92.640 | 73.701 | 10.794 | 13.568 | 1.257x |
+| 512K | 115.246 | 80.268 | 8.677 | 12.458 | 1.436x |
+| 1M | 363.286 | 94.502 | 2.753 | 10.582 | 3.844x |
 
 The 1M row allocates the full 3.43 GiB packed persistent cache. It validates
 decode at a million-token frontier; it is not a million-token prefill result.
@@ -54,8 +54,8 @@ DS4X is derived from [antirez/ds4](https://github.com/antirez/ds4), with the
 optimization work developed against upstream commit
 [`84cc882`](https://github.com/antirez/ds4/commit/84cc882352757baf628a1776badf7cc54d584e28).
 DS4 provides the original GGUF loader, DeepSeek-V4-Flash execution pipeline,
-CLI/server frontends, session and checkpoint machinery, and the `ds4_*` API
-retained in this repository.
+session and checkpoint machinery, and the `ds4_*` API retained during the
+current migration.
 
 DS4X extracts that runtime into a CUDA-only, GB10-specific project and adds the
 packed-cache and long-context kernel work described below. Selected quantized
@@ -65,6 +65,8 @@ upstream pin and local modifications are documented in
 
 The DS4 and llama.cpp copyright notices remain in `LICENSE`. DS4X is an
 independent community project and is not affiliated with DeepSeek or NVIDIA.
+NVIDIA CUTLASS is consumed as a pinned submodule under its BSD-3-Clause
+license; DS4X does not vendor or modify its source.
 
 ## What DS4X changes
 
@@ -76,6 +78,7 @@ independent community project and is not affiliated with DeepSeek or NVIDIA.
 | Batch-one CSA scoring | Scalar/direct path over expanded history | Direct packed-row SM121 block-scaled MMA scorer; no full-history re-encode per generated token |
 | HCA long-context attention | Optimized path limited to 7,936 selected rows | Exact score-split attention without the old row ceiling, including the 1M frontier |
 | Q8 weight handling | Selective Q8-to-FP16 prefill cache | Same selective FP16/cuBLAS prefill path; no activation-Q8 exact-MMA path when the cache is available |
+| FP16 GEMM dispatch | cuBLAS for every Tensor Core-sized projection | Measured cuBLAS/CUTLASS dispatch; CuTe describes the logical layouts and CUTLASS only takes the production indexer shape where it wins |
 | Quantized matrix multiply | Original DS4 dispatch | Self-contained adapters for selected llama.cpp Q8_0, Q2_K, IQ2_XXS, dense, and routed-MoE CUDA kernels |
 | Persistent checkpoints | F32-cache payloads | Native packed-cache payloads with explicit ABI versioning and rejection of incompatible files |
 | Validation focus | General runtime coverage | Exact packed-kernel parity plus reproducible 128K, 256K, 512K, and 1M decode-frontier tests |
@@ -98,14 +101,18 @@ long-context performance.
 - Checkpoint weights remain Q8. Prefill lazily creates the same selective FP16
   weight mirrors as upstream so activations feed cuBLAS/HMMA directly instead
   of being requantized for the exact INT8 Tensor Core path.
-- Disk checkpoints store the native packed rows. Payload ABI version 3 and
-  distributed layer-payload ABI version 2 deliberately reject old F32-cache
-  checkpoint files.
+- Disk checkpoints store the native packed rows. Payload ABI version 3
+  deliberately rejects old F32-cache checkpoint files.
 - The quantized matmul adapter calls the selected CUDA kernels directly through
   a small raw-argument ABI, without requiring the full ggml graph runtime.
-- CUDA kernels, inference engine, storage, distributed execution, frontends,
-  and support libraries are separated into explicit source modules. Large
-  translation units are thin aggregators over subsystem-sized parts.
+- Modern CUDA C++ operators live in independent translation units under
+  `src/ds4x_kernel/backends/`. The first migrated operator owns the FP16
+  projection fallbacks and a pinned CUTLASS/CuTe GEMM backend; the stable C ABI
+  and the existing cuBLAS path remain available as fallbacks.
+- CUDA kernels, the single-request inference engine, storage, frontends, and
+  support libraries are separated into explicit source modules. Historical
+  translation units remain thin aggregators only while operators are migrated
+  into standalone CUDA C++ modules.
 
 Some graph-driver functions retain historical `metal_graph_*` names from the
 source runtime. The Makefile only builds the CUDA implementation.
@@ -127,35 +134,37 @@ portable fallback for another GPU generation.
 ## Build
 
 Requirements are an aarch64 DGX Spark host, a CUDA toolkit that recognizes
-`sm_121a`, GNU make, and a C99 compiler.
+`sm_121a`, GNU make, a C99 compiler, and the pinned CUTLASS submodule.
 
 ```bash
+git submodule update --init --recursive
 make -j4 spark smoke perf ds4_test
 ```
 
-The main programs are `ds4`, `ds4-server`, `ds4-bench`, and `ds4-eval`.
+The main programs are `ds4` and `ds4-bench`.
 
 Focused design studies:
 
 - [QKVO FP4 and quantized DSpark feasibility](docs/qkvo_fp4_dspark_feasibility.md)
+- [Modern CUDA, DSpark, and Codex roadmap](docs/roadmap.md)
 
 ## Project layout
 
 ```text
 src/
   README.md       module ownership and source-layout notes
-  apps/           CLI, HTTP server, benchmark and evaluation frontends
-  engine/         model loading, graph/session runtime and layer packing
+  apps/           single-request CLI and benchmark frontends
+  engine/         model loading and single-session graph runtime
   ds4x_kernel/    GB10 CUDA backend and device-facing API
-    backend/      packed cache, attention, projection and MoE kernels
+    backend/      dependency-ordered legacy aggregation and subsystem parts
+    backends/     standalone modern CUDA C++ operators and dispatch backends
     quantization/ adapted quantized CUDA matrix kernels
     include/      kernel ABI consumed by the inference engine
-  distributed/   tensor-parallel and distributed execution support
-  storage/       KV checkpoint store, SSD streaming and expert hotlists
+  storage/       packed checkpoint storage
   support/       small embedded support libraries (linenoise and rax)
 tests/
   ds4x_kernel/    standalone kernel parity, smoke and performance tests
-  engine/         engine and protocol semantic tests
+  engine/         engine and session semantic tests
   integration/    packed-checkpoint and full-model frontier tests
 build/obj/        generated dependency files and intermediate objects
 ```
@@ -275,24 +284,50 @@ make long-context DS4_TEST_MODEL=/path/to/model.gguf
 
 ## Benchmark details
 
-### Refactor regression
+### Phase 2 release regression
 
-The responsibility-based source split was rebuilt and checked on DGX Spark on
-2026-08-11. `make kernel-test` passed the packed-cache/attention/indexer smoke
-suite and every MMQ parity case; `./ds4_test --server` and all four application
-help paths passed. The packed checkpoint round trip at 8K reported
-`max_abs=0`, `rmse=0`, and identical argmax logits.
+The final single-device build was rebuilt from scratch and checked on DGX
+Spark on 2026-08-11. `make kernel-test` passed packed cache, attention,
+indexer, CUTLASS FP16, projection, operator-adapter and every MMQ parity case.
+The 8K packed-checkpoint round trip reported a 42.614 MiB payload,
+`max_abs=0`, `rmse=0`, `different=0/129280`, and identical argmax logits.
 
-The latest synthetic frontier validation, rerun after aligning the prefill
-weight path with upstream, used three warmups and 30 timed steps. It exercises
-the same packed target-only decode path as the comparison table.
+The final synthetic frontier validation used three warmups and 30 timed steps
+per context. It exercises the release build's packed target-only decode path.
 
 | Context | Median TPOT (ms) | Throughput (tok/s) |
 |---:|---:|---:|
-| 128K | 70.918 | 14.101 |
-| 256K | 75.092 | 13.317 |
-| 512K | 81.434 | 12.280 |
-| 1M | 94.206 | 10.615 |
+| 128K | 69.804 | 14.326 |
+| 256K | 73.701 | 13.568 |
+| 512K | 80.268 | 12.458 |
+| 1M | 94.502 | 10.582 |
+
+### CUTLASS/CuTe dispatch regression
+
+CUTLASS 4.6.2 is pinned at commit `6c65a175`. GB10's FP16 path uses
+warp-level `mma.sync`; CUTLASS's SM120 CollectiveBuilder is currently aimed at
+F8/F6/F4 inputs, so DS4X deliberately uses its forward-compatible SM80 FP16
+TensorOp composition rather than mislabeling an SM100 `tcgen05` path as
+available on `sm_121`. CuTe owns the logical `[tokens, in] x [in, out]`
+problem shape and CUTLASS owns the explicit kernel composition.
+
+The DGX Spark microbenchmark keeps cuBLAS for latency-sized and attention-output
+projections. It selects CUTLASS only for the production 4096-token indexer
+`q_b` shape, where the isolated kernel improved from `1.281 ms` to `1.063 ms`
+(`0.830x` latency). The 4096-token attention-output shape was slower under the
+tested CUTLASS tile (`1.105x` latency), so it remains on cuBLAS.
+
+Whole-model A/B used the same binary with `DS4_CUDA_F16_BACKEND=cublas` versus
+the default measured dispatch. On a 6,000,000-byte repeated-token fixture, 4K
+prefill was `851.26` versus `854.66 tok/s`, and warmed 16K prefill was `874.15`
+versus `885.94 tok/s`. The 4K full-logit JSON files were byte-identical. These
+numbers are dispatch regression checks, not replacements for the published
+prompt-dependent performance table.
+
+`DS4_CUDA_F16_BACKEND=cublas` disables CUTLASS dispatch for reproducible
+fallback runs. `DS4_CUDA_F16_BACKEND=cutlass` force-attempts CUTLASS on all
+supported FP16 batch shapes and is intended only for kernel research; the
+default auto policy is the measured production setting.
 
 ### Test methodology
 
@@ -323,21 +358,12 @@ remove the per-context decode warmups or the resident aligned CUDA artifacts.
 This isolates steady-state decode cost versus cache length. It is not a prefill
 benchmark and the synthetic zero history is not a language-quality workload.
 
-The table below is the release-validation run from 2026-08-10: a fresh build,
-three warmups, and the median of 30 timed decode steps at each frontier.
-
-At 1M, `cudaMemGetInfo` reported 122,572 MiB total and 12,930 MiB free after
-decode, or 107.07 GiB system-wide used. That is an observed unified-memory
-machine total, not a process-only allocation: it includes the Linux page cache,
-driver state, and any other system use. The runtime's own allocation plan is
-the 84.25 GiB total shown earlier.
-
-| Context | Median TPOT (ms) | Throughput (tok/s) |
-|---:|---:|---:|
-| 128K | 69.570 | 14.374 |
-| 256K | 74.057 | 13.503 |
-| 512K | 80.419 | 12.435 |
-| 1M | 93.993 | 10.639 |
+The release-validation run is the fresh-build, three-warmup, 30-sample table
+in [Phase 2 release regression](#phase-2-release-regression). At 1M the runtime
+planned 84.25 GiB: 80.76 GiB resident model, 3.43 GiB packed KV/indexer, and
+0.06 GiB runtime buffers. System-wide unified-memory usage also includes the
+Linux page cache, driver state, and unrelated processes, so it is not used as
+a process allocation figure.
 
 The release A/B run alternated two scorers over the same persistent 68-byte
 packed indexer rows: a transparent scalar oracle that decodes each row to F32,
@@ -362,7 +388,7 @@ generation steps. Each row is a separate process that actually prefills the
 full context; model loading and aligned-weight construction are outside the
 prefill timer. Each prefill latency is one complete measured pass. `steady
 decode` excludes the first generated token and averages the remaining 31
-tokens. The resulting 4K-128K values are summarized in the top-level
+tokens. The paired 4K and 16K release values are summarized in the top-level
 Performance table.
 
 The preceding packed-online implementation was 23.8%-55.6% slower in prefill.
@@ -395,16 +421,14 @@ byte-identical to `84cc882`.
 
 | Context | Upstream TPOT (ms) | DS4X TPOT (ms) | Upstream (tok/s) | DS4X (tok/s) | Decode speedup |
 |---:|---:|---:|---:|---:|---:|
-| 128K | 81.248 | 70.918 | 12.308 | 14.101 | 1.146x |
-| 256K | 92.640 | 75.092 | 10.794 | 13.317 | 1.234x |
-| 512K | 115.246 | 81.434 | 8.677 | 12.280 | 1.415x |
-| 1M | 363.286 | 94.206 | 2.753 | 10.615 | 3.856x |
+| 128K | 81.248 | 69.804 | 12.308 | 14.326 | 1.164x |
+| 256K | 92.640 | 73.701 | 10.794 | 13.568 | 1.257x |
+| 512K | 115.246 | 80.268 | 8.677 | 12.458 | 1.436x |
+| 1M | 363.286 | 94.502 | 2.753 | 10.582 | 3.844x |
 
-At 128K, the synthetic results are within 2.6% of upstream's real-prefill
-decode and within 1.0% of DS4X's real-prefill decode. At 1M, upstream allocates
-13.46 GiB of F32 KV through managed memory and shows substantial paging
-variance (236.7-540.4 ms across the timed steps); DS4X uses 3.43 GiB of packed
-KV and remains on the stable packed decode path.
+At 1M, upstream allocates 13.46 GiB of F32 KV through managed memory and shows
+substantial paging variance (236.7-540.4 ms across the timed steps); DS4X uses
+3.43 GiB of packed KV and remains on the stable packed decode path.
 
 Raw benchmark logs and CSV files remain outside the public repository.
 
@@ -465,6 +489,12 @@ separately by the exact kernel smoke comparison above.
 
 The 8K packed checkpoint test produced a 42.614 MiB payload and bit-identical
 post-restore decode logits (`max_abs=0`, `rmse=0`, identical argmax).
+
+The Phase 2 release build also produced a byte-identical 4K full-logit JSON
+against the last validated pre-refactor snapshot (SHA-256
+`b26645e9d08c1e84005634e4a9b50353e32ddc67ba8eef088eb72b70070e6474`).
+At 128K, 256K, 512K, and 1M, the optimized and scalar-oracle runs reported
+`max_abs=0`, `rmse=0`, `different=0/129280`, and identical argmax values.
 
 The real-text regression prefills a 30,474-token generated story, asks for the
 embedded facts, and passes all assignments on the default fast path:
@@ -533,9 +563,11 @@ score/top-k, not persistent-cache expansion.
 
 - Only the documented DeepSeek-V4-Flash layout is supported.
 - The performance table is target-only and batch one.
-- Packed multi-token prefill is enabled only for one CUDA GPU. Multi-GPU
-  placement retains the old fallback until packed row-table ownership and
-  communication are implemented.
+- Packed multi-token prefill and decode run on one CUDA GPU and one active
+  request. Multi-GPU placement, TP/EP and server batching are out of scope.
+- The target verifier/checkpoint and DSpark cache-window invariant are tested,
+  but no compatible DSpark support GGUF was available for an end-to-end draft
+  model run. Quantized DSpark integration remains Phase 3 work.
 - Default prefill prioritizes throughput and is not bit-identical to the exact
   reduction order. Set `DS4_CUDA_SPARK_PREFILL_EXACT=1` for grouped bit-exact
   attention or `DS4_CUDA_SPARK_PREFILL_REFERENCE=1` for the old oracle.

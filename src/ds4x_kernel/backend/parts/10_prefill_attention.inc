@@ -2141,6 +2141,7 @@ extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, 
     return cuda_ok(cudaGetLastError(), "add launch");
 }
 
+#if 0
 extern "C" int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor *out,
                                         const ds4_gpu_tensor *local,
                                         const ds4_gpu_tensor *remote,
@@ -2185,6 +2186,7 @@ extern "C" int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor *out,
     }
     return ok;
 }
+#endif
 extern "C" int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,

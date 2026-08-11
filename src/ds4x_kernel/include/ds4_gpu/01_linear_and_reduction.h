@@ -27,46 +27,6 @@ int ds4_gpu_embed_tokens_hc_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int ds4_gpu_embed_token_q8_0_tensor(
-        ds4_gpu_tensor *out,
-        const void       *model_map,
-        uint64_t          model_size,
-        uint64_t          weight_offset,
-        uint32_t          n_vocab,
-        uint32_t          token,
-        uint32_t          n_embd);
-
-int ds4_gpu_embed_tokens_q8_0_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *tokens,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint32_t                n_vocab,
-        uint32_t                n_tokens,
-        uint32_t                n_embd);
-
-int ds4_gpu_embed_token_quant_tensor(
-        ds4_gpu_tensor *out,
-        const void       *model_map,
-        uint64_t          model_size,
-        uint64_t          weight_offset,
-        uint32_t          weight_type,
-        uint32_t          n_vocab,
-        uint32_t          token,
-        uint32_t          n_embd);
-
-int ds4_gpu_embed_tokens_quant_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *tokens,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint32_t                weight_type,
-        uint32_t                n_vocab,
-        uint32_t                n_tokens,
-        uint32_t                n_embd);
-
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -153,4 +113,3 @@ int ds4_gpu_dsv4_topk_mask_tensor(
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k);
-

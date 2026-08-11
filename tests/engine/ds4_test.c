@@ -1,21 +1,35 @@
-#define DS4_SERVER_TEST
-#define DS4_SERVER_TEST_NO_MAIN
-#include "apps/ds4_server.c"
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
 
-#ifndef DS4_NO_GPU
-#include "parts/00_cuda_and_shared_helpers.inc"
-#if defined(__APPLE__)
-#include "parts/01_apple_kernel_reference_a.inc"
-#include "parts/02_apple_kernel_reference_b.inc"
-#endif
-#if defined(__APPLE__)
-#include "parts/03_apple_attention_reference.inc"
-#endif
-#if defined(__APPLE__)
-#include "parts/04_apple_moe_reference.inc"
-#endif
-#include "parts/05_model_and_vector_tests.inc"
-#include "parts/06_equivalence_and_speculative.inc"
-#endif
+bool ds4_test_dspark_cache_window_crop(void);
 
-#include "parts/07_test_runner.inc"
+static void print_help(const char *program) {
+    printf("Usage: %s [--dspark-cache-window | --all]\n", program);
+    puts("  --dspark-cache-window  Validate DSpark cache crop/append invariants.");
+    puts("  --all                  Run every single-request engine invariant.");
+}
+
+int main(int argc, char **argv) {
+    bool run_dspark = argc == 1;
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--all") ||
+            !strcmp(argv[i], "--dspark-cache-window")) {
+            run_dspark = true;
+        } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            print_help(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "unknown test: %s\n", argv[i]);
+            print_help(argv[0]);
+            return 2;
+        }
+    }
+
+    if (run_dspark && !ds4_test_dspark_cache_window_crop()) {
+        fputs("dspark-cache-window: FAILED\n", stderr);
+        return 1;
+    }
+    puts("dspark-cache-window: OK");
+    return 0;
+}

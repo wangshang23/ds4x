@@ -12,15 +12,22 @@ src/
   support/       embedded utility libraries
 ```
 
-Historical C/CUDA implementations use a thin aggregation translation unit plus
-semantic `parts/*.inc` files. This preserves private/static symbol ordering
-while those subsystems are migrated. New self-contained CUDA work uses ordinary
-`.cu` translation units under `ds4x_kernel/backends/` with narrow C launch
-interfaces; the FP16 projection module is the reference structure.
+The host engine is split into ordinary, independently compiled C modules under
+`engine/core`, `engine/model`, `engine/runtime`, and `engine/session`. Its
+private cross-module ABI is centralized in `engine/internal`; public callers
+only include `engine/include/ds4.h`.
+
+Packed CUDA kernels are split into independent runtime, linear, attention,
+indexer, MoE and compatibility translation units inside `ds4x_kernel/backend`.
+Template and force-inlined device implementation stays in private `.cuh`
+headers, following CUTLASS/CuTe's header-instantiation model. New standalone
+CUDA work uses ordinary `.cu` translation units under `ds4x_kernel/backends/`
+with narrow C launch interfaces; the FP16 projection module is the reference
+structure.
 
 Phase 2 routes every model-visible target operation through typed adapters.
-The remaining aggregation parts are audited implementations behind that
-boundary, not engine-owned APIs or alternate platform backends.
+The packed CUDA modules remain audited implementations behind that boundary,
+not engine-owned APIs or alternate platform backends.
 
 Vendored llama.cpp headers retain their upstream layout to keep source audits
 and re-syncs practical.

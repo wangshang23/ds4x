@@ -46,9 +46,10 @@ tests/
   performance/   reproducible GB10 regression benchmarks
 ```
 
-During migration, existing paths remain under `src/ds4x_kernel/backend/parts/`.
-New code must not add more aggregation includes. An operator leaves that
-directory only when its standalone parity and performance tests pass.
+The packed runtime now lives in independently compiled modules under
+`src/ds4x_kernel/backend/`. New code must not recreate textual `.inc`
+aggregation. Template or force-inlined device implementation belongs in a
+private `.cuh`; stateful launch and resource ownership belongs in one `.cu`.
 
 ## Phase 0: single-device runtime
 

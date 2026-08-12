@@ -1,0 +1,6 @@
+#ifndef DS4X_BACKEND_COMPAT_KERNELS_CUH
+#define DS4X_BACKEND_COMPAT_KERNELS_CUH
+
+#include "../backend_common.cuh"
+
+#endif  // DS4X_BACKEND_COMPAT_KERNELS_CUH

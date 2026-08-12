@@ -108,7 +108,7 @@ converted target size estimate
 
 代码证据：
 
-- `src/engine/parts/02_model_validation.inc` 的 Flash layout validation 当前要求这五类 projection 使用
+- `src/engine/model/validation.c` 的 Flash layout validation 当前要求这五类 projection 使用
   dense quant layout，现有模型实际为 Q8_0。
 - `src/ds4x_kernel/quantization/mmq/mma.cuh` 已包含
   `mma.sync.aligned.kind::mxf4nvf4...e2m1...ue4m3` 原生 PTX。
@@ -120,7 +120,7 @@ converted target size estimate
 
 尚未完成的整模型接入：
 
-- `src/engine/parts/01_gguf_and_quant.inc` 尚未把 GGUF type 40 注册为 DS4 dense NVFP4 类型。
+- `src/engine/model/gguf.c` 尚未把 GGUF type 40 注册为 DS4 dense NVFP4 类型。
 - `tensor_type_is_dense_quant()` 和 DSpark dense validation 尚未接受 NVFP4。
 - `ds4_gpu_matmul_quant_tensor()` 尚未把 type 40 分派到 NVFP4 vector kernel。
 - 当前 Q8 production path 已有 Q_a+KV、Q_b+norm+RoPE、grouped O_a 和

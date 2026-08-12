@@ -5,18 +5,24 @@ kernels.
 
 ```text
 engine/
-  ds4_engine.c   thin aggregation translation unit
+  core/          platform and process-level runtime support
   include/       public `ds4_*` C API
-  config/        GPU/runtime option parsing shared by applications
-  model/         layer packing and model-layout helpers
-  parts/         GGUF, CPU reference, graph, prefill, decode, DSpark and batch
-                 execution subsystems
+  internal/      private types, declarations and hot-path inline accessors
+  model/         GGUF loading, validation, tokenizer and model memory policy
+  runtime/       graph setup, prefill, decode, verification and DSpark runtime
+  session/       engine/session lifecycle, generation, checkpoint and batching
 ```
 
-The ordered `parts/*.inc` files preserve the original single-translation-unit
-static symbol visibility. They are grouped by lifecycle: model validation and
-reference operations, graph construction, decode/prefill execution, engine and
-session state, then batching and distributed integration.
+Every `.c` file is an independent translation unit and produces its own object
+file. Shared private declarations live in `internal/engine_internal.h`; they
+are not part of the installed API. Small graph accessors remain `static inline`
+there so splitting the former aggregation unit does not add calls to the decode
+hot path.
+
+Modules are grouped by ownership rather than source-order dependencies. New
+engine code should keep private helpers in its owning `.c` file and expose only
+the narrow declarations needed by another engine module through the internal
+header.
 
 Device work is accessed only through headers from `src/ds4x_kernel/include`.
 New host scheduling logic belongs here; new CUDA implementation belongs in

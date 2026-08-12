@@ -6,6 +6,7 @@ SRC_DIR := src
 APP_DIR := $(SRC_DIR)/apps
 ENGINE_DIR := $(SRC_DIR)/engine
 ENGINE_INCLUDE_DIR := $(ENGINE_DIR)/include
+ENGINE_INTERNAL_DIR := $(ENGINE_DIR)/internal
 KERNEL_DIR := $(SRC_DIR)/ds4x_kernel
 KERNEL_BACKEND_DIR := $(KERNEL_DIR)/backend
 KERNEL_MODERN_BACKEND_DIR := $(KERNEL_DIR)/backends
@@ -25,7 +26,7 @@ BUILD_DIR ?= build
 OBJ_DIR := $(BUILD_DIR)/obj
 
 INCLUDE_DIRS := -I$(SRC_DIR) -I$(APP_DIR) \
-	-I$(ENGINE_DIR) -I$(ENGINE_INCLUDE_DIR) \
+	-I$(ENGINE_DIR) -I$(ENGINE_INCLUDE_DIR) -I$(ENGINE_INTERNAL_DIR) \
 	-I$(KERNEL_INCLUDE_DIR) -I$(KERNEL_TABLE_DIR) \
 	-I$(MMQ_DIR) -I$(STORAGE_DIR) -I$(SUPPORT_DIR) \
 	-I$(KERNEL_MMQ_TEST_DIR) -I$(CUDA_HOME)/include
@@ -52,15 +53,65 @@ MMQ_OBJS := \
 	$(OBJ_DIR)/ds4x_kernel/quantization/mmq/mmvq.o \
 	$(OBJ_DIR)/ds4x_kernel/quantization/mmq/ds4_repack.o
 
+BACKEND_OBJS := \
+	$(OBJ_DIR)/ds4x_kernel/backend/runtime/runtime.o \
+	$(OBJ_DIR)/ds4x_kernel/backend/runtime/storage.o \
+	$(OBJ_DIR)/ds4x_kernel/backend/ops/linear.o \
+	$(OBJ_DIR)/ds4x_kernel/backend/ops/attention_decode.o \
+	$(OBJ_DIR)/ds4x_kernel/backend/ops/indexer.o \
+	$(OBJ_DIR)/ds4x_kernel/backend/ops/attention_prefill.o \
+	$(OBJ_DIR)/ds4x_kernel/backend/ops/moe_quantized.o \
+	$(OBJ_DIR)/ds4x_kernel/backend/ops/moe_dispatch.o \
+	$(OBJ_DIR)/ds4x_kernel/backend/compat/compat_api.o
+
 KERNEL_OBJS := \
-	$(OBJ_DIR)/ds4x_kernel/backend/ds4x_kernel.o \
+	$(BACKEND_OBJS) \
 	$(OBJ_DIR)/ds4x_kernel/backends/cutlass_fp16_gemm.o \
 	$(OBJ_DIR)/ds4x_kernel/backends/fp16_projection.o \
 	$(OBJ_DIR)/ds4x_kernel/backends/operator_adapters.o \
 	$(MMQ_OBJS)
 
+ENGINE_OBJS := \
+	$(OBJ_DIR)/engine/core/platform.o \
+	$(OBJ_DIR)/engine/model/gguf.o \
+	$(OBJ_DIR)/engine/model/validation.o \
+	$(OBJ_DIR)/engine/model/dspark_weights.o \
+	$(OBJ_DIR)/engine/model/math.o \
+	$(OBJ_DIR)/engine/model/tokenizer.o \
+	$(OBJ_DIR)/engine/model/context_memory.o \
+	$(OBJ_DIR)/engine/runtime/diagnostics.o \
+	$(OBJ_DIR)/engine/runtime/graph_state.o \
+	$(OBJ_DIR)/engine/runtime/graph_setup.o \
+	$(OBJ_DIR)/engine/runtime/decode_primitives.o \
+	$(OBJ_DIR)/engine/runtime/decode_layer.o \
+	$(OBJ_DIR)/engine/runtime/output.o \
+	$(OBJ_DIR)/engine/runtime/dspark_prefill.o \
+	$(OBJ_DIR)/engine/runtime/prefill_attention.o \
+	$(OBJ_DIR)/engine/runtime/prefill_ffn.o \
+	$(OBJ_DIR)/engine/runtime/verifier.o \
+	$(OBJ_DIR)/engine/runtime/dspark_verify.o \
+	$(OBJ_DIR)/engine/runtime/prefill_runner.o \
+	$(OBJ_DIR)/engine/runtime/long_prompt.o \
+	$(OBJ_DIR)/engine/session/engine_lifecycle.o \
+	$(OBJ_DIR)/engine/session/checkpoint.o \
+	$(OBJ_DIR)/engine/session/spec_frontier.o \
+	$(OBJ_DIR)/engine/session/session_state.o \
+	$(OBJ_DIR)/engine/session/model_cache.o \
+	$(OBJ_DIR)/engine/session/generation.o \
+	$(OBJ_DIR)/engine/session/session_sync.o \
+	$(OBJ_DIR)/engine/session/batch.o
+
+ENGINE_HOOK_OBJS := \
+	$(OBJ_DIR)/tests/engine/tokenizer_hooks.o \
+	$(OBJ_DIR)/tests/engine/model_cache_hooks.o
+
+ENGINE_INTEGRATION_OBJS := \
+	$(filter-out $(OBJ_DIR)/engine/model/tokenizer.o \
+		$(OBJ_DIR)/engine/session/model_cache.o,$(ENGINE_OBJS)) \
+	$(ENGINE_HOOK_OBJS)
+
 RUNTIME_OBJS := \
-	$(OBJ_DIR)/engine/ds4_engine.o \
+	$(ENGINE_OBJS) \
 	$(OBJ_DIR)/storage/ds4_memory.o \
 	$(KERNEL_OBJS)
 
@@ -78,7 +129,7 @@ TEST_OBJS := \
 	$(OBJ_DIR)/tests/integration/synth_frontier_bench.o \
 	$(OBJ_DIR)/tests/integration/packed_checkpoint_smoke.o \
 	$(OBJ_DIR)/tests/engine/ds4_test.o \
-	$(OBJ_DIR)/engine/ds4_test_hooks.o
+	$(ENGINE_HOOK_OBJS)
 
 ALL_OBJS := $(sort $(RUNTIME_OBJS) $(APP_OBJS) $(TEST_OBJS))
 DEPS := $(ALL_OBJS:.o=.d)
@@ -104,9 +155,10 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-$(OBJ_DIR)/ds4x_kernel/backend/ds4x_kernel.o: $(KERNEL_BACKEND_DIR)/ds4x_kernel.cu
+$(OBJ_DIR)/ds4x_kernel/backend/%.o: $(KERNEL_BACKEND_DIR)/%.cu
 	@mkdir -p $(dir $@)
-	$(NVCC) $(CPPFLAGS) $(NVCC_DEFS) $(NVCCFLAGS) $(DEPFLAGS) -c -o $@ $<
+	$(NVCC) $(CPPFLAGS) $(NVCC_DEFS) $(NVCCFLAGS) $(DEPFLAGS) \
+		-std=c++17 -c -o $@ $<
 
 $(OBJ_DIR)/ds4x_kernel/backends/%.o: $(KERNEL_MODERN_BACKEND_DIR)/%.cu
 	@mkdir -p $(dir $@)
@@ -117,11 +169,6 @@ $(OBJ_DIR)/ds4x_kernel/quantization/mmq/%.o: $(MMQ_DIR)/%.cu
 	@mkdir -p $(dir $@)
 	$(NVCC) $(CPPFLAGS) $(NVCC_DEFS) $(NVCCFLAGS) $(DEPFLAGS) \
 		-std=c++17 -c -o $@ $<
-
-$(OBJ_DIR)/engine/ds4_test_hooks.o: $(ENGINE_DIR)/ds4_engine.c
-	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -Wno-unused-function \
-		-DDS4_TEST_HOOKS -c -o $@ $<
 
 $(OBJ_DIR)/tests/ds4x_kernel/%.o: $(KERNEL_TEST_DIR)/%.c
 	@mkdir -p $(dir $@)
@@ -134,6 +181,14 @@ $(OBJ_DIR)/tests/integration/%.o: $(INTEGRATION_TEST_DIR)/%.c
 $(OBJ_DIR)/tests/engine/ds4_test.o: $(ENGINE_TEST_DIR)/ds4_test.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -Wno-unused-function -c -o $@ $<
+
+$(OBJ_DIR)/tests/engine/tokenizer_hooks.o: $(ENGINE_DIR)/model/tokenizer.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -DDS4_TEST_HOOKS -c -o $@ $<
+
+$(OBJ_DIR)/tests/engine/model_cache_hooks.o: $(ENGINE_DIR)/session/model_cache.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -DDS4_TEST_HOOKS -c -o $@ $<
 
 $(KERNEL_TEST_DIR)/cuda_long_context_smoke: \
 	$(OBJ_DIR)/tests/ds4x_kernel/cuda_long_context_smoke.o $(KERNEL_OBJS)
@@ -150,7 +205,7 @@ $(KERNEL_MMQ_TEST_DIR)/test_mmq_parity: \
 
 $(INTEGRATION_TEST_DIR)/synth_frontier_bench: \
 	$(OBJ_DIR)/tests/integration/synth_frontier_bench.o \
-	$(OBJ_DIR)/engine/ds4_test_hooks.o \
+	$(ENGINE_INTEGRATION_OBJS) \
 	$(OBJ_DIR)/storage/ds4_kvstore.o \
 	$(OBJ_DIR)/support/rax.o \
 	$(OBJ_DIR)/storage/ds4_memory.o \
@@ -159,7 +214,7 @@ $(INTEGRATION_TEST_DIR)/synth_frontier_bench: \
 
 $(INTEGRATION_TEST_DIR)/packed_checkpoint_smoke: \
 	$(OBJ_DIR)/tests/integration/packed_checkpoint_smoke.o \
-	$(OBJ_DIR)/engine/ds4_test_hooks.o \
+	$(ENGINE_INTEGRATION_OBJS) \
 	$(OBJ_DIR)/storage/ds4_kvstore.o \
 	$(OBJ_DIR)/support/rax.o \
 	$(OBJ_DIR)/storage/ds4_memory.o \

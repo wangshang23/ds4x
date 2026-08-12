@@ -6,21 +6,33 @@ runtime.
 ```text
 ds4x_kernel/
   backend/
-    ds4x_kernel.cu   thin aggregation translation unit
-    parts/           runtime, cache, attention, projection and MoE kernels
+    runtime/         CUDA context, graph, tensor and model-cache ownership
+    ops/             linear, attention, indexer and routed-MoE modules
+    compat/          stable engine-facing compatibility ABI
+    internal/        private types, declarations and shared device helpers
   backends/          independent modern CUDA C++ operator implementations
   include/           C ABI used by the engine and standalone tests
-  quantization/mmq/  adapted llama.cpp quantized matrix kernels
-  tables/            CUDA lookup tables
+  quantization/mmq/  adapted llama.cpp quantized template instantiations
+  tables/            private CUDA lookup-table headers
 ```
 
-`backend/parts/` is ordered by dependency: runtime state and memory management
-come first, followed by attention/indexer kernels, projections, MoE, GLM, and
-the compatibility API. Persistent KV and indexer rows remain physically
-packed; this layout must not be changed without a checkpoint ABI bump.
+The packed backend is compiled as nine ordinary CUDA translation units. Their
+shared private contract lives in `backend/internal/backend_internal.cuh`.
+Small device helpers that must remain visible for inlining stay in that private
+header; stateful host functions and kernels have one owning `.cu` module.
 
-New self-contained work belongs in `backends/` rather than adding another
-large textual include. `fp16_projection.cu` is the migration example: kernels
+Cross-module kernels and force-inlined device helpers remain private
+header-visible definitions. This avoids relocatable device code: CUDA 13
+device LTO currently lowers the SM121a block-scaled MXFP4 instructions to an
+SM121 target, which rejects those instructions. Host state and launch APIs are
+still independently compiled, while each caller instantiates the exact local
+kernel variant it launches.
+
+Persistent KV and indexer rows remain physically packed; this layout must not
+be changed without a checkpoint ABI bump.
+
+New self-contained work belongs in `backends/` or an owning `backend/ops`
+module. `fp16_projection.cu` is the migration example: kernels
 and launch wrappers live in one ordinary CUDA C++ translation unit, while the
 engine-facing wrapper retains allocation, model-cache and dispatch ownership.
 `cutlass_fp16_gemm.cu` composes the pinned CUTLASS kernel and uses CuTe for its

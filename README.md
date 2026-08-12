@@ -40,10 +40,10 @@ decode steps after 3 warmups:
 
 | Context | Upstream TPOT (ms) | DS4X TPOT (ms) | Upstream (tok/s) | DS4X (tok/s) | Decode speedup |
 |---:|---:|---:|---:|---:|---:|
-| 128K | 81.248 | 69.804 | 12.308 | 14.326 | 1.164x |
-| 256K | 92.640 | 73.701 | 10.794 | 13.568 | 1.257x |
-| 512K | 115.246 | 80.268 | 8.677 | 12.458 | 1.436x |
-| 1M | 363.286 | 94.502 | 2.753 | 10.582 | 3.844x |
+| 128K | 81.248 | 70.401 | 12.308 | 14.204 | 1.154x |
+| 256K | 92.640 | 74.004 | 10.794 | 13.513 | 1.252x |
+| 512K | 115.246 | 79.838 | 8.677 | 12.525 | 1.444x |
+| 1M | 363.286 | 94.251 | 2.753 | 10.610 | 3.854x |
 
 The 1M row allocates the full 3.43 GiB packed persistent cache. It validates
 decode at a million-token frontier; it is not a million-token prefill result.
@@ -110,9 +110,9 @@ long-context performance.
   projection fallbacks and a pinned CUTLASS/CuTe GEMM backend; the stable C ABI
   and the existing cuBLAS path remain available as fallbacks.
 - CUDA kernels, the single-request inference engine, storage, frontends, and
-  support libraries are separated into explicit source modules. Historical
-  translation units remain thin aggregators only while operators are migrated
-  into standalone CUDA C++ modules.
+  support libraries are separated into explicit source modules. The packed
+  backend builds as nine ordinary CUDA translation units; shared templates and
+  force-inlined device helpers remain in private `.cuh` headers.
 
 Some graph-driver functions retain historical `metal_graph_*` names from the
 source runtime. The Makefile only builds the CUDA implementation.
@@ -155,8 +155,13 @@ src/
   README.md       module ownership and source-layout notes
   apps/           single-request CLI and benchmark frontends
   engine/         model loading and single-session graph runtime
+    core/         platform support
+    model/        GGUF, validation, tokenizer and memory policy
+    runtime/      graph, prefill, decode and verification
+    session/      lifecycle, generation and checkpoints
+    internal/     private cross-module declarations
   ds4x_kernel/    GB10 CUDA backend and device-facing API
-    backend/      dependency-ordered legacy aggregation and subsystem parts
+    backend/      independently compiled packed runtime and operator modules
     backends/     standalone modern CUDA C++ operators and dispatch backends
     quantization/ adapted quantized CUDA matrix kernels
     include/      kernel ABI consumed by the inference engine
@@ -208,8 +213,8 @@ indexer row = 128 E2M1 values / 2 values per byte
 ```
 
 The four scales correspond to four 32-value blocks. The constants live in
-`src/ds4x_kernel/include/ds4_gpu.h`; pack/unpack and the SM121 scorer live
-under `src/ds4x_kernel/backend/parts/`.
+`src/ds4x_kernel/include/ds4_gpu.h`; pack/unpack and the SM121 scorer live in
+the independent modules under `src/ds4x_kernel/backend/ops/`.
 
 For Flash, layers 0 and 1 have no compressed history, 21 layers use CSA ratio
 4, and 20 layers use HCA ratio 128. With the benchmark's 32-token prefill chunk,
@@ -287,7 +292,7 @@ make long-context DS4_TEST_MODEL=/path/to/model.gguf
 ### Phase 2 release regression
 
 The final single-device build was rebuilt from scratch and checked on DGX
-Spark on 2026-08-11. `make kernel-test` passed packed cache, attention,
+Spark on 2026-08-12. `make kernel-test` passed packed cache, attention,
 indexer, CUTLASS FP16, projection, operator-adapter and every MMQ parity case.
 The 8K packed-checkpoint round trip reported a 42.614 MiB payload,
 `max_abs=0`, `rmse=0`, `different=0/129280`, and identical argmax logits.
@@ -297,10 +302,14 @@ per context. It exercises the release build's packed target-only decode path.
 
 | Context | Median TPOT (ms) | Throughput (tok/s) |
 |---:|---:|---:|
-| 128K | 69.804 | 14.326 |
-| 256K | 73.701 | 13.568 |
-| 512K | 80.268 | 12.458 |
-| 1M | 94.502 | 10.582 |
+| 128K | 70.401 | 14.204 |
+| 256K | 74.004 | 13.513 |
+| 512K | 79.838 | 12.525 |
+| 1M | 94.251 | 10.610 |
+
+Relative to the pre-split packed-backend centers, TPOT changed by `+0.9%`,
+`+0.4%`, `-0.5%`, and `-0.3%` respectively. This is run-to-run variation,
+not a structural performance regression from independent compilation.
 
 ### CUTLASS/CuTe dispatch regression
 
@@ -421,10 +430,10 @@ byte-identical to `84cc882`.
 
 | Context | Upstream TPOT (ms) | DS4X TPOT (ms) | Upstream (tok/s) | DS4X (tok/s) | Decode speedup |
 |---:|---:|---:|---:|---:|---:|
-| 128K | 81.248 | 69.804 | 12.308 | 14.326 | 1.164x |
-| 256K | 92.640 | 73.701 | 10.794 | 13.568 | 1.257x |
-| 512K | 115.246 | 80.268 | 8.677 | 12.458 | 1.436x |
-| 1M | 363.286 | 94.502 | 2.753 | 10.582 | 3.844x |
+| 128K | 81.248 | 70.401 | 12.308 | 14.204 | 1.154x |
+| 256K | 92.640 | 74.004 | 10.794 | 13.513 | 1.252x |
+| 512K | 115.246 | 79.838 | 8.677 | 12.525 | 1.444x |
+| 1M | 363.286 | 94.251 | 2.753 | 10.610 | 3.854x |
 
 At 1M, upstream allocates 13.46 GiB of F32 KV through managed memory and shows
 substantial paging variance (236.7-540.4 ms across the timed steps); DS4X uses

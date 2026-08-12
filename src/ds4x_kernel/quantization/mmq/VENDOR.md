@@ -46,14 +46,14 @@ keeps ds4 self-contained at the cost of a periodic re-sync.
 | `ds4_ggml_stubs.h`    | (new)                                        | shim: ggml_type enum, macros, info struct, type_size lookups             | ~280 |
 | `ds4_ggml_stubs.cu`   | (new)                                        | shim impls: `ggml_cuda_info`, naive pool, `ggml_backend_cuda_context::*` | ~110 |
 | `ds4_mmq.h`           | (new)                                        | public C ABI for ds4 to call                                             |  ~70 |
-| `ds4_mmq.cu`          | (new)                                        | thin aggregation unit for the local MMQ adapter                          |   <20 |
-| `parts/*.inc`         | (new)                                        | dense, routed-MoE, vector and aligned host/kernel adapters               | ~4,500 |
-| `ds4_mmq_d2r.cu`      | (new)                                        | thin aggregation unit for the D2R path                                  |   <20 |
-| `d2r_parts/*.inc`     | (new)                                        | D2R layouts, mainloops, kernels and launchers                            | ~3,400 |
+| `ds4_mmq.cu`          | (new)                                        | explicit instantiation unit for the local MMQ adapter                    |   <20 |
+| `detail/*.cuh`        | (new)                                        | dense, routed-MoE, vector and aligned template implementation            | ~4,500 |
+| `ds4_mmq_d2r.cu`      | (new)                                        | explicit instantiation unit for the D2R path                             |   <20 |
+| `detail/d2r/*.cuh`    | (new)                                        | D2R layouts, mainloops, kernels and launchers                            | ~3,400 |
 
 Vendored files retain their upstream shape for auditability. DS4X-owned CUDA
-adapters are split into semantic parts so no local implementation monolith is
-needed.
+adapters use normal private CUDA headers and explicit instantiation units; no
+textual `.inc` aggregation remains.
 
 ## What llama.cpp's `mmq.cu` does that we don't vendor
 

@@ -28,23 +28,26 @@ acceptance or Codex protocols.
 
 As of the Phase 2 release, every model-visible target hot path enters this
 operator boundary. Some adapters deliberately call the already validated
-packed kernel implementation in `backend/parts/`; migration means the engine
-no longer depends on private kernel ordering or untyped argument lists, not
-that a slower replacement kernel must be selected.
+packed kernel modules under `backend/ops/`; migration means the engine no
+longer depends on private source ordering or untyped argument lists, not that a
+slower replacement kernel must be selected.
 
 ## Source ownership
 
-- `backend/ds4x_kernel.cu` is the dependency-ordered aggregation unit for code
-  that still shares private state across subsystem includes.
-- `backend/parts/` contains those historical subsystems. Moving a kernel out is
-  preferred to growing these files further.
+- `backend/runtime/` owns process/device state, graph capture, memory and model
+  cache lifetime.
+- `backend/ops/` owns independently compiled linear, attention, indexer and MoE
+  kernels; `backend/compat/` owns only the stable compatibility ABI.
+- `backend/internal/backend_internal.cuh` contains private declarations,
+  templates and force-inlined device helpers needed across translation units.
 - `backends/` contains independent CUDA C++ implementations. Files expose a
   narrow launch ABI through `include/ds4x/` and have focused tests under
   `tests/ds4x_kernel/backends/`.
 - `backends/operator_adapters.cu` is the typed bridge for packed cache,
   indexer, attention, routed MoE, hyper-connection and graph-capture paths.
 - `quantization/mmq/` retains the audited llama.cpp-derived quantized kernels
-  and its vendor record.
+  as explicit template-instantiation units with private `detail/*.cuh` headers,
+  plus its vendor record.
 
 ## FP16 projection dispatch
 

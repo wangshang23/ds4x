@@ -3076,32 +3076,68 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 n_groups,
                 group_dim);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a pack launch")) return 0;
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        cublasStatus_t st = cublasGemmStridedBatchedEx(cuda_cublas_for_tier(logical_tier),
-                                                       CUBLAS_OP_T,
-                                                       CUBLAS_OP_N,
-                                                       (int)rank,
-                                                       (int)n_tokens,
-                                                       (int)group_dim,
-                                                       &alpha,
-                                                       out_a_f16,
-                                                       CUDA_R_16F,
-                                                       (int)group_dim,
-                                                       (long long)rank * group_dim,
-                                                       heads_h,
-                                                       CUDA_R_16F,
-                                                       (int)group_dim,
-                                                       (long long)n_tokens * group_dim,
-                                                       &beta,
-                                                       low_packed,
-                                                       CUDA_R_32F,
-                                                       (int)rank,
-                                                       (long long)rank * n_tokens,
-                                                       (int)n_groups,
-                                                       CUDA_R_32F,
-                                                       CUBLAS_GEMM_DEFAULT);
-        if (!cublas_ok(st, "attention output a gemm")) return 0;
+        static const int cutlass_batched_mode = [] {
+            const char *backend = getenv("DS4_CUDA_ATTN_OUTPUT_A_BACKEND");
+            return backend && strcmp(backend, "cutlass") == 0 ? 2 :
+                   backend && strcmp(backend, "cublas") == 0 ? 0 : 1;
+        }();
+        const int cutlass_auto_shape =
+            n_groups == 8u && group_dim == 4096u && rank == 1024u &&
+            n_tokens >= 512u && n_tokens <= 1024u;
+        int cutlass_done = 0;
+        if (cutlass_batched_mode == 2 ||
+            (cutlass_batched_mode == 1 && cutlass_auto_shape)) {
+            const int rc = ds4x_cutlass_fp16_gemm_strided_batched(
+                    low_packed,
+                    (const uint16_t *)heads_h,
+                    (const uint16_t *)out_a_f16,
+                    n_tokens,
+                    group_dim,
+                    rank,
+                    n_groups,
+                    (void *)cuda_decode_stream());
+            if (rc == 1) {
+                cutlass_done = 1;
+            } else if (rc < 0) {
+                static int logged = 0;
+                if (!logged) {
+                    logged = 1;
+                    fprintf(stderr,
+                            "ds4: CUTLASS attention output-A failed (%s); "
+                            "falling back to cuBLAS\n",
+                            ds4x_cutlass_status_string(rc));
+                }
+            }
+        }
+        if (!cutlass_done) {
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            cublasStatus_t st = cublasGemmStridedBatchedEx(
+                    cuda_cublas_for_tier(logical_tier),
+                    CUBLAS_OP_T,
+                    CUBLAS_OP_N,
+                    (int)rank,
+                    (int)n_tokens,
+                    (int)group_dim,
+                    &alpha,
+                    out_a_f16,
+                    CUDA_R_16F,
+                    (int)group_dim,
+                    (long long)rank * group_dim,
+                    heads_h,
+                    CUDA_R_16F,
+                    (int)group_dim,
+                    (long long)n_tokens * group_dim,
+                    &beta,
+                    low_packed,
+                    CUDA_R_32F,
+                    (int)rank,
+                    (long long)rank * n_tokens,
+                    (int)n_groups,
+                    CUDA_R_32F,
+                    CUBLAS_GEMM_DEFAULT);
+            if (!cublas_ok(st, "attention output a gemm")) return 0;
+        }
         attention_unpack_group_low_kernel<<<(low_tmp_count + 255) / 256, 256, 0, cuda_decode_stream()>>>(
                 (float *)low->ptr,
                 low_packed,

@@ -66,11 +66,16 @@ The default backend policy is empirical:
 
 - small compressor, router and output projections remain on cuBLAS or their
   exact fallback kernels;
-- `in=1024`, `out=8192`, `tokens>=2048` uses CUTLASS, matching the production
-  indexer `q_b` shape that wins on GB10;
+- `in=1024`, `out=8192`, `tokens>=128` uses CUTLASS, matching the indexer
+  `q_b` shapes that win or tie on GB10;
+- attention output-A uses a CuTe-shaped CUTLASS strided-batched GEMM only for
+  the measured Flash shape `batch=8`, `in=4096`, `out=1024`, and
+  `512<=tokens<=1024`; smaller and 4096-token chunks remain on cuBLAS;
 - unsupported or failed CUTLASS launches fall back to cuBLAS;
 - `DS4_CUDA_F16_BACKEND=cublas` disables CUTLASS, while `cutlass` is a research
-  override that attempts it for every supported batch shape.
+  override that attempts it for every supported dense shape;
+- `DS4_CUDA_ATTN_OUTPUT_A_BACKEND=cublas|cutlass` provides the corresponding
+  attention output-A A/B override.
 
 No runtime autotuning occurs in inference. It would add synchronization and
 first-request latency, and a noisy first sample is not a safe production

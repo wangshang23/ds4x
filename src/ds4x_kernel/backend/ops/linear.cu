@@ -1234,7 +1234,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                    backend && strcmp(backend, "cublas") == 0 ? 0 : 1;
         }();
         const int cutlass_auto_shape =
-            in_dim == 1024u && out_dim == 8192u && n_tok >= 2048u;
+            in_dim == 1024u && out_dim == 8192u && n_tok >= 128u;
         if (cutlass_mode == 2 || (cutlass_mode == 1 && cutlass_auto_shape)) {
             const int rc = ds4x_cutlass_fp16_gemm(
                     (float *)out->ptr,

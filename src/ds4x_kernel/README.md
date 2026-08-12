@@ -35,9 +35,11 @@ New self-contained work belongs in `backends/` or an owning `backend/ops`
 module. `fp16_projection.cu` is the migration example: kernels
 and launch wrappers live in one ordinary CUDA C++ translation unit, while the
 engine-facing wrapper retains allocation, model-cache and dispatch ownership.
-`cutlass_fp16_gemm.cu` composes the pinned CUTLASS kernel and uses CuTe for its
-logical problem shape. See `docs/cuda_backend_architecture.md` for the boundary
-and performance-gating rules.
+`cutlass_fp16_gemm.cu` composes the pinned CUTLASS dense and strided-batched
+kernels and uses CuTe for their logical problem shapes. Production dispatch
+currently covers the indexer `q_b` projection and selected attention output-A
+prefill chunks. See `docs/cuda_backend_architecture.md` for the boundary and
+performance-gating rules.
 
 `operator_adapters.cu` completes the Phase 2 hot-path boundary for packed
 cache, CSA indexer, CSA/HCA attention, routed MoE, output hyper-connections and

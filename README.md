@@ -320,11 +320,20 @@ TensorOp composition rather than mislabeling an SM100 `tcgen05` path as
 available on `sm_121`. CuTe owns the logical `[tokens, in] x [in, out]`
 problem shape and CUTLASS owns the explicit kernel composition.
 
-The DGX Spark microbenchmark keeps cuBLAS for latency-sized and attention-output
-projections. It selects CUTLASS only for the production 4096-token indexer
-`q_b` shape, where the isolated kernel improved from `1.281 ms` to `1.063 ms`
-(`0.830x` latency). The 4096-token attention-output shape was slower under the
-tested CUTLASS tile (`1.105x` latency), so it remains on cuBLAS.
+The DGX Spark microbenchmark keeps cuBLAS for latency-sized compressor/router
+projections and selects CUTLASS for indexer `q_b` from 128 tokens upward. The
+measured CUTLASS/cuBLAS latency ratios were `0.899x`, `0.810x`, `0.956x`, and
+`0.843x` at 128, 256, 1024, and 4096 tokens respectively. Output-A also has a
+CuTe-shaped strided-batched CUTLASS path for the model's eight
+`[tokens,4096] x [4096,1024]` GEMMs: it measured `0.899x` at 512 tokens and
+`0.947x` at 1024, but `1.255x` at 4096. Production therefore enables it only
+for 512-1024 token chunks and keeps the common 4096-token chunk on cuBLAS.
+
+The focused attention output-A parity test is bit-identical to cuBLAS. A full
+835-token prompt A/B at prefill chunk 512 also produced byte-identical
+129,280-logit JSON. At chunk 1024, per-layer profiling reduced cumulative
+output-A time from `496.149 ms` to `479.963 ms` (`3.3%`); whole-prefill impact
+is smaller because attention output-A is only one stage of every layer.
 
 Whole-model A/B used the same binary with `DS4_CUDA_F16_BACKEND=cublas` versus
 the default measured dispatch. On a 6,000,000-byte repeated-token fixture, 4K
@@ -337,6 +346,8 @@ prompt-dependent performance table.
 fallback runs. `DS4_CUDA_F16_BACKEND=cutlass` force-attempts CUTLASS on all
 supported FP16 batch shapes and is intended only for kernel research; the
 default auto policy is the measured production setting.
+`DS4_CUDA_ATTN_OUTPUT_A_BACKEND=cublas|cutlass` separately controls the
+strided-batched attention output-A path.
 
 ### Test methodology
 

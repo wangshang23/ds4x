@@ -23,6 +23,14 @@ static int compare_double(const void *a, const void *b) {
 }
 
 static void select_legacy_path(int legacy) {
+    if (getenv("DS4_SYNTH_AB_FUSED_INDEXER") != NULL) {
+        if (legacy) {
+            setenv("DS4_CUDA_NO_FUSED_INDEXER_TOPK", "1", 1);
+        } else {
+            unsetenv("DS4_CUDA_NO_FUSED_INDEXER_TOPK");
+        }
+        return;
+    }
     if (legacy) {
         setenv("DS4_CUDA_SPARK_INDEXER_REFERENCE", "1", 1);
     } else {

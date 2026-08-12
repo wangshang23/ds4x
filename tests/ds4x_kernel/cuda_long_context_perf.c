@@ -74,6 +74,72 @@ static double run_indexer_once(ds4_gpu_tensor *scores,
     return (monotonic_seconds() - t0) * 1000.0 / iters;
 }
 
+static double run_indexer_score_only(ds4_gpu_tensor *scores,
+                                     const ds4_gpu_tensor *q,
+                                     const ds4_gpu_tensor *weights,
+                                     const ds4_gpu_tensor *cache,
+                                     uint32_t n_comp, uint32_t iters) {
+    const uint32_t pos0 = n_comp * 4u - 1u;
+    const float scale = 1.0f / sqrtf(128.0f * 64.0f);
+    if (!ds4_gpu_indexer_scores_decode_batch_tensor(
+            scores, q, weights, cache, n_comp, 1u, pos0,
+            64u, 128u, 4u, scale) || !ds4_gpu_synchronize()) {
+        return -1.0;
+    }
+    const double t0 = monotonic_seconds();
+    for (uint32_t i = 0; i < iters; i++) {
+        if (!ds4_gpu_indexer_scores_decode_batch_tensor(
+                scores, q, weights, cache, n_comp, 1u, pos0,
+                64u, 128u, 4u, scale)) {
+            return -1.0;
+        }
+    }
+    if (!ds4_gpu_synchronize()) return -1.0;
+    return (monotonic_seconds() - t0) * 1000.0 / iters;
+}
+
+static double run_indexer_topk_only(ds4_gpu_tensor *selected,
+                                    const ds4_gpu_tensor *scores,
+                                    uint32_t n_comp, uint32_t iters) {
+    if (!ds4_gpu_indexer_topk_tensor(
+            selected, scores, n_comp, 1u, 512u) ||
+        !ds4_gpu_synchronize()) {
+        return -1.0;
+    }
+    const double t0 = monotonic_seconds();
+    for (uint32_t i = 0; i < iters; i++) {
+        if (!ds4_gpu_indexer_topk_tensor(
+                selected, scores, n_comp, 1u, 512u)) {
+            return -1.0;
+        }
+    }
+    if (!ds4_gpu_synchronize()) return -1.0;
+    return (monotonic_seconds() - t0) * 1000.0 / iters;
+}
+
+static double run_indexer_fused_once(ds4_gpu_tensor *selected,
+                                     const ds4_gpu_tensor *q,
+                                     const ds4_gpu_tensor *weights,
+                                     const ds4_gpu_tensor *cache,
+                                     uint32_t n_comp, uint32_t iters) {
+    const float scale = 1.0f / sqrtf(128.0f * 64.0f);
+    if (!ds4_gpu_indexer_score_topk_one_tensor(
+            selected, q, weights, cache, n_comp, 64u, 128u, 512u, scale) ||
+        !ds4_gpu_synchronize()) {
+        return -1.0;
+    }
+    const double t0 = monotonic_seconds();
+    for (uint32_t i = 0; i < iters; i++) {
+        if (!ds4_gpu_indexer_score_topk_one_tensor(
+                selected, q, weights, cache, n_comp,
+                64u, 128u, 512u, scale)) {
+            return -1.0;
+        }
+    }
+    if (!ds4_gpu_synchronize()) return -1.0;
+    return (monotonic_seconds() - t0) * 1000.0 / iters;
+}
+
 static int run_indexer(uint32_t n_comp, uint32_t iters) {
     const uint64_t q_count = 64u * 128u;
     const uint64_t cache_count = (uint64_t)n_comp * 128u;
@@ -84,8 +150,9 @@ static int run_indexer(uint32_t n_comp, uint32_t iters) {
     float *opt_host = (float *)malloc((uint64_t)n_comp * sizeof(float));
     uint32_t *ref_topk = (uint32_t *)malloc(512u * sizeof(uint32_t));
     uint32_t *opt_topk = (uint32_t *)malloc(512u * sizeof(uint32_t));
+    uint32_t *fused_topk = (uint32_t *)malloc(512u * sizeof(uint32_t));
     if (!q_host || !weights_host || !cache_host || !ref_host || !opt_host ||
-        !ref_topk || !opt_topk) {
+        !ref_topk || !opt_topk || !fused_topk) {
         return 1;
     }
     for (uint64_t i = 0; i < q_count; i++) q_host[i] = qat_value(i + 7u);
@@ -139,6 +206,27 @@ static int run_indexer(uint32_t n_comp, uint32_t iters) {
     fprintf(stderr,
             "indexer n_comp=%u direct=%.6f ms wmma=%.6f ms speedup=%.3fx topk_diff=%u\n",
             n_comp, ref_ms, opt_ms, ref_ms / opt_ms, topk_diff);
+    const double score_ms = run_indexer_score_only(
+        scores, q, weights, cache, n_comp, iters);
+    const double topk_ms = run_indexer_topk_only(
+        selected, scores, n_comp, iters);
+    const double fused_ms = run_indexer_fused_once(
+        selected, q, weights, cache, n_comp, iters);
+    if (fused_ms < 0.0 ||
+        !ds4_gpu_tensor_read(selected, 0, fused_topk,
+                             512u * sizeof(uint32_t))) {
+        goto cleanup;
+    }
+    uint32_t fused_diff = 0;
+    for (uint32_t i = 0; i < 512u; i++) {
+        if (ref_topk[i] != fused_topk[i]) fused_diff++;
+    }
+    fprintf(stderr,
+            "indexer components n_comp=%u score=%.6f ms topk=%.6f ms "
+            "sum=%.6f ms fused=%.6f ms speedup=%.3fx fused_diff=%u\n",
+            n_comp, score_ms, topk_ms, score_ms + topk_ms, fused_ms,
+            (score_ms + topk_ms) / fused_ms, fused_diff);
+    if (fused_diff != 0u) rc = 1;
     rc = compare_f32("indexer scores", ref_host, opt_host, n_comp,
                      2.0e-4f, 2.0e-4f);
 
@@ -153,6 +241,7 @@ cleanup:
     ds4_gpu_tensor_free(q);
     free(opt_topk);
     free(ref_topk);
+    free(fused_topk);
     free(opt_host);
     free(ref_host);
     free(cache_host);
@@ -243,6 +332,7 @@ static int run_hca(uint32_t n_comp, uint32_t iters) {
                      5.0e-4f, 5.0e-4f);
 
 cleanup:
+    unsetenv("DS4_CUDA_NO_SPLITKV_DECODE");
     ds4_gpu_tensor_free(comp);
     ds4_gpu_tensor_free(raw);
     ds4_gpu_tensor_free(q);
@@ -251,6 +341,93 @@ cleanup:
     free(ref_host);
     free(comp_host);
     free(raw_host);
+    free(q_host);
+    free(sinks);
+    return rc;
+}
+
+static double run_swa_once(ds4_gpu_tensor *heads,
+                           const float *sinks,
+                           const ds4_gpu_tensor *q,
+                           const ds4_gpu_tensor *raw,
+                           uint32_t format,
+                           uint32_t iters) {
+    if (!ds4_gpu_attention_decode_heads_tensor(
+            heads, sinks, 64u * sizeof(float), 0, q, raw,
+            128u, 128u, 0u, NULL, format, 0u, NULL, 0u, 64u, 512u) ||
+        !ds4_gpu_synchronize()) {
+        return -1.0;
+    }
+    const double t0 = monotonic_seconds();
+    for (uint32_t i = 0; i < iters; i++) {
+        if (!ds4_gpu_attention_decode_heads_tensor(
+                heads, sinks, 64u * sizeof(float), 0, q, raw,
+                128u, 128u, 0u, NULL, format, 0u, NULL, 0u, 64u, 512u)) {
+            return -1.0;
+        }
+    }
+    if (!ds4_gpu_synchronize()) return -1.0;
+    return (monotonic_seconds() - t0) * 1000.0 / iters;
+}
+
+static int run_swa(uint32_t iters) {
+    const uint64_t head_count = 64u * 512u;
+    const uint64_t kv_count = 128u * 512u;
+    float *sinks = (float *)malloc(64u * sizeof(float));
+    float *q_host = (float *)malloc(head_count * sizeof(float));
+    float *kv_host = (float *)malloc(kv_count * sizeof(float));
+    float *ref_host = (float *)malloc(head_count * sizeof(float));
+    float *packed_host = (float *)malloc(head_count * sizeof(float));
+    if (!sinks || !q_host || !kv_host || !ref_host || !packed_host) return 1;
+    for (uint32_t h = 0; h < 64u; h++) {
+        sinks[h] = -0.5f + (float)(h % 11u) * 0.125f;
+    }
+    for (uint64_t i = 0; i < head_count; i++) {
+        q_host[i] = sinf((float)(i % 997u) * 0.013f) * 0.125f;
+    }
+    for (uint64_t i = 0; i < kv_count; i++) {
+        kv_host[i] = cosf((float)(i % 991u) * 0.017f) * 0.125f;
+    }
+
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(head_count * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(head_count * sizeof(float));
+    ds4_gpu_tensor *raw_f32 = ds4_gpu_tensor_alloc(kv_count * sizeof(float));
+    ds4_gpu_tensor *raw_packed = ds4_gpu_tensor_alloc(
+        128u * DS4_SPARK_KV_ROW_BYTES);
+    int rc = 1;
+    if (!heads || !q || !raw_f32 || !raw_packed ||
+        !ds4_gpu_tensor_write(q, 0, q_host, head_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(raw_f32, 0, kv_host, kv_count * sizeof(float)) ||
+        !ds4_gpu_spark_pack_kv_rows_tensor(raw_packed, 0, raw_f32, 0, 128u) ||
+        !ds4_gpu_spark_unpack_kv_rows_tensor(raw_f32, raw_packed, 128u)) {
+        goto cleanup;
+    }
+
+    const double f32_ms = run_swa_once(
+        heads, sinks, q, raw_f32, DS4_GPU_CACHE_F32, iters);
+    if (f32_ms < 0.0 ||
+        !ds4_gpu_tensor_read(heads, 0, ref_host, head_count * sizeof(float))) {
+        goto cleanup;
+    }
+    const double packed_ms = run_swa_once(
+        heads, sinks, q, raw_packed, DS4_GPU_CACHE_SPARK_KV, iters);
+    if (packed_ms < 0.0 ||
+        !ds4_gpu_tensor_read(heads, 0, packed_host, head_count * sizeof(float))) {
+        goto cleanup;
+    }
+    fprintf(stderr, "swa f32=%.6f ms packed=%.6f ms packed/f32=%.3fx\n",
+            f32_ms, packed_ms, packed_ms / f32_ms);
+    rc = compare_f32("swa output", ref_host, packed_host, head_count,
+                     1.0e-5f, 1.0e-5f);
+
+cleanup:
+    ds4_gpu_tensor_free(raw_packed);
+    ds4_gpu_tensor_free(raw_f32);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(heads);
+    free(packed_host);
+    free(ref_host);
+    free(kv_host);
     free(q_host);
     free(sinks);
     return rc;
@@ -271,6 +448,9 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "hca") == 0 || strcmp(mode, "all") == 0) {
         const uint32_t hca_comp = strcmp(mode, "hca") == 0 ? n_comp : 8192u;
         if (run_hca(hca_comp, iters) != 0) rc = 1;
+    }
+    if (strcmp(mode, "swa") == 0 || strcmp(mode, "all") == 0) {
+        if (run_swa(iters) != 0) rc = 1;
     }
     ds4_gpu_cleanup();
     return rc;

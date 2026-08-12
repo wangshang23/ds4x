@@ -35,15 +35,16 @@ an isolated sample. See [Benchmark details](#benchmark-details).
 
 Long-context target-only decode uses an actually allocated packed KV/indexer
 cache at each frontier. These measurements seed deterministic cache contents
-instead of performing a 128K-1M prompt prefill, then report the median of 30
-decode steps after 3 warmups:
+instead of performing a 128K-1M prompt prefill. The final DS4X column reports
+50 alternating A/B samples after 3 warmups; the frozen upstream column retains
+its original 30-sample measurement:
 
 | Context | Upstream TPOT (ms) | DS4X TPOT (ms) | Upstream (tok/s) | DS4X (tok/s) | Decode speedup |
 |---:|---:|---:|---:|---:|---:|
-| 128K | 81.248 | 70.401 | 12.308 | 14.204 | 1.154x |
-| 256K | 92.640 | 74.004 | 10.794 | 13.513 | 1.252x |
-| 512K | 115.246 | 79.838 | 8.677 | 12.525 | 1.444x |
-| 1M | 363.286 | 94.251 | 2.753 | 10.610 | 3.854x |
+| 128K | 81.248 | 70.155 | 12.308 | 14.254 | 1.158x |
+| 256K | 92.640 | 72.757 | 10.794 | 13.744 | 1.273x |
+| 512K | 115.246 | 80.090 | 8.677 | 12.486 | 1.439x |
+| 1M | 363.286 | 92.190 | 2.753 | 10.847 | 3.940x |
 
 The 1M row allocates the full 3.43 GiB packed persistent cache. It validates
 decode at a million-token frontier; it is not a million-token prefill result.
@@ -76,6 +77,7 @@ license; DS4X does not vendor or modify its source.
 | Persistent attention history | Expanded F32 cache slots | Native 583-byte packed rows: E4M3 non-RoPE values, FP16 RoPE values, and UE8M0 scales |
 | CSA indexer history | 128 F32 values per compressed row | 68-byte MXFP4 rows with four UE8M0 block scales |
 | Batch-one CSA scoring | Scalar/direct path over expanded history | Direct packed-row SM121 block-scaled MMA scorer; no full-history re-encode per generated token |
+| CSA score/top-k handoff | Full F32 score array, then a separate exact top-512 pass | At 256K+ context, each scorer CTA retains an exact local top-512 and hierarchical key merges avoid materializing the full score array |
 | HCA long-context attention | Optimized path limited to 7,936 selected rows | Exact score-split attention without the old row ceiling, including the 1M frontier |
 | Q8 weight handling | Selective Q8-to-FP16 prefill cache | Same selective FP16/cuBLAS prefill path; no activation-Q8 exact-MMA path when the cache is available |
 | FP16 GEMM dispatch | cuBLAS for every Tensor Core-sized projection | Measured cuBLAS/CUTLASS dispatch; CuTe describes the logical layouts and CUTLASS only takes the production indexer shape where it wins |
@@ -96,6 +98,11 @@ long-context performance.
 - The B1 indexer reads the 68-byte persistent rows directly and executes the
   SM121 block-scaled MXFP4 MMA path; it does not re-encode the full history for
   every generated token.
+- At `n_comp >= 65536` (256K context), B1 scoring emits the exact sortable
+  `(score,index)` keys directly, retains 512 candidates per 2,048-row CTA and
+  hierarchically merges them to the model's exact top-512. The float score
+  ordering and lower-index tie break are unchanged, while the full F32 score
+  array and its second read are removed.
 - HCA uses exact score-split attention without the old 7,936-row fast-path
   ceiling, including at a 1M-token frontier.
 - Checkpoint weights remain Q8. Prefill lazily creates the same selective FP16
@@ -297,19 +304,20 @@ indexer, CUTLASS FP16, projection, operator-adapter and every MMQ parity case.
 The 8K packed-checkpoint round trip reported a 42.614 MiB payload,
 `max_abs=0`, `rmse=0`, `different=0/129280`, and identical argmax logits.
 
-The final synthetic frontier validation used three warmups and 30 timed steps
-per context. It exercises the release build's packed target-only decode path.
+The final synthetic frontier validation used three warmups and 50 timed steps
+per path, alternating the fused and fallback CSA dispatch in one process. It
+exercises the release build's packed target-only decode path.
 
 | Context | Median TPOT (ms) | Throughput (tok/s) |
 |---:|---:|---:|
-| 128K | 70.401 | 14.204 |
-| 256K | 74.004 | 13.513 |
-| 512K | 79.838 | 12.525 |
-| 1M | 94.251 | 10.610 |
+| 128K | 70.155 | 14.254 |
+| 256K | 72.757 | 13.744 |
+| 512K | 80.090 | 12.486 |
+| 1M | 92.190 | 10.847 |
 
-Relative to the pre-split packed-backend centers, TPOT changed by `+0.9%`,
-`+0.4%`, `-0.5%`, and `-0.3%` respectively. This is run-to-run variation,
-not a structural performance regression from independent compilation.
+The 128K row stays on the established score-then-top-k path. At 256K, 512K
+and 1M, exact CSA score/top-k fusion improves median TPOT by 1.57%, 1.05% and
+2.55% over the same-process fallback.
 
 ### CUTLASS/CuTe dispatch regression
 
@@ -349,6 +357,38 @@ default auto policy is the measured production setting.
 `DS4_CUDA_ATTN_OUTPUT_A_BACKEND=cublas|cutlass` separately controls the
 strided-batched attention output-A path.
 
+### CSA score/top-512 fusion
+
+The B1 CSA scorer now fuses packed MXFP4 scoring with exact top-512 selection
+for `n_comp >= 65536`. Every 2,048-row CTA produces 512 ordered 64-bit keys;
+four-way hierarchical merges retain the same float total order and
+lower-index tie break as the separate top-k implementation. Smaller contexts
+keep the legacy two-stage path because their end-to-end measurements did not
+show a repeatable gain.
+
+The final same-process A/B alternated legacy and fused dispatch over identical
+frontiers, with 3 warmups and 50 timed samples per path. Full vocabulary
+logits were bit-identical at every context (`max_abs=0`, `rmse=0`, identical
+argmax).
+
+| Context | Legacy TPOT (ms) | Fused TPOT (ms) | TPOT improvement |
+|---:|---:|---:|---:|
+| 128K | 70.101 | 70.155 | threshold not active |
+| 256K | 73.915 | 72.757 | 1.57% |
+| 512K | 80.938 | 80.090 | 1.05% |
+| 1M | 94.605 | 92.190 | 2.55% |
+
+Reproduce it with:
+
+```bash
+DS4_SYNTH_SKIP_WARM_WEIGHTS=1 \
+DS4_SYNTH_AB_FUSED_INDEXER=1 \
+./tests/integration/synth_frontier_bench MODEL ab-sweep 3 50
+```
+
+`DS4_CUDA_NO_FUSED_INDEXER_TOPK=1` forces the legacy score-then-top-k path.
+The fused implementation is not a relaxed or approximate selector.
+
 ### Test methodology
 
 The measured system was:
@@ -371,14 +411,15 @@ path. `synth_frontier_bench` does not invoke prefill, so it does not populate
 the selective Q8-to-FP16 prefill cache. It allocates the requested context and
 materializes a deterministic zero-cache frontier before measuring one exact
 decode step.
-The table reports the median of 30 samples after 3 warmups. The optional
-startup pass that touches all mapped model pages was disabled; this does not
-remove the per-context decode warmups or the resident aligned CUDA artifacts.
+The final DS4X table reports the median of 50 alternating samples after 3
+warmups. The optional startup pass that touches all mapped model pages was
+disabled; this does not remove the per-context decode warmups or the resident
+aligned CUDA artifacts.
 
 This isolates steady-state decode cost versus cache length. It is not a prefill
 benchmark and the synthetic zero history is not a language-quality workload.
 
-The release-validation run is the fresh-build, three-warmup, 30-sample table
+The release-validation run is the fresh-build, three-warmup, 50-sample table
 in [Phase 2 release regression](#phase-2-release-regression). At 1M the runtime
 planned 84.25 GiB: 80.76 GiB resident model, 3.43 GiB packed KV/indexer, and
 0.06 GiB runtime buffers. System-wide unified-memory usage also includes the
@@ -441,10 +482,10 @@ byte-identical to `84cc882`.
 
 | Context | Upstream TPOT (ms) | DS4X TPOT (ms) | Upstream (tok/s) | DS4X (tok/s) | Decode speedup |
 |---:|---:|---:|---:|---:|---:|
-| 128K | 81.248 | 70.401 | 12.308 | 14.204 | 1.154x |
-| 256K | 92.640 | 74.004 | 10.794 | 13.513 | 1.252x |
-| 512K | 115.246 | 79.838 | 8.677 | 12.525 | 1.444x |
-| 1M | 363.286 | 94.251 | 2.753 | 10.610 | 3.854x |
+| 128K | 81.248 | 70.155 | 12.308 | 14.254 | 1.158x |
+| 256K | 92.640 | 72.757 | 10.794 | 13.744 | 1.273x |
+| 512K | 115.246 | 80.090 | 8.677 | 12.486 | 1.439x |
+| 1M | 363.286 | 92.190 | 2.753 | 10.847 | 3.940x |
 
 At 1M, upstream allocates 13.46 GiB of F32 KV through managed memory and shows
 substantial paging variance (236.7-540.4 ms across the timed steps); DS4X uses

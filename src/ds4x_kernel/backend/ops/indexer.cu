@@ -730,6 +730,247 @@ __device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) 
     return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
 }
 
+#ifdef DS4_CUDA_HAVE_MXF4
+template <uint32_t ITEMS_PER_THREAD>
+using IndexerKeySort = cub::BlockRadixSort<uint64_t, 512, ITEMS_PER_THREAD>;
+
+__global__ static void __launch_bounds__(512)
+indexer_score_topk_mxf4_b1_kernel(
+        uint64_t *candidate_keys,
+        const unsigned char * __restrict__ q_codes,
+        const uint32_t * __restrict__ q_scales,
+        const float * __restrict__ weights,
+        uint32_t n_comp,
+        float scale,
+        const unsigned char * __restrict__ k_codes,
+        uint32_t k_row_bytes,
+        uint32_t k_scale_offset) {
+    constexpr uint32_t HEAD_GROUP = 16u;
+    constexpr uint32_t SCORE_TILES = 8u;
+    constexpr uint32_t SCORES_PER_BLOCK = SCORE_TILES * 256u;
+    constexpr uint32_t ITEMS_PER_THREAD = 4u;
+    constexpr uint32_t Q_WORDS = 2u * 16u * 8u * 32u;
+    constexpr uint32_t SCALE_WORDS = 2u * 16u * 16u;
+    constexpr uint32_t WEIGHT_WORDS = 2u * 16u * 16u;
+    constexpr uint32_t KEY_OFFSET =
+        (Q_WORDS + SCALE_WORDS + WEIGHT_WORDS) * sizeof(uint32_t);
+
+    extern __shared__ __align__(16) unsigned char shared[];
+    uint32_t *q_shared = reinterpret_cast<uint32_t *>(shared);
+    uint32_t *scale_shared = q_shared + Q_WORDS;
+    float *weight_shared = reinterpret_cast<float *>(scale_shared + SCALE_WORDS);
+    uint64_t *keys_shared = reinterpret_cast<uint64_t *>(
+        shared + KEY_OFFSET);
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t lane_in_group = lane & 3u;
+    const uint32_t chunk_start = blockIdx.x * SCORES_PER_BLOCK;
+
+    auto q_ptr = [&](uint32_t buffer, uint32_t hh,
+                     uint32_t pair, uint32_t word) -> uint32_t * {
+        return q_shared + (((buffer * 16u + hh) * 8u + pair) * 32u + word);
+    };
+    auto scale_ptr = [&](uint32_t buffer, uint32_t hh,
+                         uint32_t row) -> uint32_t * {
+        return scale_shared + (buffer * 16u + hh) * 16u + row;
+    };
+    auto weight_ptr = [&](uint32_t buffer, uint32_t hh,
+                          uint32_t row) -> float * {
+        return weight_shared + (buffer * 16u + hh) * 16u + row;
+    };
+    auto stage = [&](uint32_t head0, uint32_t buffer) {
+        for (uint32_t i = tid; i < HEAD_GROUP * 16u * 17u; i += 512u) {
+            const uint32_t hh = i / (16u * 17u);
+            const uint32_t rem = i - hh * (16u * 17u);
+            const uint32_t row = rem / 17u;
+            const uint32_t word = rem - row * 17u;
+            const bool valid = row == 0u;
+            const uint64_t qrow = head0 + hh;
+            const void *src;
+            uint32_t *dst;
+            if (word < 16u) {
+                src = valid
+                    ? (const void *)(q_codes + qrow * 64u + word * 4u)
+                    : (const void *)q_codes;
+                dst = q_ptr(buffer, hh, row >> 1u,
+                    (row & 1u) * 16u + (word & 3u) * 4u + (word >> 2u));
+            } else {
+                src = valid ? (const void *)(q_scales + qrow)
+                            : (const void *)q_scales;
+                dst = scale_ptr(buffer, hh, row);
+            }
+            indexer_cp_async_u32(dst, src, valid);
+        }
+        for (uint32_t i = tid; i < HEAD_GROUP * 16u; i += 512u) {
+            const uint32_t hh = i >> 4u;
+            const uint32_t row = i & 15u;
+            const bool valid = row == 0u;
+            const void *src = valid
+                ? (const void *)(weights + head0 + hh)
+                : (const void *)weights;
+            indexer_cp_async_u32(
+                reinterpret_cast<uint32_t *>(weight_ptr(buffer, hh, row)),
+                src, valid);
+        }
+    };
+
+    for (uint32_t score_tile = 0; score_tile < SCORE_TILES; score_tile++) {
+        const uint32_t tile_c = chunk_start + score_tile * 256u;
+        uint32_t b_frag[2][4];
+        uint32_t scale_b[2][2];
+#pragma unroll
+        for (uint32_t cg = 0; cg < 2u; cg++) {
+            const uint32_t col =
+                tile_c + (cg * 16u + warp) * 8u + (lane >> 2u);
+            if (col < n_comp) {
+                const uint32_t *words = reinterpret_cast<const uint32_t *>(
+                    k_codes + (uint64_t)col * k_row_bytes);
+                b_frag[cg][0] = words[lane_in_group];
+                b_frag[cg][1] = words[4u + lane_in_group];
+                b_frag[cg][2] = words[8u + lane_in_group];
+                b_frag[cg][3] = words[12u + lane_in_group];
+                const uint32_t packed_scale = *reinterpret_cast<const uint32_t *>(
+                    k_codes + (uint64_t)col * k_row_bytes + k_scale_offset);
+                scale_b[cg][0] = packed_scale & 0xffffu;
+                scale_b[cg][1] = packed_scale >> 16u;
+            } else {
+                b_frag[cg][0] = b_frag[cg][1] = 0u;
+                b_frag[cg][2] = b_frag[cg][3] = 0u;
+                scale_b[cg][0] = scale_b[cg][1] = 127u | (127u << 8u);
+            }
+        }
+
+        stage(0u, 0u);
+        indexer_cp_commit();
+        indexer_cp_wait();
+        __syncthreads();
+
+        float accum[2][4] = {};
+        const uint32_t row0 = lane >> 2u;
+        const uint32_t scale_row = (lane & 1u) * 8u + row0;
+        for (uint32_t group = 0; group < 4u; group++) {
+            const uint32_t current = group & 1u;
+            if (group + 1u < 4u) {
+                stage((group + 1u) * HEAD_GROUP, current ^ 1u);
+                indexer_cp_commit();
+            }
+#pragma unroll
+            for (uint32_t hh = 0; hh < HEAD_GROUP; hh++) {
+                const uint4 a0 = *reinterpret_cast<const uint4 *>(
+                    q_ptr(current, hh, row0 >> 1u,
+                          (row0 & 1u) * 16u + lane_in_group * 4u));
+                const uint4 a1 = *reinterpret_cast<const uint4 *>(
+                    q_ptr(current, hh, (row0 + 8u) >> 1u,
+                          (row0 & 1u) * 16u + lane_in_group * 4u));
+                const uint32_t packed_scale =
+                    *scale_ptr(current, hh, scale_row);
+                const uint32_t scale_a0 = packed_scale & 0xffffu;
+                const uint32_t scale_a1 = packed_scale >> 16u;
+                const float w0 = *weight_ptr(current, hh, row0);
+                const float w1 = *weight_ptr(current, hh, row0 + 8u);
+                const uint32_t a_lo[4] = {a0.x, a1.x, a0.y, a1.y};
+                const uint32_t a_hi[4] = {a0.z, a1.z, a0.w, a1.w};
+#pragma unroll
+                for (uint32_t cg = 0; cg < 2u; cg++) {
+                    float product[4] = {};
+                    indexer_mxf4_mma(product, a_lo,
+                                     b_frag[cg][0], b_frag[cg][1],
+                                     scale_a0, scale_b[cg][0]);
+                    indexer_mxf4_mma(product, a_hi,
+                                     b_frag[cg][2], b_frag[cg][3],
+                                     scale_a1, scale_b[cg][1]);
+                    accum[cg][0] += fmaxf(product[0], 0.0f) * w0;
+                    accum[cg][1] += fmaxf(product[1], 0.0f) * w0;
+                    accum[cg][2] += fmaxf(product[2], 0.0f) * w1;
+                    accum[cg][3] += fmaxf(product[3], 0.0f) * w1;
+                }
+            }
+            if (group + 1u < 4u) {
+                indexer_cp_wait();
+                __syncthreads();
+            }
+        }
+
+        if (row0 == 0u) {
+#pragma unroll
+            for (uint32_t cg = 0; cg < 2u; cg++) {
+                const uint32_t col0 = tile_c +
+                    (cg * 16u + warp) * 8u + lane_in_group * 2u;
+#pragma unroll
+                for (uint32_t j = 0; j < 2u; j++) {
+                    const uint32_t col = col0 + j;
+                    const uint32_t local = score_tile * 256u +
+                        (cg * 16u + warp) * 8u + lane_in_group * 2u + j;
+                    keys_shared[local] = col < n_comp
+                        ? topk_pack_key(accum[cg][j] * scale, col)
+                        : topk_pack_key(-INFINITY, UINT32_MAX);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    uint64_t keys[ITEMS_PER_THREAD];
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        keys[item] = keys_shared[tid * ITEMS_PER_THREAD + item];
+    }
+    __syncthreads();
+    using BlockSort = IndexerKeySort<ITEMS_PER_THREAD>;
+    typename BlockSort::TempStorage &sort_storage =
+        *reinterpret_cast<typename BlockSort::TempStorage *>(shared);
+    BlockSort(sort_storage).SortDescending(keys);
+    if (tid < 128u) {
+#pragma unroll
+        for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+            candidate_keys[(uint64_t)blockIdx.x * 512u +
+                           tid * ITEMS_PER_THREAD + item] = keys[item];
+        }
+    }
+}
+
+__global__ static void __launch_bounds__(512)
+indexer_topk_key_merge4_kernel(
+        uint64_t *output,
+        const uint64_t *input,
+        uint32_t n_sets) {
+    constexpr uint32_t ITEMS_PER_THREAD = 4u;
+    using BlockSort = IndexerKeySort<ITEMS_PER_THREAD>;
+    extern __shared__ __align__(16) unsigned char shared[];
+    typename BlockSort::TempStorage &sort_storage =
+        *reinterpret_cast<typename BlockSort::TempStorage *>(shared);
+    const uint32_t group = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t set0 = group * 4u;
+    uint64_t keys[ITEMS_PER_THREAD];
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t index = tid * ITEMS_PER_THREAD + item;
+        const uint32_t set = set0 + index / 512u;
+        const uint32_t offset = index & 511u;
+        keys[item] = set < n_sets
+            ? input[(uint64_t)set * 512u + offset]
+            : topk_pack_key(-INFINITY, UINT32_MAX);
+    }
+    BlockSort(sort_storage).SortDescending(keys);
+    if (tid < 128u) {
+#pragma unroll
+        for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+            output[(uint64_t)group * 512u + tid * ITEMS_PER_THREAD + item] =
+                keys[item];
+        }
+    }
+}
+
+__global__ static void indexer_topk_key_extract_kernel(
+        uint32_t *selected, const uint64_t *keys) {
+    const uint32_t i = threadIdx.x;
+    if (i < 512u) selected[i] = 0xffffffffu - (uint32_t)keys[i];
+}
+#endif
+
 __global__ static void indexer_topk_8192_cub_kernel(
         uint32_t *selected,
         const float *scores,
@@ -1086,6 +1327,97 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
                                  n_head, head_dim, 1, scale, 0);
+}
+
+extern "C" int ds4_gpu_indexer_score_topk_one_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                top_k,
+        float                   scale) {
+#ifndef DS4_CUDA_HAVE_MXF4
+    (void)selected; (void)q; (void)weights; (void)index_comp;
+    (void)n_comp; (void)n_head; (void)head_dim; (void)top_k; (void)scale;
+    return 0;
+#else
+    if (!selected || !q || !weights || !index_comp || top_k != 512u ||
+        n_comp < top_k || n_head != 64u || head_dim != 128u ||
+        selected->bytes < 512u * sizeof(uint32_t) ||
+        q->bytes < 64u * 128u * sizeof(float) ||
+        weights->bytes < 64u * sizeof(float) ||
+        index_comp->bytes < (uint64_t)n_comp * DS4_SPARK_INDEX_ROW_BYTES) {
+        return 0;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(0, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        return 0;
+    }
+    const uint32_t n_chunks = (n_comp + 2047u) / 2048u;
+    const uint64_t q_codes_bytes = (64u * 64u + 255u) & ~255ull;
+    const uint64_t q_scales_bytes = (64u * 4u + 255u) & ~255ull;
+    const uint64_t candidate_bytes = (uint64_t)n_chunks * 512u * sizeof(uint64_t);
+    unsigned char *scratch = (unsigned char *)indexer_mxf4_scratch_alloc(
+        q_codes_bytes + q_scales_bytes + 2u * candidate_bytes);
+    if (!scratch) return 0;
+    unsigned char *q_codes = scratch;
+    uint32_t *q_scales = reinterpret_cast<uint32_t *>(scratch + q_codes_bytes);
+    uint64_t *keys0 = reinterpret_cast<uint64_t *>(
+        scratch + q_codes_bytes + q_scales_bytes);
+    uint64_t *keys1 = reinterpret_cast<uint64_t *>(
+        reinterpret_cast<unsigned char *>(keys0) + candidate_bytes);
+
+    indexer_mxf4_encode_rows_kernel<<<8u, 256>>>(
+        (const float *)q->ptr, q_codes, q_scales, 64u);
+    if (!cuda_ok(cudaGetLastError(), "fused indexer Q encode launch")) return 0;
+
+    using ScoreSort = IndexerKeySort<4u>;
+    const size_t score_layout_bytes = 53248u;
+    const size_t score_smem = std::max(
+        score_layout_bytes, sizeof(typename ScoreSort::TempStorage));
+    if (!cuda_ok(cudaFuncSetAttribute(
+            indexer_score_topk_mxf4_b1_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)score_smem), "set fused indexer score-topk smem")) {
+        return 0;
+    }
+    indexer_score_topk_mxf4_b1_kernel<<<n_chunks, 512, score_smem>>>(
+        keys0, q_codes, q_scales, (const float *)weights->ptr,
+        n_comp, scale, (const unsigned char *)index_comp->ptr,
+        DS4_SPARK_INDEX_ROW_BYTES, 64u);
+    if (!cuda_ok(cudaGetLastError(), "fused indexer score-topk launch")) return 0;
+
+    using MergeSort = IndexerKeySort<4u>;
+    const size_t merge_smem = sizeof(typename MergeSort::TempStorage);
+    if (!cuda_ok(cudaFuncSetAttribute(
+            indexer_topk_key_merge4_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)merge_smem), "set fused indexer merge smem")) {
+        return 0;
+    }
+    uint32_t n_sets = n_chunks;
+    uint64_t *input = keys0;
+    uint64_t *output = keys1;
+    while (n_sets > 1u) {
+        const uint32_t next_sets = (n_sets + 3u) / 4u;
+        indexer_topk_key_merge4_kernel<<<next_sets, 512, merge_smem>>>(
+            output, input, n_sets);
+        if (!cuda_ok(cudaGetLastError(), "fused indexer key merge launch")) {
+            return 0;
+        }
+        uint64_t *tmp = input;
+        input = output;
+        output = tmp;
+        n_sets = next_sets;
+    }
+    indexer_topk_key_extract_kernel<<<1u, 512>>>(
+        (uint32_t *)selected->ptr, input);
+    return cuda_ok(cudaGetLastError(), "fused indexer key extract launch");
+#endif
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(

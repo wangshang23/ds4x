@@ -647,7 +647,9 @@ static int check_large_packed_indexer_zero(void) {
     float *weights_host = malloc((size_t)n_head * sizeof(*weights_host));
     float *scores_host = malloc((size_t)n_comp * sizeof(*scores_host));
     uint32_t *topk_host = malloc((size_t)top_k * sizeof(*topk_host));
-    if (!q_host || !weights_host || !scores_host || !topk_host) return 1;
+    uint32_t *fused_topk_host = malloc((size_t)top_k * sizeof(*fused_topk_host));
+    if (!q_host || !weights_host || !scores_host || !topk_host ||
+        !fused_topk_host) return 1;
     for (uint64_t i = 0; i < q_count; i++) q_host[i] = qat_value(i + 41u);
     for (uint32_t h = 0; h < n_head; h++) weights_host[h] = 1.0f;
     ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
@@ -673,6 +675,14 @@ static int check_large_packed_indexer_zero(void) {
                              (uint64_t)top_k * sizeof(uint32_t))) {
         goto cleanup;
     }
+    if (!ds4_gpu_indexer_score_topk_one_tensor(
+            selected, q, weights, cache, n_comp, n_head, head_dim,
+            top_k, 1.0f / sqrtf(8192.0f)) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(selected, 0, fused_topk_host,
+                             (uint64_t)top_k * sizeof(uint32_t))) {
+        goto cleanup;
+    }
     float max_abs = 0.0f;
     for (uint32_t i = 0; i < n_comp; i++) {
         const float v = fabsf(scores_host[i]);
@@ -681,6 +691,7 @@ static int check_large_packed_indexer_zero(void) {
     uint32_t topk_diff = 0u;
     for (uint32_t i = 0; i < top_k; i++) {
         if (topk_host[i] != i) topk_diff++;
+        if (fused_topk_host[i] != topk_host[i]) topk_diff++;
     }
     fprintf(stderr,
             "cuda-regression: large packed indexer max_abs=%g topk_diff=%u\n",
@@ -693,6 +704,7 @@ cleanup:
     ds4_gpu_tensor_free(weights);
     ds4_gpu_tensor_free(q);
     free(topk_host);
+    free(fused_topk_host);
     free(scores_host);
     free(weights_host);
     free(q_host);

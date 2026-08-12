@@ -7,6 +7,8 @@
 
 #include "ds4_gpu.h"
 
+#include <cstdlib>
+
 namespace {
 
 bool context_supported(const ds4x_runtime_context *context) {
@@ -82,9 +84,17 @@ extern "C" int ds4x_indexer_launch(
     int ok = 0;
     if (args->mode == DS4X_INDEXER_DECODE_ONE) {
         if (args->n_tokens != 1) return 0;
+        if (getenv("DS4_CUDA_NO_FUSED_INDEXER_TOPK") == NULL &&
+            args->n_comp >= 65536u && args->top_k == 512u) {
+            ok = ds4_gpu_indexer_score_topk_one_tensor(
+                args->selected, args->query, args->weights, args->cache,
+                args->n_comp, args->n_head, args->head_dim, args->top_k,
+                args->scale);
+            if (ok) return 1;
+        }
         ok = ds4_gpu_indexer_score_one_tensor(
-                args->scores, args->query, args->weights, args->cache,
-                args->n_comp, args->n_head, args->head_dim, args->scale);
+            args->scores, args->query, args->weights, args->cache,
+            args->n_comp, args->n_head, args->head_dim, args->scale);
     } else if (args->mode == DS4X_INDEXER_PREFILL) {
         ok = ds4_gpu_indexer_scores_prefill_tensor(
                 args->scores, args->query, args->weights, args->cache,

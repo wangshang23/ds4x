@@ -37,6 +37,17 @@ int ds4_gpu_indexer_score_one_tensor(
         uint32_t                head_dim,
         float                   scale);
 
+int ds4_gpu_indexer_score_topk_one_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                top_k,
+        float                   scale);
+
 int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,

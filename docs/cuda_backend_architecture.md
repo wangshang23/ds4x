@@ -95,6 +95,35 @@ non-block-scaled mainloop to F8/F6/F4 inputs. DS4X therefore uses:
 - cluster shape `1x1x1`, because GB10 does not expose the data-center
   multicast assumptions used by SM100 kernels.
 
+## CSA exact top-k fusion
+
+Batch-one CSA keeps the SM121 block-scaled MXFP4 MMA scorer and changes only
+the score handoff at long context. A CTA scores 2,048 packed indexer rows,
+converts each result to a 64-bit sortable key and retains its exact local
+top-512. The key encodes the float total-order value in the high 32 bits and
+`0xffffffff-index` in the low bits, preserving the existing lower-index tie
+break. Four-way hierarchical merges then produce the global 512 indices.
+
+The fused dispatch starts at `n_comp=65536`, corresponding to a 256K CSA
+frontier. The threshold is empirical: 128K had no repeatable end-to-end gain,
+while 50-sample alternating A/B runs improved median TPOT by 1.57%, 1.05% and
+2.55% at 256K, 512K and 1M. All four full-logit comparisons were bit-identical.
+`DS4_CUDA_NO_FUSED_INDEXER_TOPK=1` remains the deterministic fallback.
+
+The CUTLASS/CuTe MXFP4 atom was also evaluated against the current native
+SM120 block-scaled MMA sequence. Both compiled to 69 registers and 37,888
+bytes of shared memory, with only 0.1%-0.3% microbenchmark variation, so the
+native scorer remains selected. A CUTLASS Example 41 SWA experiment was also
+rejected: batch-one changed F32-Q/output numerics, and the 128-token prefill
+shape was about 30% slower than DS4X's token-tile HMMA kernel.
+
+HCA online split-KV prototypes were not promoted. The pre-existing F32
+prototype was roughly 4x slower across 1,024-8,192 compressed rows. A packed
+16-head split prototype reached 1.32x isolated HCA speedup at 8,192 rows, but
+its changed floating-point reduction order produced non-identical 1M model
+logits and a different argmax. The exact-order packed variant was 3x slower.
+The production HCA path therefore remains unchanged.
+
 ## Change gate
 
 Every dispatch or kernel change must pass all of the following on DGX Spark:

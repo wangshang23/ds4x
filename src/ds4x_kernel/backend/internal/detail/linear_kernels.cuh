@@ -408,68 +408,6 @@ __global__ static void rope_tail_kernel(
 
 
 
-__global__ static void rope_tail_decode_rows_kernel(
-        float *x,
-        cuda_attention_decode_row_table rows,
-        uint32_t n_rows,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t n_rot,
-        uint32_t n_ctx_orig,
-        int inverse,
-        float freq_base,
-        float freq_scale,
-        float ext_factor,
-        float attn_factor,
-        float beta_fast,
-        float beta_slow) {
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t pairs = n_rows * n_head * (n_rot / 2u);
-    if (gid >= pairs) return;
-    const uint32_t pair = gid % (n_rot / 2u);
-    const uint32_t tmp = gid / (n_rot / 2u);
-    const uint32_t h = tmp % n_head;
-    const uint32_t row = tmp / n_head;
-    const uint32_t n_nope = head_dim - n_rot;
-    const uint32_t i = pair * 2u;
-
-    float corr0 = 0.0f, corr1 = 0.0f;
-    if (ext_factor != 0.0f) {
-        const float denom = 2.0f * logf(freq_base);
-        corr0 = floorf((float)n_rot *
-                       logf((float)n_ctx_orig /
-                            (beta_fast * 2.0f * (float)M_PI)) / denom);
-        corr1 = ceilf((float)n_rot *
-                      logf((float)n_ctx_orig /
-                           (beta_slow * 2.0f * (float)M_PI)) / denom);
-        corr0 = fmaxf(0.0f, corr0);
-        corr1 = fminf((float)(n_rot - 1u), corr1);
-    }
-
-    const float theta_extrap = (float)rows.row[row].pos *
-        powf(freq_base, -((float)i) / (float)n_rot);
-    const float theta_interp = freq_scale * theta_extrap;
-    float theta = theta_interp;
-    float mscale = attn_factor;
-    if (ext_factor != 0.0f) {
-        const float ramp_mix =
-            rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
-        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
-        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-    }
-    const float c = cosf(theta) * mscale;
-    float s = sinf(theta) * mscale;
-    if (inverse) s = -s;
-
-    float *tail = x + ((uint64_t)row * n_head + h) * head_dim + n_nope;
-    const float x0 = tail[i];
-    const float x1 = tail[i + 1u];
-    tail[i] = x0 * c - x1 * s;
-    tail[i + 1u] = x0 * s + x1 * c;
-}
-
-
-
 __device__ static float dsv4_e4m3fn_value_dev(int i) {
     int exp = (i >> 3) & 15;
     int mant = i & 7;

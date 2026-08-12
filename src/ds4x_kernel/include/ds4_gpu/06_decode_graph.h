@@ -1,5 +1,4 @@
-/* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
- * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
+/* Decode-island CUDA graph capture. Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured
  * island: layer, island index, and the activation buffers whose addresses
  * the captured kernels bake in.  ds4_cuda.cu mirrors this struct
@@ -25,4 +24,3 @@ int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
-

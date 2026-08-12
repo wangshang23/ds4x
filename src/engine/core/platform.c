@@ -5,285 +5,12 @@
  * ds4.c - DeepSeek V4 inference engine.
  * =========================================================================
  *
- * This file is deliberately vertical: it owns GGUF loading, the fixed
- * DeepSeek V4 tensor layouts, CPU reference kernels, the whole-model Metal
- * graph driver, and tokenizer wiring.  Model shape selection is intentionally
- * narrow: validation accepts the known Flash and Pro layouts and fails early
- * for anything else.
+ * This file owns the fixed DeepSeek V4 tensor layouts and shared engine
+ * helpers. Model validation accepts only the DeepSeek V4 Flash layout.
  *
- * Loading is mmap based.  The loader parses only the GGUF header, metadata
- * table, and tensor directory.  Tensor data stays in the kernel page cache
- * until inference touches it, or until Metal wraps slices of the mapping as
- * no-copy MTLBuffers.
+ * Loading is mmap based. The loader parses only the GGUF header, metadata
+ * table, and tensor directory; CUDA resolves tensor ranges from that mapping.
  */
-
-#if defined(__APPLE__)
-#endif
-
-
-#ifndef DS4_NO_GPU
-#endif
-
-/* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
- * stubs for the multi-GPU plumbing multi-GPU functions and globals declared in
- * ds4_gpu_mgpu.h. These keep the linker happy on Mac/Metal and on CPU
- * builds. None of these are reached at runtime in non-CUDA builds
- * because multi_tier == 1 requires graph_backend == true which on
- * non-CUDA paths means Metal, and the multi-tier branch only fires
- * when the caller supplied a non-NULL gpu_cfg — which only the new
- * ds4_engine_create_with_gpu_config can do, and no Metal caller does.
- *
- * We key off __APPLE__ + DS4_NO_GPU rather than the inverse of CUDA
- * because there's no positive "is CUDA build" macro and ds4_cuda.cu
- * is only compiled in the non-Apple, non-DS4_NO_GPU configuration. */
-/* Apple (Metal) build: ds4_cuda.cu is not linked, but the engine compiles
- * code referencing some multi-GPU CLI symbols inside dead multi-tier branches.
- * Provide stubs so the linker is happy. CPU-only (DS4_NO_GPU) builds
- * never reach the multi-tier branches and never include ds4_gpu.h, so
- * we cannot reference ds4_tensor_range there — those stubs are guarded
- * by !DS4_NO_GPU below. */
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-/* Decode-island graph capture is CUDA-only; Metal decodes eagerly. */
-int ds4_gpu_decode_graphs_supported(void) { return 0; }
-int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
-int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
-void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
-void ds4_gpu_decode_graphs_invalidate(void) {}
-int ds4_gpu_set_current_device(int logical_tier) { (void)logical_tier; return -1; }
-int ds4_gpu_set_current_device_fenced(int logical_tier) { (void)logical_tier; return -1; }
-void ds4_gpu_enable_q8_dequant_gemm(void) {}
-int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) { (void)dst; (void)src; (void)bytes; return 0; }
-int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
-                                     const ds4_gpu_tensor *src,
-                                     uint64_t bytes) {
-    return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
-}
-int ds4_gpu_tensor_copy_xdev3_default_dst(
-        ds4_gpu_tensor *dst0, const ds4_gpu_tensor *src0, uint64_t bytes0,
-        ds4_gpu_tensor *dst1, const ds4_gpu_tensor *src1, uint64_t bytes1,
-        ds4_gpu_tensor *dst2, const ds4_gpu_tensor *src2, uint64_t bytes2) {
-    return (bytes0 == 0 || ds4_gpu_tensor_copy(dst0, 0, src0, 0, bytes0)) &&
-           (bytes1 == 0 || ds4_gpu_tensor_copy(dst1, 0, src1, 0, bytes1)) &&
-           (bytes2 == 0 || ds4_gpu_tensor_copy(dst2, 0, src2, 0, bytes2));
-}
-int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
-    (void)model_map; (void)model_size; return 0;
-}
-int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) {
-    (void)map; (void)size; (void)bias; return 1;
-}
-int ds4_gpu_device_cache_support_tensors(int device_id,
-                                          int exec_device_id,
-                                          const ds4_tensor_range *ranges,
-                                          int n_ranges,
-                                          int main_model) {
-    (void)device_id; (void)exec_device_id; (void)ranges;
-    (void)n_ranges; (void)main_model; return 0;
-}
-uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
-    (void)logical_tier; return 0;
-}
-int ds4_gpu_device_cache_tensors(int device_id,
-                                  const ds4_tensor_range *ranges,
-                                  int n_ranges) {
-    (void)device_id; (void)ranges; (void)n_ranges; return 1;
-}
-int ds4_gpu_init_multi(const ds4_gpu_config *cfg) { (void)cfg; return -1; }
-int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id, uint64_t bytes) {
-    (void)t; (void)device_id; (void)bytes; return -1;
-}
-ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes) {
-    /* Metal / CPU build has no CUDA multi-tier — short-circuit tier 0 to
-     * the legacy single-device allocator so the per-tier graph
-     * allocation path (e.g. g->output_pre_by_tier[head_tier]) keeps
-     * working byte-equivalent to pre-multi-tier Metal. Without this,
-     * every multi-tier-aware allocation in metal_graph_alloc_raw_cap
-     * returns NULL, the validation chain fails, and session_create
-     * silently returns 1. */
-    if (tier == 0) return ds4_gpu_tensor_alloc(bytes);
-    return NULL;
-}
-ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes) {
-    if (tier == 0) return ds4_gpu_tensor_alloc_managed(bytes);
-    return NULL;
-}
-void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) { (void)t; }
-int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
-                              const ds4_gpu_tensor *src,
-                              uint64_t bytes) {
-    (void)dst; (void)src; (void)bytes; return -1;
-}
-int ds4_gpu_tensor_copy_xdev3(ds4_gpu_tensor       *dst0,
-                              const ds4_gpu_tensor *src0,
-                              uint64_t              bytes0,
-                              ds4_gpu_tensor       *dst1,
-                              const ds4_gpu_tensor *src1,
-                              uint64_t              bytes1,
-                              ds4_gpu_tensor       *dst2,
-                              const ds4_gpu_tensor *src2,
-                              uint64_t              bytes2) {
-    (void)dst0; (void)src0; (void)bytes0;
-    (void)dst1; (void)src1; (void)bytes1;
-    (void)dst2; (void)src2; (void)bytes2;
-    return -1;
-}
-int ds4_gpu_tensor_copy_xdev_ordered(ds4_gpu_tensor *dst,
-                                      const ds4_gpu_tensor *src,
-                                      uint64_t bytes) {
-    (void)dst; (void)src; (void)bytes; return -1;
-}
-int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier) {
-    (void)src; (void)dst_tier; return -1;
-}
-int ds4_gpu_moe_handoff_pack_tensor(
-        ds4_gpu_tensor       *packed,
-        const ds4_gpu_tensor *ffn_norm,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t              n_embd,
-        uint32_t              n_expert) {
-    (void)packed; (void)ffn_norm; (void)selected; (void)weights;
-    (void)n_embd; (void)n_expert; return -1;
-}
-int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
-        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
-        const void *model_map, uint64_t model_size,
-        uint64_t weight0_offset, uint64_t weight1_offset,
-        uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
-        const ds4_gpu_tensor *x, uint32_t n_rows) {
-    return ds4_gpu_matmul_q8_0_pair_tensor(
-            out0, out1, model_map, model_size,
-            weight0_offset, weight1_offset,
-            in_dim, out0_dim, out1_dim, x, n_rows);
-}
-int ds4_gpu_matmul_f16_router_rows_exact_tensor(
-        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, const ds4_gpu_tensor *x, uint32_t n_rows) {
-    return ds4_gpu_matmul_f16_tensor(
-            out, model_map, model_size, weight_offset,
-            4096u, 256u, x, n_rows);
-}
-int ds4_gpu_q8_cache_suppressed(void) { return 0; }
-void ds4_gpu_set_q8_cache_suppressed(int suppressed) { (void)suppressed; }
-int ds4_gpu_set_decode_fast_attention(int enabled) { (void)enabled; return 0; }
-int ds4_gpu_set_decode_score_vec4(int enabled) { (void)enabled; return 0; }
-int ds4_gpu_indexer_top2_value_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *values,
-        const ds4_gpu_tensor *scores,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                index_offset) {
-    (void)selected; (void)values; (void)scores; (void)n_comp;
-    (void)n_tokens; (void)index_offset;
-    return 0;
-}
-int ds4_gpu_matmul_q8_0_top1_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *values,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint32_t                index_offset) {
-    (void)selected; (void)values; (void)model_map; (void)model_size;
-    (void)weight_offset; (void)in_dim; (void)out_dim; (void)x;
-    (void)index_offset;
-    return 0;
-}
-int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
-        ds4_gpu_tensor       *q_out,
-        const ds4_gpu_tensor *q,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                q_weight_offset,
-        uint32_t                q_n,
-        ds4_gpu_tensor       *kv_out,
-        const ds4_gpu_tensor *kv,
-        uint64_t                kv_weight_offset,
-        uint32_t                kv_n,
-        uint32_t                rows,
-        uint32_t                kv_n_head,
-        uint32_t                kv_head_dim,
-        uint32_t                n_rot,
-        uint32_t                pos0,
-        uint32_t                n_ctx_orig,
-        bool                    inverse,
-        float                   freq_base,
-        float                   freq_scale,
-        float                   ext_factor,
-        float                   attn_factor,
-        float                   beta_fast,
-        float                   beta_slow,
-        float                   eps) {
-    (void)q_out; (void)q; (void)model_map; (void)model_size;
-    (void)q_weight_offset; (void)q_n; (void)kv_out; (void)kv;
-    (void)kv_weight_offset; (void)kv_n; (void)rows; (void)kv_n_head;
-    (void)kv_head_dim; (void)n_rot; (void)pos0; (void)n_ctx_orig;
-    (void)inverse; (void)freq_base; (void)freq_scale; (void)ext_factor;
-    (void)attn_factor; (void)beta_fast; (void)beta_slow; (void)eps;
-    return 0;
-}
-int ds4_gpu_attention_decode_heads_rope_tensor(
-        ds4_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        uint32_t                n_raw,
-        uint32_t                raw_cap,
-        uint32_t                raw_start,
-        const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        uint32_t                n_comp,
-        const ds4_gpu_tensor *comp_mask,
-        uint32_t                use_mask,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                n_rot,
-        uint32_t                pos0,
-        uint32_t                n_ctx_orig,
-        float                   freq_base,
-        float                   freq_scale,
-        float                   ext_factor,
-        float                   attn_factor,
-        float                   beta_fast,
-        float                   beta_slow,
-        int                    *fused_inv_rope) {
-    (void)n_rot; (void)pos0; (void)n_ctx_orig; (void)freq_base;
-    (void)freq_scale; (void)ext_factor; (void)attn_factor;
-    (void)beta_fast; (void)beta_slow;
-    if (fused_inv_rope) *fused_inv_rope = 0;
-    return ds4_gpu_attention_decode_heads_tensor(
-            heads, model_map, model_size, sinks_offset, q, raw_kv,
-            n_raw, raw_cap, raw_start, comp_kv, comp_kv_f16, n_comp,
-            comp_mask, use_mask, n_head, head_dim);
-}
-int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) { (void)t; return -1; }
-ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
-int         g_n_gpus = 0;
-int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
-#endif
-
-#if defined(DS4_NO_GPU)
-/* CPU-only build: even though no multi-tier code is reached, the engine
- * struct still embeds ds4_gpu_config and the global decls in
- * ds4_gpu_mgpu.h need matching definitions. We do not stub the
- * function symbols here because no caller references them in CPU
- * builds (every callsite is inside !DS4_NO_GPU). */
-ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
-int         g_n_gpus = 0;
-int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
-#endif
-#if defined(__ARM_NEON)
-#endif
-
-#ifndef M_PI
-#endif
-
 
 const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
@@ -294,25 +21,13 @@ const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * Below that size we keep ordinary thinking to avoid injecting a prompt that
  * asks for a reasoning budget the allocated context is not meant to hold. */
 
-bool glm_graph_env_present(const char *rocm_name, const char *metal_name) {
-#ifdef DS4_ROCM_BUILD
-    if (rocm_name && getenv(rocm_name) != NULL) return true;
-#else
-    (void)rocm_name;
-#endif
-    return metal_name && getenv(metal_name) != NULL;
+bool ds4_graph_env_present(const char *name) {
+    return name && getenv(name) != NULL;
 }
 
-const char *glm_graph_env_value(const char *rocm_name,
-                                       const char *metal_name) {
-#ifdef DS4_ROCM_BUILD
-    const char *rocm_env = rocm_name ? getenv(rocm_name) : NULL;
-    if (rocm_env && rocm_env[0]) return rocm_env;
-#else
-    (void)rocm_name;
-#endif
-    const char *metal_env = metal_name ? getenv(metal_name) : NULL;
-    return (metal_env && metal_env[0]) ? metal_env : NULL;
+const char *ds4_graph_env_value(const char *name) {
+    const char *value = name ? getenv(name) : NULL;
+    return (value && value[0]) ? value : NULL;
 }
 
 const ds4_shape DS4_SHAPE_FLASH = {
@@ -394,10 +109,6 @@ uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 
 int g_ds4_lock_fd = -1;
 
-#if defined(__GNUC__) || defined(__clang__)
-#else
-#endif
-
 /* =========================================================================
  * GGUF Quant Block Formats.
  * =========================================================================
@@ -405,8 +116,7 @@ int g_ds4_lock_fd = -1;
  * These layouts and IQ2 tables match the GGUF quantized tensor format,
  * reduced to only the formats ds4.c currently reads or sizes:
  *   - Q2_K routed down experts
- *   - Q4_K routed experts in the high-memory variant
- *   - Q5_K/Q6_K GLM routed experts
+ *   - Q4_K routed experts in compatible Flash checkpoints
  *   - IQ2_XXS routed gate/up experts
  *   - MXFP4 routed experts preserved from native checkpoints
  *   - Q8_K temporary activation blocks for dot products
@@ -414,112 +124,6 @@ int g_ds4_lock_fd = -1;
 
 
 
-
-static const uint8_t kmask_iq2xs[8] = {
-    1, 2, 4, 8, 16, 32, 64, 128
-};
-
-static const uint8_t ksigns_iq2xs[128] = {
-      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
-    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
-    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
-     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
-    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
-     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
-     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
-    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
-};
-
-const uint64_t iq2xxs_grid[256] = {
-    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
-    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
-    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
-    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
-    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
-    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
-    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
-    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
-    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
-    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
-    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
-    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
-    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
-    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
-    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
-    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
-    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
-    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
-    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
-    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
-    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
-    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
-    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
-    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
-    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
-    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
-    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
-    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
-    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
-    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
-    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
-    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
-    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
-    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
-    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
-    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
-    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
-    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
-    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
-    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
-    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
-    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
-    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
-    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
-    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
-    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
-    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
-    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
-    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
-    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
-    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
-    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
-    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
-    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
-    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
-    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
-    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
-    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
-    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
-    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
-    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
-    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
-    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
-    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
-};
-
-int8_t iq2xxs_signed_grid[256][128][8];
-int8_t iq2xxs_signs[128][8];
-pthread_once_t iq2xxs_signed_grid_once = PTHREAD_ONCE_INIT;
-
-void iq2xxs_signed_grid_init(void) {
-    for (uint32_t s = 0; s < 128; s++) {
-        const uint8_t signs = ksigns_iq2xs[s];
-        for (uint32_t j = 0; j < 8; j++) {
-            iq2xxs_signs[s][j] = (int8_t)((signs & kmask_iq2xs[j]) ? -1 : 1);
-        }
-    }
-
-    for (uint32_t g = 0; g < 256; g++) {
-        const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + g);
-        for (uint32_t s = 0; s < 128; s++) {
-            const uint8_t signs = ksigns_iq2xs[s];
-            for (uint32_t j = 0; j < 8; j++) {
-                const int v = (int)grid[j];
-                iq2xxs_signed_grid[g][s][j] = (int8_t)((signs & kmask_iq2xs[j]) ? -v : v);
-            }
-        }
-    }
-}
 
 /* =========================================================================
  * Shared Helpers, Allocation Guards, Threads, and Cursor Reads.
@@ -590,39 +194,13 @@ uint64_t hash_bytes(const void *ptr, uint64_t len) {
     return h;
 }
 
-static bool g_alloc_guard_enabled;
-static const char *g_alloc_guard_phase;
-
-static void ds4_alloc_guard_begin(const char *phase) {
-    g_alloc_guard_phase = phase;
-    g_alloc_guard_enabled = true;
-}
-
-static void ds4_alloc_guard_end(void) {
-    g_alloc_guard_enabled = false;
-    g_alloc_guard_phase = NULL;
-}
-
-static void ds4_alloc_guard_check(const char *op, size_t size) {
-    if (!g_alloc_guard_enabled) return;
-    fprintf(stderr,
-            "ds4: internal allocation during %s: %s(%zu). "
-            "CPU decode is expected to reuse preallocated scratch buffers.\n",
-            g_alloc_guard_phase ? g_alloc_guard_phase : "guarded phase",
-            op,
-            size);
-    exit(1);
-}
-
 void *xcalloc(size_t n, size_t size) {
-    ds4_alloc_guard_check("calloc", n * size);
     void *p = calloc(n, size);
     if (!p) ds4_die("out of memory");
     return p;
 }
 
 void *xmalloc(size_t size) {
-    ds4_alloc_guard_check("malloc", size);
     void *p = malloc(size);
     if (!p) ds4_die("out of memory");
     return p;
@@ -636,27 +214,8 @@ char *ds4_strdup(const char *s) {
 }
 
 void *xrealloc(void *ptr, size_t size) {
-    ds4_alloc_guard_check("realloc", size);
     void *p = realloc(ptr, size);
     if (!p) ds4_die("out of memory");
-    return p;
-}
-
-static void *xmalloc_zeroed(size_t n, size_t size) {
-    if (size != 0 && n > SIZE_MAX / size) ds4_die("allocation size overflow");
-    const size_t total = n * size;
-    void *p = xmalloc(total ? total : 1);
-    /*
-     * This is intentionally not calloc(). Large untouched calloc ranges may be
-     * represented by the VM through shared zero-page bookkeeping. The CPU decode
-     * KV cache grows one token at a time, so using calloc here can move thousands
-     * of first-touch faults into generation. On Darwin we have observed this end
-     * in a kernel cpt_mapcnt_inc overflow panic instead of a user-space error.
-     *
-     * Explicitly writing the zeroes while the cache is allocated keeps those VM
-     * faults out of the token loop and gives the cache private resident pages.
-     */
-    memset(p, 0, total);
     return p;
 }
 
@@ -814,8 +373,6 @@ static void *ds4_worker_main(void *arg) {
  * of creating pthreads in the token loop. */
 void ds4_threads_init(void) {
     if (g_pool.initialized) return;
-
-    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
 
     uint32_t n_threads = 12;
     const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);

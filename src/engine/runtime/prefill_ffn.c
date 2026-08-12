@@ -1,7 +1,6 @@
 #include "engine_internal.h"
 
 /* Prefill Ffn module. */
-#ifndef DS4_NO_GPU
 /* Encode the multi-token prefill/verification FFN half. */
 bool metal_graph_encode_layer_ffn_batch(
         ds4_gpu_graph  *g,
@@ -254,8 +253,7 @@ bool metal_graph_encode_layer_ffn_batch(
                                                metal_graph_batch_ffn_norm(g),
                                                il,
                                                n_tokens,
-                                               &g->batch_routed_mid_is_f16,
-                                               false) != 0;
+                                               &g->batch_routed_mid_is_f16) != 0;
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_batch_routed_gate(g),
@@ -372,7 +370,7 @@ bool metal_graph_encode_layer_batch(
     return ok;
 }
 
- /* Execute one Metal decode token and read back logits. */
+ /* Execute one CUDA decode token and read back logits. */
 bool metal_graph_eval_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -381,8 +379,7 @@ bool metal_graph_eval_token_raw_swa(
         uint32_t               pos,
         float                 *logits) {
     const bool profile =
-        glm_graph_env_present("DS4_ROCM_GRAPH_TOKEN_PROFILE",
-                              "DS4_METAL_GRAPH_TOKEN_PROFILE");
+        ds4_graph_env_present("DS4_METAL_GRAPH_TOKEN_PROFILE");
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
 
@@ -409,10 +406,8 @@ bool metal_graph_eval_token_raw_swa(
     if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after graph eval failure also failed\n");
+            fprintf(stderr, "ds4: CUDA synchronize after graph eval failure also failed\n");
         }
     }
     return ok;
 }
-
-#endif /* !DS4_NO_GPU */

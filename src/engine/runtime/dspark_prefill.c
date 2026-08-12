@@ -1,15 +1,7 @@
 #include "engine_internal.h"
 
 /* Dspark Prefill module. */
-#ifndef DS4_NO_GPU
-/* =========================================================================
- * Metal Release Decode and Prefill.
- * =========================================================================
- *
- * Everything below is the user-facing Metal backend.  It uses the same layer
- * encoder as diagnostics, but diagnostics are not required for normal command
- * flow and their CPU reads stay outside these generation entry points.
- */
+/* CUDA decode and prefill orchestration shared by target and DSpark paths. */
 
 static uint32_t metal_graph_cuda_decode_split_after_layers(void) {
     const char *env = getenv("DS4_CUDA_DECODE_SPLIT_LAYERS");
@@ -317,66 +309,6 @@ bool metal_graph_dspark_capture_prefill_layer(
     return ok;
 }
 
-static bool metal_graph_dspark_capture_prefill_rows(
-        ds4_gpu_graph *g,
-        uint32_t       il,
-        uint32_t       chunk_start,
-        uint32_t       chunk_len,
-        uint32_t       pos0,
-        uint32_t       n_tokens) {
-    const int slot = metal_graph_dspark_target_slot(g, il);
-    if (slot < 0) return true;
-    if (!g->dspark_target_hidden_batch ||
-        !g->dspark_target_hidden ||
-        !g->dspark_hc_mean_rows ||
-        n_tokens == 0 ||
-        chunk_len == 0 ||
-        chunk_len > g->prefill_cap ||
-        pos0 < chunk_start) {
-        return true;
-    }
-    const uint32_t row0 = pos0 - chunk_start;
-    if (row0 > chunk_len || n_tokens > chunk_len - row0) return true;
-
-    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    ds4_gpu_tensor *batch_dst =
-        ds4_gpu_tensor_view(g->dspark_target_hidden_batch,
-                            (((uint64_t)(uint32_t)slot * g->prefill_cap +
-                              row0) * DS4_N_EMBD) * sizeof(float),
-                            (uint64_t)n_tokens * embd_bytes);
-    bool ok = batch_dst &&
-              ds4_gpu_hc_weighted_sum_tensor(batch_dst,
-                                             metal_graph_batch_cur_hc(g),
-                                             g->dspark_hc_mean_rows,
-                                             DS4_N_EMBD,
-                                             DS4_N_HC) != 0;
-    if (!ok) fprintf(stderr, "ds4: pipeline capture rows FAIL il=%u row0=%u n=%u dst=%d\n",
-                     il, row0, n_tokens, batch_dst != NULL);
-    if (ok && row0 + n_tokens == chunk_len) {
-        ds4_gpu_tensor *last_src =
-            ds4_gpu_tensor_view(batch_dst,
-                                (uint64_t)(n_tokens - 1u) * embd_bytes,
-                                embd_bytes);
-        ds4_gpu_tensor *last_dst =
-            ds4_gpu_tensor_view(g->dspark_target_hidden,
-                                (uint64_t)(uint32_t)slot * embd_bytes,
-                                embd_bytes);
-        ok = last_src && last_dst &&
-             ds4_gpu_tensor_copy(last_dst, 0, last_src, 0, embd_bytes) != 0;
-        ds4_gpu_tensor_free(last_dst);
-        ds4_gpu_tensor_free(last_src);
-        if (ok) {
-            metal_graph_dspark_capture_note_slot(g, (uint32_t)slot);
-            ok = metal_graph_dspark_capture_batch_note_slot(g,
-                                                            (uint32_t)slot,
-                                                            chunk_start,
-                                                            chunk_len);
-        }
-    }
-    ds4_gpu_tensor_free(batch_dst);
-    return ok;
-}
-
 bool metal_graph_dspark_capture_verified_suffix_begin(
         ds4_gpu_graph *g,
         uint32_t       start,
@@ -612,26 +544,6 @@ bool metal_graph_refresh_ratio4_compressor_state(
         fprintf(stderr, "ds4: ratio-4 compressor tail view creation failed\n");
     }
     if (ok) {
-#if defined(__APPLE__)
-        ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
-                                        model->map,
-                                        model->size,
-                                        kv_weight->abs_offset,
-                                        DS4_N_EMBD,
-                                        width,
-                                        tail_hc,
-                                        4) != 0;
-        if (ok) {
-            ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_sc(g),
-                                            model->map,
-                                            model->size,
-                                            score_weight->abs_offset,
-                                            DS4_N_EMBD,
-                                            width,
-                                            tail_hc,
-                                            4) != 0;
-        }
-#else
         ok = ds4_gpu_matmul_f16_pair_tensor(metal_graph_batch_comp_kv(g),
                                              metal_graph_batch_comp_sc(g),
                                              model->map,
@@ -642,7 +554,6 @@ bool metal_graph_refresh_ratio4_compressor_state(
                                              width,
                                              tail_hc,
                                              4) != 0;
-#endif
         if (!ok) {
             fprintf(stderr, "ds4: ratio-4 compressor tail projection failed\n");
         }
@@ -667,7 +578,7 @@ bool metal_graph_refresh_ratio4_compressor_state(
 }
 
 /* Seed the batched HC state from token ids: every HC stream starts as the same
- * 4096-wide embedding.  Long prefill chunks use the Metal get-rows/repeat
+ * 4096-wide embedding. Long prefill chunks use the CUDA get-rows/repeat
  * kernel so the CPU does not build and upload a large [token, HC, dim] tensor. */
 bool metal_graph_upload_prompt_embeddings_hc(
         ds4_gpu_tensor   *out_hc,
@@ -703,20 +614,6 @@ bool metal_graph_hc_rms_scale_project(
         in_dim > UINT32_MAX) {
         return false;
     }
-#if defined(__APPLE__)
-    return ds4_gpu_hc_rms_scale_project_f16_tensor(
-               out,
-               norm_scratch,
-               model->map,
-               model->size,
-               weight->abs_offset,
-               (uint32_t)in_dim,
-               2u * DS4_N_HC + DS4_N_HC * DS4_N_HC,
-               x,
-               n_tokens,
-               DS4_RMS_EPS) != 0;
-#else
-#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     if (weight->type == DS4_TENSOR_F16 &&
         ds4_gpu_matmul_f16_rms_fold_tensor(
             out,
@@ -730,7 +627,6 @@ bool metal_graph_hc_rms_scale_project(
             DS4_RMS_EPS)) {
         return true;
     }
-#endif
     bool ok = ds4_gpu_rms_norm_plain_rows_tensor(
                   norm_scratch,
                   x,
@@ -749,7 +645,6 @@ bool metal_graph_hc_rms_scale_project(
                  n_tokens) != 0;
     }
     return ok;
-#endif
 }
 
 bool metal_graph_warmup_prefill_kernels(
@@ -962,5 +857,3 @@ ds4_gpu_tensor *metal_graph_tensor_row_range_view(
                                  (uint64_t)row0 * row_values * sizeof(float),
                                  (uint64_t)rows * row_values * sizeof(float));
 }
-
-#endif /* !DS4_NO_GPU */

@@ -14,21 +14,16 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <limits.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#if defined(__APPLE__)
-#include <sys/sysctl.h>
-#endif
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
 #include "ds4.h"
 #include "ds4_gpu_runtime.h"
-#ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #include "ds4x/ops/attention.h"
 #include "ds4x/ops/cache.h"
@@ -36,210 +31,6 @@
 #include "ds4x/ops/hyper_connection.h"
 #include "ds4x/ops/indexer.h"
 #include "ds4x/ops/moe.h"
-#endif
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-
-/* Decode-island graph capture is CUDA-only; Metal decodes eagerly. */
-int ds4_gpu_decode_graphs_supported(void);
-
-int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
-
-int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
-
-void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
-
-void ds4_gpu_decode_graphs_invalidate(void);
-
-int ds4_gpu_set_current_device(int logical_tier);
-
-int ds4_gpu_set_current_device_fenced(int logical_tier);
-
-void ds4_gpu_enable_q8_dequant_gemm(void);
-
-int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes);
-
-int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
-                                     const ds4_gpu_tensor *src,
-                                     uint64_t bytes);
-
-int ds4_gpu_tensor_copy_xdev3_default_dst(
-        ds4_gpu_tensor *dst0, const ds4_gpu_tensor *src0, uint64_t bytes0,
-        ds4_gpu_tensor *dst1, const ds4_gpu_tensor *src1, uint64_t bytes1,
-        ds4_gpu_tensor *dst2, const ds4_gpu_tensor *src2, uint64_t bytes2);
-
-int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size);
-
-int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias);
-
-int ds4_gpu_device_cache_support_tensors(int device_id,
-                                          int exec_device_id,
-                                          const ds4_tensor_range *ranges,
-                                          int n_ranges,
-                                          int main_model);
-
-uint64_t ds4_gpu_tier_free_vram(int logical_tier);
-
-int ds4_gpu_device_cache_tensors(int device_id,
-                                  const ds4_tensor_range *ranges,
-                                  int n_ranges);
-
-int ds4_gpu_init_multi(const ds4_gpu_config *cfg);
-
-int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id, uint64_t bytes);
-
-ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes);
-
-ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes);
-
-void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t);
-
-int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
-                              const ds4_gpu_tensor *src,
-                              uint64_t bytes);
-
-int ds4_gpu_tensor_copy_xdev3(ds4_gpu_tensor       *dst0,
-                              const ds4_gpu_tensor *src0,
-                              uint64_t              bytes0,
-                              ds4_gpu_tensor       *dst1,
-                              const ds4_gpu_tensor *src1,
-                              uint64_t              bytes1,
-                              ds4_gpu_tensor       *dst2,
-                              const ds4_gpu_tensor *src2,
-                              uint64_t              bytes2);
-
-int ds4_gpu_tensor_copy_xdev_ordered(ds4_gpu_tensor *dst,
-                                      const ds4_gpu_tensor *src,
-                                      uint64_t bytes);
-
-int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier);
-
-int ds4_gpu_moe_handoff_pack_tensor(
-        ds4_gpu_tensor       *packed,
-        const ds4_gpu_tensor *ffn_norm,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t              n_embd,
-        uint32_t              n_expert);
-
-int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
-        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
-        const void *model_map, uint64_t model_size,
-        uint64_t weight0_offset, uint64_t weight1_offset,
-        uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
-        const ds4_gpu_tensor *x, uint32_t n_rows);
-
-int ds4_gpu_matmul_f16_router_rows_exact_tensor(
-        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, const ds4_gpu_tensor *x, uint32_t n_rows);
-
-int ds4_gpu_q8_cache_suppressed(void);
-
-void ds4_gpu_set_q8_cache_suppressed(int suppressed);
-
-int ds4_gpu_set_decode_fast_attention(int enabled);
-
-int ds4_gpu_set_decode_score_vec4(int enabled);
-
-int ds4_gpu_indexer_top2_value_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *values,
-        const ds4_gpu_tensor *scores,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                index_offset);
-
-int ds4_gpu_matmul_q8_0_top1_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *values,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint32_t                index_offset);
-
-int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
-        ds4_gpu_tensor       *q_out,
-        const ds4_gpu_tensor *q,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                q_weight_offset,
-        uint32_t                q_n,
-        ds4_gpu_tensor       *kv_out,
-        const ds4_gpu_tensor *kv,
-        uint64_t                kv_weight_offset,
-        uint32_t                kv_n,
-        uint32_t                rows,
-        uint32_t                kv_n_head,
-        uint32_t                kv_head_dim,
-        uint32_t                n_rot,
-        uint32_t                pos0,
-        uint32_t                n_ctx_orig,
-        bool                    inverse,
-        float                   freq_base,
-        float                   freq_scale,
-        float                   ext_factor,
-        float                   attn_factor,
-        float                   beta_fast,
-        float                   beta_slow,
-        float                   eps);
-
-int ds4_gpu_attention_decode_heads_rope_tensor(
-        ds4_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        uint32_t                n_raw,
-        uint32_t                raw_cap,
-        uint32_t                raw_start,
-        const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        uint32_t                n_comp,
-        const ds4_gpu_tensor *comp_mask,
-        uint32_t                use_mask,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                n_rot,
-        uint32_t                pos0,
-        uint32_t                n_ctx_orig,
-        float                   freq_base,
-        float                   freq_scale,
-        float                   ext_factor,
-        float                   attn_factor,
-        float                   beta_fast,
-        float                   beta_slow,
-        int                    *fused_inv_rope);
-
-int ds4_gpu_tensor_device(const ds4_gpu_tensor *t);
-
-extern ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
-
-
-extern int         g_n_gpus;
-
-
-extern int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
-
-#endif
-#if defined(DS4_NO_GPU)
-
-extern /* CPU-only build: even though no multi-tier code is reached, the engine
- * struct still embeds ds4_gpu_config and the global decls in
- * ds4_gpu_mgpu.h need matching definitions. We do not stub the
- * function symbols here because no caller references them in CPU
- * builds (every callsite is inside !DS4_NO_GPU). */
-ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
-
-
-extern int         g_n_gpus;
-
-
-extern int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
-
-#endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -262,10 +53,9 @@ extern const char DS4_REASONING_EFFORT_MAX_PREFIX[];
 
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
-bool glm_graph_env_present(const char *rocm_name, const char *metal_name);
+bool ds4_graph_env_present(const char *name);
 
-const char *glm_graph_env_value(const char *rocm_name,
-                                       const char *metal_name);
+const char *ds4_graph_env_value(const char *name);
 
 
 
@@ -273,9 +63,7 @@ const char *glm_graph_env_value(const char *rocm_name,
  * Model Shape Profiles.
  * =========================================================================
  *
- * The weight binder and metadata validator select one of the known model
- * profiles below.  Arrays reserve the maximum Pro dimensions; hot loops read
- * the active profile after GGUF validation.
+ * The weight binder and metadata validator accept one fixed Flash profile.
  */
 
 enum {
@@ -393,11 +181,6 @@ extern uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER];
 
 extern int g_ds4_lock_fd;
 
-#if defined(__GNUC__) || defined(__clang__)
-#define DS4_MAYBE_UNUSED __attribute__((unused))
-#else
-#define DS4_MAYBE_UNUSED
-#endif
 #define QK_K 256
 #define QK_MXFP4 32
 
@@ -417,25 +200,6 @@ typedef struct {
     uint8_t  scales[12];
     uint8_t  qs[QK_K / 2];
 } block_q4_K;
-
-
-
-typedef struct {
-    uint16_t d;
-    uint16_t dmin;
-    uint8_t  scales[12];
-    uint8_t  qh[QK_K / 8];
-    uint8_t  qs[QK_K / 2];
-} block_q5_K;
-
-
-
-typedef struct {
-    uint8_t ql[QK_K / 2];
-    uint8_t qh[QK_K / 4];
-    int8_t  scales[QK_K / 16];
-    uint16_t d;
-} block_q6_K;
 
 
 
@@ -464,12 +228,6 @@ DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 
 
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
-
-
-DS4_STATIC_ASSERT(ds4_block_q5_k_size, sizeof(block_q5_K) == 176);
-
-
-DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
 
 
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
@@ -544,74 +302,6 @@ typedef struct {
     float *output_norm;
 } ds4_cpu_decode_scratch;
 
-extern const uint64_t iq2xxs_grid[256];
-
-
-extern int8_t iq2xxs_signed_grid[256][128][8];
-
-
-extern int8_t iq2xxs_signs[128][8];
-
-
-extern pthread_once_t iq2xxs_signed_grid_once;
-
-
-void iq2xxs_signed_grid_init(void);
-
-
-
-static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
-    const int32x4_t acc = vdotq_s32(vdupq_n_s32(0), gv, vld1q_s8(q8));
-    return vaddvq_s32(acc);
-#elif defined(__ARM_NEON)
-    const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
-    const int8x16_t qv = vld1q_s8(q8);
-    const int16x8_t p0 = vmull_s8(vget_low_s8(gv), vget_low_s8(qv));
-    const int16x8_t p1 = vmull_s8(vget_high_s8(gv), vget_high_s8(qv));
-    return vaddvq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
-#else
-    int32_t sum = 0;
-    for (uint32_t i = 0; i < 8; i++) sum += (int32_t)grid0[i] * (int32_t)q8[i];
-    for (uint32_t i = 0; i < 8; i++) sum += (int32_t)grid1[i] * (int32_t)q8[8 + i];
-    return sum;
-#endif
-}
-
-
-
-static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    const uint8x16_t packed = vld1q_u8(q2);
-    uint8x16_t shifted;
-    switch (shift) {
-    case 0: shifted = packed; break;
-    case 2: shifted = vshrq_n_u8(packed, 2); break;
-    case 4: shifted = vshrq_n_u8(packed, 4); break;
-    default: shifted = vshrq_n_u8(packed, 6); break;
-    }
-    const uint8x16_t vals_u = vandq_u8(shifted, vdupq_n_u8(3));
-    const int8x16_t vals = vreinterpretq_s8_u8(vals_u);
-    const int8x16_t q8v = vld1q_s8(q8);
-    const int32x4_t acc = vdotq_s32(vdupq_n_s32(0), q8v, vals);
-    return vaddvq_s32(acc);
-#elif defined(__ARM_NEON)
-    uint8_t vals_tmp[16];
-    for (uint32_t i = 0; i < 16; i++) vals_tmp[i] = (q2[i] >> shift) & 3;
-    const int8x16_t vals = vreinterpretq_s8_u8(vld1q_u8(vals_tmp));
-    const int8x16_t q8v = vld1q_s8(q8);
-    const int16x8_t p0 = vmull_s8(vget_low_s8(q8v), vget_low_s8(vals));
-    const int16x8_t p1 = vmull_s8(vget_high_s8(q8v), vget_high_s8(vals));
-    const int32x4_t s0 = vpaddlq_s16(p0);
-    const int32x4_t s1 = vpaddlq_s16(p1);
-    return vaddvq_s32(vaddq_s32(s0, s1));
-#else
-    int32_t sum = 0;
-    for (uint32_t i = 0; i < 16; i++) sum += (int32_t)q8[i] * (int32_t)((q2[i] >> shift) & 3);
-    return sum;
-#endif
-}
 #define DS4_GGUF_MAGIC 0x46554747u /* "GGUF", little endian. */
 #define DS4_MAX_DIMS   8
 
@@ -765,8 +455,6 @@ enum {
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
     DS4_TENSOR_Q4_K     = 12,
-    DS4_TENSOR_Q5_K     = 13,
-    DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
@@ -840,12 +528,8 @@ bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *out);
 
 void model_close(ds4_model *m);
 
-/* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
- * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
- * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
- * walks the huge tensor payload. */
-void model_open(ds4_model *m, const char *path, bool metal_mapping,
-                       bool prefetch_cpu);
+/* Open and map the GGUF once for CUDA weight-range resolution. */
+void model_open(ds4_model *m, const char *path);
 #define DS4_DSPARK_MAX_TARGET_LAYERS 8
 #define DS4_DSPARK_MAX_STAGES 8
 #define DS4_DSPARK_MAX_BLOCK_SIZE 16
@@ -875,7 +559,6 @@ typedef struct {
 
 typedef enum {
     DS4_SUPPORT_NONE = 0,
-    DS4_SUPPORT_MTP_LEGACY,
     DS4_SUPPORT_DSPARK,
 } ds4_support_kind;
 
@@ -889,9 +572,6 @@ ds4_support_kind support_model_detect(
         const ds4_model *m,
         uint32_t        *stages_out,
         ds4_dspark_summary *summary_out);
-#ifndef DS4_NO_GPU
-#ifndef __APPLE__
-
 typedef struct {
     uint64_t off;
     uint64_t end;
@@ -902,15 +582,6 @@ bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const uint64_t *span_offsets,
                                             const uint64_t *span_sizes,
                                             uint32_t span_count);
-#else
-
-bool accelerator_cache_model_tensors(ds4_backend backend,
-                                            const ds4_model *m,
-                                            const uint64_t *span_offsets,
-                                            const uint64_t *span_sizes,
-                                            uint32_t span_count);
-#endif
-#endif
 
 /* Return the in-place tensor payload inside the mapped GGUF. */
 const void *tensor_data(const ds4_model *m, const ds4_tensor *t);
@@ -924,8 +595,8 @@ void model_warm_weights(const ds4_model *m);
  * Scalar Conversion and Quantized Tensor Kernels.
  * =========================================================================
  *
- * These functions are the CPU reference math used by the C backend and by
- * Metal diagnostics.  They implement only the tensor formats present in the
+ * These scalar helpers support validation and diagnostics. They implement only
+ * the tensor formats present in the
  * DeepSeek V4 Flash GGUF: F16, F32, Q8_0, Q2_K, IQ2_XXS, and Q8_K activation
  * blocks used for expert dot products.
  */
@@ -1060,7 +731,7 @@ bool tensor_type_is_f16_or_q8_0(uint32_t type);
 
 bool tensor_is_routed_expert_type(uint32_t type);
 
-DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t);
+uint64_t routed_expert_row_bytes(const ds4_tensor *t);
 
 uint64_t ds4_add_sat_u64(uint64_t a, uint64_t b);
 
@@ -1100,21 +771,6 @@ void weights_bind(
         bool             optional_output);
 
 
-
-typedef struct {
-    uint64_t off;
-    uint64_t end;
-    bool isolate;
-} ds4_model_map_span;
-
-
-
-typedef struct {
-    ds4_model_map_span *v;
-    uint32_t len;
-    uint32_t cap;
-    uint64_t max_tensor_bytes;
-} ds4_model_map_span_vec;
 
 void dspark_weights_bind_optional(
         ds4_dspark_weights        *dw,
@@ -1165,35 +821,29 @@ void matvec_any(float *out,
 
 uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk);
-#ifndef DS4_NO_GPU
-
 int sample_argmax(const float *logits, uint32_t n_vocab);
 
 /* =========================================================================
- * Metal Reference Comparison Helpers.
+ * CUDA Reference Comparison Helpers.
  * =========================================================================
  *
- * These small scalar helpers are used only by diagnostics that compare the C
- * reference path with the Metal executor.
+ * These small scalar helpers are used only by CUDA diagnostics.
  */
 
 float max_abs_diff(const float *a, const float *b, uint64_t n);
 
 float rms_abs_diff(const float *a, const float *b, uint64_t n);
-#endif
-#ifndef DS4_NO_GPU
 #define DS4_GPU_RAW_CACHE_SPARK 1
 #define DS4_GPU_ATTN_COMP_CACHE_SPARK 1
 #define DS4_GPU_INDEX_COMP_CACHE_SPARK 1
 #define DS4_GPU_ATTN_COMP_CACHE_F16 0
-#define DS4_GPU_GLM_COMPACT_CACHE_F16 DS4_GPU_ATTN_COMP_CACHE_F16
 
 
 /* =========================================================================
- * Metal Release Graph State.
+ * CUDA Graph State.
  * =========================================================================
  *
- * The release Metal executor owns one fixed set of tensors for single-token
+ * The CUDA executor owns one fixed set of tensors for single-token
  * decode and another for batched prefill.  The structure is DS4-specific:
  * tensor names follow the model stages rather than generic graph nodes.
  */
@@ -1208,10 +858,9 @@ typedef struct {
      * future stream migration does not reintroduce process-global dispatch. */
     ds4x_runtime_context runtime;
 
-    /* Class P — per-tier replicated kernel scratch buffers.
-     * Each used tier has its own copy; active_tier names the slot the
-     * current dispatch step reads/writes. Single-tier paths leave
-     * active_tier == 0; multi-tier dispatch updates active_tier in B6.
+    /* Class P kernel scratch buffers. DS4_MAX_GPUS is one, so active_tier
+     * remains zero and the arrays preserve the tensor-accessor ABI without
+     * implying a distributed execution path.
      *
      * Decode hidden-state buffers. A generated token enters as an embedding
      * in cur_hc and leaves as logits after all 43 layers update their
@@ -1246,7 +895,7 @@ typedef struct {
     ds4_gpu_tensor *layer_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_state_score[DS4_MAX_LAYER];
 
-    /* Speculative decoding scratch.  MTP is allowed to mutate graph state only
+    /* Speculative decoding scratch. DSpark may mutate graph state only
      * if the target verifier can either commit it or restore the saved
      * frontiers.  Prefix slots retain the intermediate frontiers of a tiny
      * verifier block so partial accepts do not need target-model replay. */
@@ -1434,7 +1083,7 @@ typedef struct {
     double decode_token_avg_sec;
     bool quality;
     bool mtp_enabled;
-    /* Metal-only prefill helpers retained alongside the CUDA tiered workspace. */
+    /* FP16 prefill staging. */
     ds4_gpu_tensor *batch_q_half;
 } ds4_gpu_graph;
 #define DS4_GPU_PREFILL_WORKSPACE_FIELDS(X) \
@@ -1615,64 +1264,7 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_routed_down)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_routed_out)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_ffn_out)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(directional_steering_dirs)
-#ifdef DS4_NO_GPU
-
-/* CPU-only builds do not include ds4_gpu.h: mirror the decode-graph key
- * type and stub the capture API (always eager). */
-typedef struct ds4_decode_graph_key {
-    uint32_t il;
-    uint32_t island;
-    uint32_t variant;
-    uint32_t _pad;
-    void    *cur_hc;
-    void    *after_attn_hc;
-    void    *after_ffn_hc;
-    void    *attn_norm;
-} ds4_decode_graph_key;
-
-
-static inline int ds4_gpu_decode_graphs_supported(void) { return 0; }
-
-
-static inline int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
-        ds4_gpu_tensor       *q_out,
-        const ds4_gpu_tensor *q,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                q_weight_offset,
-        uint32_t                q_n,
-        ds4_gpu_tensor       *kv_out,
-        const ds4_gpu_tensor *kv,
-        uint64_t                kv_weight_offset,
-        uint32_t                kv_n,
-        uint32_t                rows,
-        uint32_t                kv_n_head,
-        uint32_t                kv_head_dim,
-        uint32_t                n_rot,
-        uint32_t                pos0,
-        uint32_t                n_ctx_orig,
-        bool                    inverse,
-        float                   freq_base,
-        float                   freq_scale,
-        float                   ext_factor,
-        float                   attn_factor,
-        float                   beta_fast,
-        float                   beta_slow,
-        float                   eps) {
-    (void)q_out; (void)q; (void)model_map; (void)model_size;
-    (void)q_weight_offset; (void)q_n; (void)kv_out; (void)kv;
-    (void)kv_weight_offset; (void)kv_n; (void)rows; (void)kv_n_head;
-    (void)kv_head_dim; (void)n_rot; (void)pos0; (void)n_ctx_orig;
-    (void)inverse; (void)freq_base; (void)freq_scale; (void)ext_factor;
-    (void)attn_factor; (void)beta_fast; (void)beta_slow; (void)eps;
-    return 0;
-}
-#endif
-
-/* Upstream: --power N GPU duty-cycle throttling helpers. The single-tier
- * --power=100 path is a no-op; multi-tier inherits the same helpers via
- * graph_power_note_prefill_layer / graph_power_note_decode_token which we
- * call from the shared encode / decode loops. */
+/* --power N GPU duty-cycle throttling helpers. --power=100 is a no-op. */
 
 bool graph_power_throttle_enabled(const ds4_gpu_graph *g);
 
@@ -1682,7 +1274,7 @@ void graph_power_note_prefill_layer(ds4_gpu_graph *g,
 
 void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec);
 
-/* Release every Metal tensor owned by the whole-model graph runtime. */
+/* Release every tensor owned by the whole-model CUDA graph runtime. */
 void metal_graph_free(ds4_gpu_graph *g);
 
 bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n);
@@ -1692,7 +1284,7 @@ bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n);
  * =========================================================================
  *
  * A steering file contains one normalized 4096-wide direction per layer.  When
- * enabled, the Metal graph edits selected block outputs in-place:
+ * enabled, the CUDA graph edits selected block outputs in-place:
  *
  *     y = y - scale * v * dot(v, y)
  *
@@ -1746,11 +1338,11 @@ ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor_on(
 
 
 /* =========================================================================
- * Metal Diagnostic Dump Hooks.
+ * CUDA Diagnostic Dump Hooks.
  * =========================================================================
  *
  * The release path calls these after important stages, but they are no-ops
- * unless DS4_METAL_GRAPH_DUMP_PREFIX or DS4_ROCM_GRAPH_DUMP_PREFIX is set.
+ * unless DS4_CUDA_GRAPH_DUMP_PREFIX is set.
  * Dumping synchronizes and restarts the command batch, so it is intentionally
  * isolated here.
  */
@@ -1815,9 +1407,6 @@ bool metal_graph_cuda_greedy_splitkv_fallback_requested(void);
 bool metal_graph_cuda_q_norm_rope_fuse_requested(void);
 
 bool metal_graph_cuda_qkv_kv_rope_fuse_requested(void);
-#endif /* !DS4_NO_GPU */
-#ifndef DS4_NO_GPU
-
 /* Allocate the complete target runtime on the single GB10. */
 bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
@@ -1827,8 +1416,6 @@ bool metal_graph_alloc_raw_cap(
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
         bool                    enable_dspark_verify);
-#endif /* !DS4_NO_GPU */
-#ifndef DS4_NO_GPU
 
 bool ds4x_graph_cache_zero(ds4_gpu_graph *g,
                                   ds4x_cache_kind kind,
@@ -1937,23 +1524,6 @@ bool metal_graph_check_hc_norm_fusion(
         uint32_t               il,
         uint32_t               pos);
 
-extern int ds4_gpu_kv_rope_fp8_fuse_available(void);
-
-extern int ds4_gpu_decode_attn_rope_fuse_available(void);
-
-extern int ds4_gpu_decode_attn_rope_fuse_used(void);
-
-extern void ds4_gpu_set_decode_attn_rope_fuse(
-        uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig,
-        bool inverse, float freq_base, float freq_scale, float ext_factor,
-        float attn_factor, float beta_fast, float beta_slow);
-
-extern int ds4_gpu_kv_rope_fp8_store_raw_tensor(
-        ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache, uint32_t raw_cap,
-        uint32_t row, uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
-        uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale,
-        float ext_factor, float attn_factor, float beta_fast, float beta_slow);
-
 bool metal_graph_decode_kv_store(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
@@ -1987,7 +1557,7 @@ ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
 
 void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t);
 
-/* Encode one DS4 decode layer on Metal.  This is the release single-token
+/* Encode one DS4 decode layer on CUDA. This is the release single-token
  * layer path; diagnostics reuse it so they compare exactly what generation
  * runs. */
 bool metal_graph_indexer_stage_profile_boundary(
@@ -2101,7 +1671,6 @@ typedef enum {
     METAL_DECODE_LAYER_FROM_KV_STORE_TO_ATTN,
     METAL_DECODE_LAYER_FROM_ATTN_TO_FFN,
 } metal_decode_layer_phase;
-#endif /* !DS4_NO_GPU */
 
 bool metal_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
@@ -2123,9 +1692,7 @@ bool metal_graph_output_logits_head_matmul(
         ds4_gpu_tensor       *dst_logits,
         uint32_t              n_tokens,
         uint64_t              vocab_dim);
-#ifndef DS4_NO_GPU
-
-/* Encode the final HC collapse, output norm, and vocab projection on Metal. */
+/* Encode the final HC collapse, output norm, and vocab projection on CUDA. */
 bool metal_graph_encode_output_head(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -2137,11 +1704,11 @@ bool metal_graph_encode_output_head(
  * A target verifier only needs top-1 ids for intermediate draft rows and full
  * logits for the last accepted row.  Running the normal one-row output head in
  * a loop serializes the HC collapse, output norm, and Q8 vocab projection.  For
- * tiny MTP suffixes we instead process all rows together and let the GPU reduce
+ * tiny DSpark suffixes we instead process all rows together and let the GPU reduce
  * each row to a top id; the CPU reads back just those ids plus the last row's
  * logits needed to continue the exact target stream. */
-/* Shared vocab-head matmul: pads small batches to 8 rows for the exact-mma Q8
- * kernel and shards the vocabulary across output-TP tiers. */
+/* Shared vocab-head matmul pads small batches to 8 rows for the exact-mma Q8
+ * kernel. */
 bool metal_graph_output_logits_head_matmul(
         ds4_gpu_graph        *g,
         const ds4_model      *model,
@@ -2227,9 +1794,6 @@ bool metal_graph_matmul_q8_0_named_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
-#endif /* !DS4_NO_GPU */
-#ifndef DS4_NO_GPU
-
 void metal_graph_dspark_capture_invalidate(ds4_gpu_graph *g);
 
 void metal_graph_dspark_cache_reset(ds4_gpu_graph *g);
@@ -2317,7 +1881,7 @@ bool metal_graph_refresh_ratio4_compressor_state(
         uint32_t          n_tokens);
 
 /* Seed the batched HC state from token ids: every HC stream starts as the same
- * 4096-wide embedding.  Long prefill chunks use the Metal get-rows/repeat
+ * 4096-wide embedding. Long prefill chunks use the CUDA get-rows/repeat
  * kernel so the CPU does not build and upload a large [token, HC, dim] tensor. */
 bool metal_graph_upload_prompt_embeddings_hc(
         ds4_gpu_tensor   *out_hc,
@@ -2383,9 +1947,6 @@ ds4_gpu_tensor *metal_graph_tensor_row_range_view(
         uint32_t          row0,
         uint32_t          rows,
         uint64_t          row_values);
-#endif /* !DS4_NO_GPU */
-#ifndef DS4_NO_GPU
-
 bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -2393,9 +1954,6 @@ bool metal_graph_encode_layer_attention_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens);
-#endif /* !DS4_NO_GPU */
-#ifndef DS4_NO_GPU
-
 /* Encode the multi-token prefill/verification FFN half. */
 bool metal_graph_encode_layer_ffn_batch(
         ds4_gpu_graph  *g,
@@ -2414,7 +1972,7 @@ bool metal_graph_encode_layer_batch(
         uint32_t                pos0,
         uint32_t                n_tokens);
 
-/* Execute one Metal decode token and read back logits. */
+/* Execute one CUDA decode token and read back logits. */
 bool metal_graph_eval_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -2422,19 +1980,6 @@ bool metal_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits);
-
-
-
- typedef struct {
-    int id0;
-    int id1;
-    float value0;
-    float value1;
-    bool valid;
-    bool fast_attention;
-} metal_graph_top2_result;
-#endif /* !DS4_NO_GPU */
-#ifndef DS4_NO_GPU
 
 /* Greedy verifier helper.  Speculative decoding only needs the target model's
  * top token after most accepted draft rows; the full vocabulary row is needed
@@ -2518,9 +2063,6 @@ bool metal_graph_eval_dspark_stage_chain(
         uint32_t                 *completed_stages,
         uint32_t                 *cache_start_out,
         uint32_t                 *cache_rows_out);
-#endif /* !DS4_NO_GPU */
-#ifndef DS4_NO_GPU
-
 /* Keep the support KV ring aligned while the scheduler skips proposals. */
 bool metal_graph_dspark_ring_maintain(
         ds4_gpu_graph            *g,
@@ -2627,9 +2169,6 @@ uint32_t dspark_confident_prefix_len(
         float        threshold);
 
 bool metal_graph_reset_prefill_state(ds4_gpu_graph *g);
-#endif /* !DS4_NO_GPU */
-#ifndef DS4_NO_GPU
-
 bool metal_graph_prefill_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -2668,9 +2207,6 @@ bool metal_graph_prefill_chunked_range(
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled);
-#endif /* !DS4_NO_GPU */
-#ifndef DS4_NO_GPU
-
 /* Long prompts are prefetched in fixed-size chunks.  Chunks bound transient
  * attention buffers while preserving the same final KV/cache state. */
 bool metal_graph_prefill_chunked(
@@ -2714,7 +2250,7 @@ bool metal_graph_verify_suffix_tops(
 
 bool metal_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, float *logits);
 
-/* Exact N=2 target verifier for MTP.
+/* Exact small-suffix target verifier for DSpark.
  *
  * The generic batch prefill path is fast, but it is not a safe substitute for
  * autoregressive decode: small row-wise differences in HC/MoE/output kernels
@@ -2734,7 +2270,6 @@ uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len,
  * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
  * as a conservative crossover.  The env knob remains useful for retuning. */
 uint32_t metal_graph_resume_prefill_min_tokens(void);
-#endif /* !DS4_NO_GPU */
 
 
 typedef struct ds4_vocab ds4_vocab;
@@ -2945,8 +2480,6 @@ void ds4_release_instance_lock(void);
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
  * stale accidental second run is more dangerous than a normal CLI error. */
 void ds4_acquire_instance_lock(void);
-#ifndef DS4_NO_GPU
-
 typedef struct {
     uint32_t n_comp[DS4_MAX_LAYER];
     uint32_t n_index_comp[DS4_MAX_LAYER];
@@ -3000,27 +2533,21 @@ typedef struct ds4_dspark_spec_stats {
     double replay_ms;
     double total_ms;
 } ds4_dspark_spec_stats;
-#endif
 
 
 struct ds4_session {
     ds4_engine *engine;
-#ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
     ds4_spec_frontier greedy_splitkv_anchor;
-#endif
     token_vec checkpoint;
     token_vec greedy_splitkv_segment;
     float *logits;
     float *sample_probs;
     int greedy_splitkv_anchor_len;
-#ifndef DS4_NO_GPU
     float *spec_row_logits;
     float *dspark_markov_bias;
     float *dspark_conf_features;
     size_t dspark_conf_features_cap;
-#endif
-#ifndef DS4_NO_GPU
     int dspark_draft_tokens[DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t dspark_draft_len;
     uint32_t dspark_sched_cycles;
@@ -3040,7 +2567,6 @@ struct ds4_session {
     bool dspark_sched_long_accept_seen;
     bool dspark_last_confidence0_valid;
     ds4_dspark_spec_stats dspark_stats;
-#endif
     ds4_session_progress_fn progress;
     void *progress_ud;
     ds4_session_progress_fn display_progress;
@@ -3052,8 +2578,6 @@ struct ds4_session {
     bool checkpoint_valid;
     bool greedy_splitkv_anchor_valid;
 };
-#ifndef DS4_NO_GPU
-
 bool ds4_dspark_stats_enabled(void);
 
 void ds4_dspark_stats_note_len(
@@ -3075,7 +2599,6 @@ void ds4_session_dspark_scheduler_note(
         uint32_t     accepted_drafts,
         bool         no_draft,
         double       extra_ms);
-#endif
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
 
 void payload_set_err(char *err, size_t errlen, const char *msg);
@@ -3293,23 +2816,14 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 
-/* Pay the one-time first-submission GPU cost (pipeline ramp plus model-heap
- * residency for the batched prefill kernels) outside any measured window.
- * The TP worker calls this right after creating its session: it otherwise
- * encodes no main-queue GPU work until the first mirrored sync arrives, so
- * the cost lands inside the leader-timed prefill (measured ~1.1 s per run
- * on the M5 Max pair -- the whole first-run TP deficit vs single
- * node, which pays the same cost before its timing window starts). */
+/* Pay the one-time CUDA submission and model-residency cost outside measured
+ * prefill windows. */
 void ds4_session_gpu_warmup(ds4_session *s);
-#ifndef DS4_NO_GPU
-#endif
 
-int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
-                                     char *err, size_t errlen);
+int ds4_session_eval_probe_draft(ds4_session *s, int token, bool probe_mtp,
+                                 char *err, size_t errlen);
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
-#ifndef DS4_NO_GPU
-#endif
 
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,

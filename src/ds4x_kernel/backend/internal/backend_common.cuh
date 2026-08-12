@@ -29,7 +29,6 @@
 #define M_PI 3.14159265358979323846
 #endif
 #define CUDA_QK_K 256
-#define DS4_CUDA_UNUSED __attribute__((unused))
 
 
 enum {
@@ -110,9 +109,6 @@ extern uint64_t g_model_registered_size;
 extern int g_model_registered;
 
 
-extern thread_local bool g_glm_mtp_verify_mode;
-
-
 extern int g_model_device_owned;
 
 
@@ -152,15 +148,6 @@ extern int g_decode_fast_attention;
 extern int g_decode_score_vec4;
 
 
-extern int g_xdev_sync_debug;
-
-
-extern int g_xdev_force_cuda_peer;
-
-
-extern int g_xdev_force_host_bounce;
-
-
 extern int g_cuda_disable_qkv_rms_fused;
 
 
@@ -185,9 +172,6 @@ extern int g_cuda_no_top1;
 extern int g_cuda_end_stream_sync;
 
 
-extern int g_cuda_no_setdevice_cache;
-
-
 extern int g_cuda_exact_score_split_graph;
 
 
@@ -207,9 +191,6 @@ extern int g_cuda_exact_score_split_fuse_inv_rope;
 
 
 extern int g_cuda_moe_decode_graph;
-
-
-extern int g_current_logical_tier;
 
 
 
@@ -261,29 +242,12 @@ void routed_moe_decode_graph_destroy_one(int logical_tier);
 
 
 
-/* =========================================================================
- * Multi-GPU plumbing (device-aware CUDA).
- * ========================================================================= */
-
 static_assert(DS4_MAX_GPUS == 1, "DS4X is a single-GB10 runtime");
 
 extern ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 
 
 extern int         g_n_gpus;
-
-
-extern int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
-
-
-extern /* Per-pair pinned-host bounce buffers, indexed [src][dst]. Lazily grown
- * to the largest copy seen for that pair. Each pair is its own allocation
- * so concurrent fan-out copies from a single source GPU to multiple
- * destinations cannot race for staging memory. */
-void   *g_xdev_bounce[DS4_MAX_GPUS][DS4_MAX_GPUS];
-
-
-extern size_t  g_xdev_bounce_bytes[DS4_MAX_GPUS][DS4_MAX_GPUS];
 
 
 /* Internal helper: resolve a tensor's device index. -1 (untagged) is
@@ -296,46 +260,6 @@ int ds4_tensor_device_idx(const ds4_gpu_tensor *t);
          (_wd_prev >= 0 ? (void)cudaSetDevice(_wd_prev) : (void)0))         \
         if (cudaGetDevice(&_wd_prev) != cudaSuccess) { /* leave */ } else   \
         if (cudaSetDevice(d)           != cudaSuccess) { /* leave */ } else
-
-
-/* =========================================================================
- * Per-device selective model cache (selective model cache).
- *
- * The public API in ds4_gpu.h declares ds4_tensor_range and the
- * device_cache_tensors / lookup_cache entry points. ds4_cuda.cu does NOT
- * include ds4_gpu.h historically (a pre-existing project convention), so
- * we redeclare the struct here with the same layout the header uses.
- * The implementation links by C linkage; struct compatibility is by
- * field layout. */
-typedef struct {
-    uint64_t source_offset;
-    uint64_t bytes;
-    int      target_device;
-} ds4_tensor_range;
-
-
-
-struct cuda_device_cache {
-    void   *base;     /* device-side slab base */
-    size_t  bytes;
-    int     present;
-};
-
-extern cuda_device_cache g_dev_cache[DS4_MAX_GPUS];
-
-
-
-
-struct cache_range_entry {
-    uint64_t source_offset;
-    uint64_t bytes;
-    int      device_id;
-    void    *device_ptr;
-};
-
-extern std::vector<cache_range_entry> g_cache_ranges;
-
-
 
 
 struct cuda_model_range {
@@ -372,18 +296,6 @@ struct cuda_q8_f16_range {
 
 
 
-struct cuda_q8_f32_range {
-    const void *host_base;
-    uint64_t offset;
-    uint64_t weight_bytes;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    float *device_ptr;
-    int device_id;          /* physical CUDA device id; 0 in single-tier */
-};
-
-
-
 enum cuda_derived_kind {
     CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE = 4,
     CUDA_DERIVED_Q8_0_ALIGNED_DENSE = 5,
@@ -404,12 +316,6 @@ struct cuda_derived_range {
     char *device_ptr;
 };
 
-extern std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
-
-
-extern std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
-
-
 extern std::vector<cuda_derived_range> g_derived_ranges;
 
 
@@ -426,9 +332,6 @@ extern int g_derived_replaces_complete;
 
 
 extern void *g_aligned_q81_scratch;
-
-
-extern uint64_t g_q8_f32_bytes;
 
 
 extern int g_q8_cache_suppressed;
@@ -461,22 +364,8 @@ const char *cuda_model_range_ptr_from_fd(
         uint64_t bytes,
         const char *what);
 
-/* Forward declaration: defined later in this file. The resolver wrapper
- * below uses it for multi-tier dispatch. */
-extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
-                                            uint64_t bytes,
-                                            int      expected_device,
-                                            void   **out_device_ptr);
-
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
-        const unsigned char *w,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks);
-
-__global__ static void dequant_q8_0_to_f32_kernel(
-        float *out,
         const unsigned char *w,
         uint64_t in_dim,
         uint64_t out_dim,
@@ -514,34 +403,12 @@ void *tt_scratch_ensure(uint64_t bytes, const char *what);
 
 uint64_t tt_align256_u64(uint64_t x);
 
-/* Per-tier scratch accessor.
- *
- * Behavior:
- *   - At g_n_gpus <= 1 (single-tier), delegates to cuda_tmp_alloc which
- *     manages the legacy g_cuda_tmp slab. This guarantees byte-identical
- *     behavior to pre-task code for the gpu_cfg == NULL case.
- *   - For multi-tier, grows the per-device g_gpu[logical_tier].scratch
- *     slab on the corresponding physical device. Cleanup is already
- *     handled by ds4_gpu_cleanup (which walks g_gpu[i].scratch).
- *
- * The legacy g_cuda_tmp slab is untouched: init-time / preload callers
- * still use cuda_tmp_alloc directly. No aliasing between g_cuda_tmp
- * and g_gpu[0].scratch — they are independently owned and freed.
- *
- * Added for multi-GPU execution (multi-GPU execution), step A3 of the
- * spec (sub-area 2). */
 void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *what);
 
 int cuda_attention_score_buffer_fits(uint32_t n_comp);
 
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 
-/* Per-tier cuBLAS handle. Used by kernel-dispatch wrappers; returns the
- * cuBLAS handle for the logical tier. The wrapper is expected to have
- * cudaSetDevice'd to that tier's physical device already (kernels and
- * cuBLAS calls ride the default stream and are naturally serialized).
- *
- * Added for multi-GPU execution (multi-GPU execution), sub-area 1. */
 cublasHandle_t cuda_cublas_for_tier(int logical_tier);
 #define CUDA_DECODE_GRAPH_LAYERS   64u
 #define CUDA_DECODE_GRAPH_ISLANDS   2u
@@ -607,20 +474,8 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
  * prefill logits drift at ULP scale: validated against the official
  * continuation vectors rather than byte-diffs.  DS4_CUDA_MMQ=0 restores
  * the legacy dispatch. */
-/* Producer-fold registry lookup the vendored ds4_mmq.cu entries probe for
- * pre-quantized q8_1 activations (the fork's flat-pool M2-Inc2a fold).
- * The flat-pool producers are not ported, so nothing is ever registered:
- * always miss, and the entries run their own activation quantize. */
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
-                                         const void **q81);
-
 int cuda_use_mmq(void);
 
-/* MXFP4 has no dequant+cublas fallback, so it must retain MMQ on multi-GPU
- * placements where the optional Q8/IQ2 prefill tier stays disabled. MMQ
- * resolves the active CUDA device on every call; initialization only warms
- * its device-info singleton. The experimental global persistent scratch is
- * intentionally rejected because one pointer cannot span CUDA devices. */
 int cuda_use_mxfp4_mmq(void);
 
 /* mmq pipeline helpers, ported from the fork: SwiGLU + clamp + router
@@ -643,52 +498,11 @@ __global__ static void moe_mmq_sum_kernel(float *out, const float *down,
  * Nothing was executed; the caller re-encodes eagerly. */
 extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 
-extern /* Multi-tier-aware weight pointer resolver.
- *
- * Used by kernel-dispatch wrappers in the per-layer execution path to
- * obtain a device pointer for a weight slice on the layer's logical
- * tier. Behavior:
- *
- *   - When g_n_gpus <= 1 (single-tier engine), delegates to the existing
- *     cuda_model_range_ptr path. This short-circuit guarantees byte-
- *     identical behavior to pre-multi-tier code for the gpu_cfg == NULL
- *     case.
- *
- *   - When g_n_gpus >= 2 (multi-tier engine), translates the logical
- *     tier index to the corresponding physical CUDA device id via
- *     g_gpu[logical_tier].device_id and looks up the slice strictly
- *     in the per-device selective cache via ds4_gpu_lookup_cache_strict.
- *     On miss, logs a diagnostic and returns NULL (no host-pointer
- *     fallback — a miss here is a placement/install bug).
- *
- * The caller is responsible for cudaSetDevice'ing to the right physical
- * device before launching the kernel that consumes the returned pointer.
- * Wrappers in this file thread `int logical_tier` from the dispatch
- * caller; single-tier callers pass 0, which hits the short-circuit.
- *
- * Added for multi-GPU execution (multi-GPU execution), sub-area 3 of the
- * spec. */
-/* Optional second (support) model map for speculative decoding. The strict
- * multi-tier cache is keyed by source offset only, so support tensors are
- * installed and resolved with a large disjoint offset bias. */
-const void *g_support_host_base;
-
-
-extern uint64_t g_support_host_size;
-
-
-extern uint64_t g_support_offset_bias;
-
-
-extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier);
-
-extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias);
-
 const char *cuda_resolve_weight_ptr(const void *model_map,
-                                            uint64_t offset,
-                                            uint64_t bytes,
-                                            int logical_tier,
-                                            const char *label);
+                                    uint64_t offset,
+                                    uint64_t bytes,
+                                    int logical_tier,
+                                    const char *label);
 
 int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes);
 
@@ -700,10 +514,6 @@ uint32_t cuda_parse_u32_env_clamped(const char *name, uint32_t fallback,
 
 int cuda_env_flag_enabled(const char *name, int fallback);
 
-extern "C" int ds4_gpu_set_decode_fast_attention(int enabled);
-
-extern "C" int ds4_gpu_set_decode_score_vec4(int enabled);
-
 bool cuda_splitkv_decode_requested(void);
 
 void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t request_bytes);
@@ -714,32 +524,7 @@ unsigned cuda_q8_exact_threads(uint64_t blocks);
 
 int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim);
 
-int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim);
-
-/* Look up a per-device dequantized fp16 slice of the Q8_0 weight at
- * (model_map, offset, weight_bytes, in_dim, out_dim). expected_device is a
- * PHYSICAL CUDA device id (0 in single-tier; g_gpu[logical_tier].device_id in
- * multi-tier). On hit returns the cached pointer for that device. On miss
- * cudaSetDevice's to expected_device, allocates + dequants there, stamps the
- * new entry with device_id == expected_device, restores the previous device,
- * and returns the new pointer.
- *
- * Single-tier (g_n_gpus <= 1) uses the offset-keyed map for a fast path —
- * legacy entries were stamped device_id=0, so the map remains authoritative.
- * Multi-tier linear-scans the ranges vector filtering on device_id (the same
- * offset may now legitimately map to multiple entries, one per device).
- */
 const __half *cuda_q8_f16_ptr(
-        const void *model_map,
-        uint64_t offset,
-        uint64_t weight_bytes,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        int expected_device,
-        const char *label);
-
-/* Per-device dequantized fp32 cache. Same conventions as cuda_q8_f16_ptr. */
-float *cuda_q8_f32_ptr(
         const void *model_map,
         uint64_t offset,
         uint64_t weight_bytes,
@@ -753,16 +538,6 @@ int cuda_ok(cudaError_t err, const char *what);
 double cuda_wall_sec(void);
 
 int cuda_model_prefetch_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
-#if 0
-
-int cuda_model_copy_to_device_streamed(
-        char *dst,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t offset,
-        uint64_t bytes,
-        const char *what);
-#endif
 
 const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
@@ -775,10 +550,6 @@ int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t
 void cuda_model_range_release_all(void);
 
 int cublas_ok(cublasStatus_t st, const char *what);
-#if 0
-
-extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg);
-#endif
 
 extern "C" int ds4_gpu_init(void);
 
@@ -789,44 +560,15 @@ __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
 extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
                                        uint64_t bytes);
 
-/* Async D2D copy queued on the destination device's default stream —
- * ordering against the producer comes from the caller's fence; the CPU
- * does not block (unlike ds4_gpu_tensor_copy's sync cudaMemcpy). */
-extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,
-                                         const ds4_gpu_tensor *src,
-                                         uint64_t bytes);
-
-extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t);
-
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 
-/* Heap-allocated tensor on a specific logical tier.
- *
- * Mirrors the legacy ds4_gpu_tensor_alloc ABI (returns ds4_gpu_tensor *)
- * with an explicit tier argument. Internally calls
- * ds4_gpu_tensor_alloc_on on a freshly malloc'd struct.
- *
- * The legacy ds4_gpu_tensor_alloc(bytes) (above) calls
- * ds4_gpu_tensor_alloc_on(t, 0, bytes); ds4_gpu_tensor_alloc_ptr_on(0,
- * bytes) is byte-equivalent. Single-tier callers MAY remain on the
- * legacy 1-arg helper; new multi-tier callers in ds4.c use _ptr_on. */
+/* Heap-allocated tensor with the explicit device-slot ABI. */
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes);
 
-/* Heap-allocated managed-memory tensor on a specific logical tier.
- * Differs from ds4_gpu_tensor_alloc_managed only in stamping
- * tier instead of 0. Used by the per-layer KV cache when tier !=0.
- *
- * Managed-memory paging behavior: cudaMallocManaged pages between
- * devices on first-touch. In a single-tier pipeline the page lives on
- * tier 0; in a multi-tier pipeline the layer's kernels run on the
- * layer's tier so the page lives there after first-touch and stays
- * unless another device touches it. Stamping tier matches the home
- * device for free-time accounting. */
+/* Managed-memory counterpart of ds4_gpu_tensor_alloc_ptr_on. */
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes);
-
-extern "C" int ds4_gpu_tensor_device(const ds4_gpu_tensor *t);
 
 extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 
@@ -848,59 +590,6 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes);
 
-extern "C" int ds4_gpu_moe_handoff_pack_tensor(
-        ds4_gpu_tensor       *packed,
-        const ds4_gpu_tensor *ffn_norm,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t              n_embd,
-        uint32_t              n_expert);
-#if 0
-
-extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
-                                        const ds4_gpu_tensor *src,
-                                        uint64_t bytes);
-
-extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
-                                                 const ds4_gpu_tensor *src,
-                                                 uint64_t bytes);
-
-extern "C" int ds4_gpu_tensor_copy_xdev3_default_dst(
-        ds4_gpu_tensor *dst0,
-        const ds4_gpu_tensor *src0,
-        uint64_t bytes0,
-        ds4_gpu_tensor *dst1,
-        const ds4_gpu_tensor *src1,
-        uint64_t bytes1,
-        ds4_gpu_tensor *dst2,
-        const ds4_gpu_tensor *src2,
-        uint64_t bytes2);
-
-extern "C" int ds4_gpu_tensor_copy_xdev3(ds4_gpu_tensor       *dst0,
-                                         const ds4_gpu_tensor *src0,
-                                         uint64_t              bytes0,
-                                         ds4_gpu_tensor       *dst1,
-                                         const ds4_gpu_tensor *src1,
-                                         uint64_t              bytes1,
-                                         ds4_gpu_tensor       *dst2,
-                                         const ds4_gpu_tensor *src2,
-                                         uint64_t              bytes2);
-
-extern "C" int ds4_gpu_tensor_copy_xdev_ordered(ds4_gpu_tensor *dst,
-                                                const ds4_gpu_tensor *src,
-                                                uint64_t bytes);
-
-extern "C" int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier);
-
-extern "C" int ds4_gpu_tensor_wait_xdev_default(
-        const ds4_gpu_tensor *src,
-        int dst_tier);
-#endif
-
-extern "C" int ds4_gpu_q8_cache_suppressed(void);
-
-extern "C" void ds4_gpu_set_q8_cache_suppressed(int suppressed);
-
 extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *slots,
@@ -917,84 +606,10 @@ extern "C" int ds4_gpu_end_commands(void);
 
 extern "C" int ds4_gpu_synchronize(void);
 
-extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
-
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 
-/* Register the mmap'd host model pointer for selective-cache lookups WITHOUT
- * triggering any device-side copy. Used by multi-GPU placement scaffolding's
- * multi-tier path so DS4_CUDA_COPY_MODEL cannot reintroduce a full-model
- * copy that defeats the per-device selective cache.
- *
- * This is the no-copy subset of ds4_gpu_set_model_map: same bookkeeping
- * for the host pointer plus cudaHostRegister, but skipping the
- * DS4_CUDA_COPY_MODEL branch that allocates and copies the entire model. */
+/* Register the mmap'd host model without forcing a full device copy. */
 extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size);
-
-/* Set the current CUDA device by LOGICAL tier index (0..g_n_gpus-1).
- * Maps to the physical CUDA device id stored in g_gpu[].device_id.
- * Added for multi-GPU placement scaffolding (multi-GPU CLI); first executed by
- * multi-GPU execution (follow-up). */
-extern "C" int ds4_gpu_set_current_device(int logical_tier);
-
-/* Fenced device switch for sequential cross-device pipelines (GLM
- * per-layer placement): work queued on the next device's default stream
- * waits for everything queued so far on the previous device's default
- * stream. Async — no host sync. Falls back to a plain switch when the
- * device does not change. */
-extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier);
-
-/* =========================================================================
- * Per-device selective model cache (selective model cache).
- *
- * ds4_gpu_device_cache_tensors copies the listed source ranges from the
- * host mmap onto device_id's selective slab and appends sorted lookup
- * entries. The legacy chunked-copy machinery (cuda_model_range_*) is
- * NOT disturbed — it continues to drive all existing callers. New
- * lookups fall back to it when no selective entry covers the range.
- *
- * Caller-context preference for overlap: when the same source range is
- * cached on multiple devices, ds4_gpu_lookup_cache returns the entry
- * whose device matches cudaGetDevice().
- * ========================================================================= */
-
-extern "C" int ds4_gpu_device_cache_tensors(int device_id,
-                                            const ds4_tensor_range *ranges,
-                                            int n_ranges);
-
-/* Install support-model tensor ranges into device_id's strict cache,
- * copying from the registered support map and keying entries at
- * source_offset + bias. Standalone slab (does not touch the main cache
- * slab growth path). */
-extern "C" int ds4_gpu_device_cache_support_tensors(int device_id,
-                                                    int entry_device_id,
-                                                    const ds4_tensor_range *ranges,
-                                                    int n_ranges,
-                                                    int from_main_map);
-
-extern "C" int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
-                                    int *out_device_id, void **out_device_ptr);
-
-extern "C" int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes);
-
-/* Strict per-device selective-cache lookup.
- *
- * Returns 1 only if a covering entry exists whose device_id matches the
- * caller-supplied expected_device. Otherwise returns 0 with *out_device_ptr
- * untouched. Unlike ds4_gpu_lookup_cache, this variant performs NO host-
- * pointer fallback (no FD-cache, no model_range_ptr_from_fd) and NO
- * different-device fallback. It is the canonical lookup for multi-tier
- * dispatch where consuming a different device's pointer would be a
- * correctness bug. expected_device is a PHYSICAL CUDA device id (the
- * value stored in g_gpu[logical_tier].device_id, not the logical tier
- * index). The caller is expected to have cudaSetDevice'd to
- * expected_device before invoking; the returned pointer is valid to
- * consume from that device's kernel. Added for
- * multi-GPU execution (multi-GPU execution). */
-extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
-                                            uint64_t bytes,
-                                            int      expected_device,
-                                            void   **out_device_ptr);
 
 extern "C" int ds4_gpu_set_model_fd(int fd);
 
@@ -1093,39 +708,6 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
         uint64_t blocks,
         int use_dp4a);
 
-__device__ __forceinline__ static uint32_t q8_top1_float_ordered_key(float v);
-
-__device__ __forceinline__ static uint64_t q8_top1_pack_key(float v, uint32_t idx);
-
-__device__ __forceinline__ static float q8_top1_unpack_value(uint32_t ordered);
-
-__global__ static void matmul_q8_0_top1_preq_warp8_kernel(
-        unsigned long long *best_key,
-        const unsigned char *w,
-        const int8_t *xq,
-        const float *xscale,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks,
-        uint32_t index_offset,
-        int use_dp4a);
-
-__global__ static void matmul_q8_0_top1_unpack_kernel(
-        uint32_t *selected,
-        float *values,
-        const unsigned long long *best_key);
-
-__global__ static void matmul_q8_0_kslice_preq_warp8_kernel(
-        float *out,
-        const unsigned char *w,
-        const int8_t *xq,
-        const float *xscale,
-        uint64_t slice_dim,
-        uint64_t out_dim,
-        uint64_t full_blocks,
-        uint64_t block_start,
-        uint64_t slice_blocks,
-        int use_dp4a);
 
 __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
         float *out0,
@@ -1138,21 +720,6 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
         uint64_t out0_dim,
         uint64_t out1_dim,
         uint64_t blocks,
-        int use_dp4a);
-
-__global__ static void shared_mid_q8_0_preq_warp8_exact_kernel(
-        float *mid,
-        const unsigned char *gate_w,
-        const unsigned char *up_w,
-        const int8_t *xq,
-        const float *xscale,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks,
-        float clamp,
-        const int32_t *selected,
-        uint32_t expert_split,
-        bool home_rank,
         int use_dp4a);
 
 __global__ static void matmul_q8_0_pair_preq_batch_kernel(
@@ -1183,22 +750,11 @@ __global__ static void matmul_q8_0_pair_preq_batch_tok2_exact_kernel(
         uint64_t blocks,
         int use_dp4a);
 
-__device__ static float moe_owned_packed_combine_row(
-        const float *home_slots,
-        const float *peer_packed,
-        const int32_t *selected,
-        uint32_t row,
-        uint32_t out_dim,
-        uint32_t expert_split);
-
 __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         float *out_hc,
         float *block_out,
         const float *block_add,
         const float *block_add2,
-        const float *owned_home_slots,
-        const float *owned_peer_packed,
-        const int32_t *owned_selected,
         const float *residual_hc,
         const float *split,
         const unsigned char *w,
@@ -1211,8 +767,6 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         uint64_t blocks,
         int has_add,
         int has_add2,
-        int has_owned_slots,
-        uint32_t owned_expert_split,
         int use_dp4a);
 
 __global__ static void matmul_q8_0_kslice_hc_expand_add_preq_warp8_kernel(
@@ -1346,13 +900,6 @@ __global__ static void dequant_q8_0_to_f16_kernel(
         uint64_t out_dim,
         uint64_t blocks);
 
-__global__ static void dequant_q8_0_to_f32_kernel(
-        float *out,
-        const unsigned char *w,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks);
-
 __global__ static void grouped_q8_0_a_preq_warp8_kernel(
         float *low,
         const unsigned char *w,
@@ -1470,21 +1017,6 @@ __global__ static void rope_tail_kernel(
         float beta_fast,
         float beta_slow);
 
-__global__ static void rope_tail_decode_rows_kernel(
-        float *x,
-        cuda_attention_decode_row_table rows,
-        uint32_t n_rows,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t n_rot,
-        uint32_t n_ctx_orig,
-        int inverse,
-        float freq_base,
-        float freq_scale,
-        float ext_factor,
-        float attn_factor,
-        float beta_fast,
-        float beta_slow);
 
 __device__ static float dsv4_e4m3fn_value_dev(int i);
 
@@ -1696,51 +1228,11 @@ __global__ static void attention_decode_score_split_scores_ldg_kernel(
         uint32_t head_dim,
         uint32_t S);
 
-extern "C" void ds4_gpu_enable_q8_dequant_gemm(void);
-
 int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label);
 
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok);
 
-extern "C" int ds4_gpu_matmul_q8_0_top1_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *values,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint32_t                index_offset);
 
-extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
-        ds4_gpu_tensor *out,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t weight_offset,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t in_start,
-        uint64_t in_count,
-        const ds4_gpu_tensor *x,
-        uint64_t n_tok);
-
-extern "C" int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
-        ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *block_out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        uint64_t                in_start,
-        uint64_t                in_count,
-        const ds4_gpu_tensor *x,
-        const ds4_gpu_tensor *block_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc);
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor *out0,
@@ -1755,28 +1247,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t n_tok);
 
-extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint32_t                n_rows);
 
-extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
-        ds4_gpu_tensor       *out0,
-        ds4_gpu_tensor       *out1,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight0_offset,
-        uint64_t                weight1_offset,
-        uint64_t                in_dim,
-        uint64_t                out0_dim,
-        uint64_t                out1_dim,
-        const ds4_gpu_tensor *x,
-        uint32_t                n_rows);
 
 int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         ds4_gpu_tensor       *out_hc,
@@ -1789,10 +1260,6 @@ int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *block_add,
         const ds4_gpu_tensor *block_add2,
-        const ds4_gpu_tensor *owned_home_slots,
-        const ds4_gpu_tensor *owned_peer_packed,
-        const ds4_gpu_tensor *owned_selected,
-        uint32_t                owned_expert_split,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
@@ -1812,13 +1279,6 @@ extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
         uint64_t n_tok,
         float norm_eps);
 
-extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
-        ds4_gpu_tensor *out,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t weight_offset,
-        const ds4_gpu_tensor *x,
-        uint32_t n_rows);
 
 extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor *out0,
@@ -2643,31 +2103,6 @@ __global__ static void directional_steering_project_kernel(
 
 __global__ static void zero_kernel(float *out, uint64_t n);
 
-__global__ static void indexer_scores_kernel(
-        float *scores,
-        const float *q,
-        const float *weights,
-        const float *index_comp,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t ratio,
-        float scale,
-        int causal);
-
-__global__ static void indexer_score_one_direct_kernel(
-        float *scores,
-        const float *q,
-        const float *weights,
-        const float *index_comp,
-        uint32_t n_comp,
-        uint32_t pos0,
-        uint32_t ratio,
-        float scale,
-        int causal);
-
 /* Slow, transparent B1 oracle for the persistent 68-byte indexer ABI. It is
  * only selected by the A/B regression; production uses block-scaled MMA. */
 __global__ static void spark_indexer_score_one_reference_kernel(
@@ -2681,66 +2116,9 @@ __global__ static void spark_indexer_score_one_reference_kernel(
         float scale,
         int causal);
 
-__global__ static void indexer_scores_wmma_kernel(
-        float *scores,
-        const float *q,
-        const float *weights,
-        const float *index_comp,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t ratio,
-        float scale,
-        int causal);
-
-__global__ static void indexer_scores_wmma32_kernel(
-        float *scores,
-        const float *q,
-        const float *weights,
-        const float *index_comp,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t ratio,
-        float scale,
-        int causal);
-
-__global__ static void indexer_scores_wmma64_kernel(
-        float *scores,
-        const float *q,
-        const float *weights,
-        const float *index_comp,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t ratio,
-        float scale,
-        int causal);
-
-__global__ static void indexer_scores_wmma128_kernel(
-        float *scores,
-        const float *q,
-        const float *weights,
-        const float *index_comp,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t ratio,
-        float scale,
-        int causal);
 #ifdef DS4_CUDA_HAVE_MXF4
 #define DS4_MXF4_INDEXER_HEADS 64u
 #define DS4_MXF4_INDEXER_DIM 128u
-#endif
-#ifdef DS4_CUDA_HAVE_MXF4
 #endif
 
 __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, float bv, uint32_t bi);
@@ -2865,22 +2243,6 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
-extern "C" int ds4_gpu_indexer_top1_value_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *values,
-        const ds4_gpu_tensor *scores,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                index_offset);
-
-extern "C" int ds4_gpu_indexer_top2_value_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *values,
-        const ds4_gpu_tensor *scores,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                index_offset);
-
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
@@ -2982,21 +2344,6 @@ extern "C" int ds4_gpu_spark_unpack_index_rows_tensor(
 
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow);
 
-extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
-        ds4_gpu_tensor                       *x,
-        const ds4_gpu_attention_decode_row   *rows,
-        uint32_t                              n_rows,
-        uint32_t                              n_head,
-        uint32_t                              head_dim,
-        uint32_t                              n_rot,
-        uint32_t                              n_ctx_orig,
-        bool                                  inverse,
-        float                                 freq_base,
-        float                                 freq_scale,
-        float                                 ext_factor,
-        float                                 attn_factor,
-        float                                 beta_fast,
-        float                                 beta_slow);
 
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 
@@ -3008,14 +2355,6 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-extern "C" int ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
-        ds4_gpu_tensor        *kv,
-        ds4_gpu_tensor *const *raw_caches,
-        const uint32_t        *raw_caps,
-        const uint32_t        *raw_rows,
-        uint32_t               n_rows,
-        uint32_t               head_dim,
-        uint32_t               n_rot);
 
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 
@@ -3172,52 +2511,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
-extern "C" int ds4_gpu_attention_decode_heads_rope_tensor(
-        ds4_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        uint32_t                n_raw,
-        uint32_t                raw_cap,
-        uint32_t                raw_start,
-        const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        uint32_t                n_comp,
-        const ds4_gpu_tensor *comp_mask,
-        uint32_t                use_mask,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                n_rot,
-        uint32_t                pos0,
-        uint32_t                n_ctx_orig,
-        float                   freq_base,
-        float                   freq_scale,
-        float                   ext_factor,
-        float                   attn_factor,
-        float                   beta_fast,
-        float                   beta_slow,
-        int                    *fused_inv_rope);
 
-extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
-        ds4_gpu_tensor                       *heads,
-        const void                           *model_map,
-        uint64_t                              model_size,
-        uint64_t                              sinks_offset,
-        const ds4_gpu_tensor                 *q,
-        const ds4_gpu_attention_decode_row   *rows,
-        uint32_t                              n_rows,
-        uint32_t                              n_head,
-        uint32_t                              head_dim,
-        uint32_t                              n_rot,
-        uint32_t                              n_ctx_orig,
-        float                                 freq_base,
-        float                                 freq_scale,
-        float                                 ext_factor,
-        float                                 attn_factor,
-        float                                 beta_fast,
-        float                                 beta_slow);
 
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim);
 
@@ -3297,22 +2591,6 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
-extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
-        ds4_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        const ds4_gpu_tensor *comp_mask,
-        uint32_t                n_tokens,
-        uint32_t                n_comp,
-        uint32_t                window,
-        uint32_t                ratio,
-        uint32_t                n_head,
-        uint32_t                head_dim);
 
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
@@ -3353,20 +2631,6 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
         uint32_t                n_groups,
         const ds4_gpu_tensor *heads);
 
-extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *low,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                out_a_offset,
-        uint64_t                out_b_offset,
-        uint64_t                group_dim,
-        uint64_t                rank,
-        uint32_t                n_groups_total,
-        uint32_t                group0,
-        uint32_t                group_cnt,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *heads);
 
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight);
 
@@ -3383,30 +2647,8 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         const ds4_gpu_tensor *x,
         float                   clamp);
 
-extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
-        ds4_gpu_tensor       *mid,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        float                   clamp,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *prequant,
-        uint32_t                expert_split,
-        bool                    home_rank);
 
 extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n);
-#if 0
-
-extern "C" int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor *out,
-                                        const ds4_gpu_tensor *local,
-                                        const ds4_gpu_tensor *remote,
-                                        ds4_gpu_tensor *remote_tmp,
-                                        uint32_t n);
-#endif
 
 extern "C" int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,
@@ -3544,40 +2786,17 @@ __global__ static void q8_K_q8_0_quantize_kernel(
         const float *x,
         uint32_t in_dim,
         uint32_t n_rows);
-
-__device__ __forceinline__ static bool moe_owned_local_expert(
-        int32_t expert,
-        uint32_t expert_base,
-        uint32_t expert_count,
-        uint32_t *local_expert);
-
-__global__ static void mxfp4_prepare_owned_assignments_kernel(
-        int32_t *local_ids,
-        float *local_weights,
-        const int32_t *selected,
-        const float *weights,
-        uint32_t expert_base,
-        uint32_t expert_count);
-
-/* Quantize only selected slots owned by this expert-parallel rank.  Rows keep
- * their original slot index so the final rank-local reduction can visit slots
- * in canonical order without compaction or a host synchronization. */
-__global__ static void q8_K_quantize_owned_kernel(
+__global__ static void q8_K_q8_0_quantize_kernel(
         cuda_block_q8_K *out,
+        int8_t *q8_0,
+        float *q8_0_scale,
         const float *x,
-        const int32_t *selected,
         uint32_t in_dim,
-        uint32_t n_rows,
-        uint32_t expert_base,
-        uint32_t expert_count);
+        uint32_t n_rows);
 
-__global__ static void moe_filter_owned_pairs_kernel(
-        int32_t *selected,
-        float *weights,
-        uint64_t pair_count,
-        uint32_t n_total_expert,
-        uint32_t expert_base,
-        uint32_t expert_count);
+
+
+
 
 __global__ static void q8_K_quantize_sidecar_kernel(
         cuda_block_q8_K *out,
@@ -3623,24 +2842,6 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         uint32_t write_aux,
         float clamp);
 
-__global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
-        float *gate_out,
-        float *up_out,
-        float *mid_out,
-        const char *gate_base,
-        const char *up_base,
-        const cuda_block_q8_K *xq,
-        const int32_t *selected,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint32_t xq_blocks,
-        uint32_t expert_mid_dim,
-        uint32_t n_expert,
-        uint32_t expert_base,
-        uint32_t expert_count,
-        uint32_t write_aux,
-        float clamp);
 
 __global__ static void moe_count_sorted_pairs_kernel(
         uint32_t *counts,
@@ -3676,27 +2877,6 @@ __global__ static void moe_build_expert_tiles_kernel(
         uint32_t block_m,
         uint32_t n_total_expert);
 
-/* Decode-sized routed batches spend more host time launching metadata kernels
- * than doing the <= 96 pair / 128 expert setup. Build both tile lists in one
- * deterministic block; the expensive expert kernels remain unchanged. */
-__global__ static void moe_prepare_sorted_tiles_small_kernel(
-        uint32_t *counts,
-        uint32_t *offsets,
-        uint32_t *cursors,
-        uint32_t *sorted_pairs,
-        uint32_t *tile_offsets,
-        uint32_t *tile_total,
-        uint32_t *tile_experts,
-        uint32_t *tile_starts,
-        uint32_t *tile16_offsets,
-        uint32_t *tile16_total,
-        uint32_t *tile16_experts,
-        uint32_t *tile16_starts,
-        const int32_t *selected,
-        uint32_t pair_count,
-        uint32_t n_total_expert,
-        uint32_t block_m,
-        bool build_tile16);
 
 __global__ static void moe_gate_up_mid_sorted_qwarp32_kernel(
         float *gate_out,
@@ -3915,21 +3095,6 @@ __global__ static void moe_gate_up_mid_decode_q4K_warp32_noaux_kernel(
         uint32_t n_expert,
         float clamp);
 
-__global__ static void moe_gate_up_mid_decode_q4K_owned_warp32_noaux_kernel(
-        float *mid_out,
-        const char *gate_base,
-        const char *up_base,
-        const cuda_block_q8_K *xq,
-        const int32_t *selected,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint32_t xq_blocks,
-        uint32_t expert_mid_dim,
-        uint32_t n_expert,
-        uint32_t expert_base,
-        uint32_t expert_count,
-        float clamp);
 
 __global__ static void moe_gate_up_mid_decode_q4K_warp32_noaux_sidecar_kernel(
         float *mid_out,
@@ -4011,56 +3176,10 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
         uint32_t midq_blocks,
         uint32_t out_dim);
 
-__global__ static void moe_down_owned_slots_qwarp32_kernel(
-        float *down_out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const int32_t *selected,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t expert_base,
-        uint32_t expert_count);
 
-/* Map one of two packed operands for a three-slot reduction group. The only
- * multi-slot operand is the peer-owned prefix (slots 0+1 within the group),
- * which can be pre-added exactly because the reference reduction starts from
- * +0. Every other peer slot remains a distinct operand in original order. */
-__device__ __forceinline__ static int moe_owned_packed_component(
-        const int32_t *selected,
-        uint32_t group,
-        uint32_t component,
-        uint32_t expert_base,
-        uint32_t expert_count,
-        bool *prefix_pair);
 
-/* One thread owns an output column and loads all source slots before writing.
- * This permits packed_out == slots for the non-peer-copy fallback. */
-__global__ static void moe_down_owned_pack_f32_slots_kernel(
-        float *packed_out,
-        const float *slots,
-        const int32_t *selected,
-        uint32_t out_dim,
-        uint32_t expert_base,
-        uint32_t expert_count);
 
-__global__ static void moe_down_owned_copy_f32_slots_kernel(
-        float *dst,
-        const float *src,
-        uint64_t count);
 
-__global__ static void moe_down_owned_packed_qwarp32_kernel(
-        float *packed_out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const int32_t *selected,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t expert_base,
-        uint32_t expert_count);
 
 __global__ static void moe_down_sum3_qwarp32_kernel(
         float *out,
@@ -4082,53 +3201,10 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
         uint32_t midq_blocks,
         uint32_t out_dim);
 
-__global__ static void moe_down_q4K_owned_slots_qwarp32_kernel(
-        float *down_out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const int32_t *selected,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t expert_base,
-        uint32_t expert_count);
 
-__global__ static void moe_down_q4K_owned_packed_qwarp32_kernel(
-        float *packed_out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const int32_t *selected,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t expert_base,
-        uint32_t expert_count);
 
-__global__ static void moe_owned_slots_combine_fixed3_kernel(
-        float *out,
-        const float *home_slots,
-        const float *peer_slots,
-        const int32_t *selected,
-        uint32_t out_dim,
-        uint32_t expert_split);
 
-__device__ static float moe_owned_packed_combine_row(
-        const float *home_slots,
-        const float *peer_packed,
-        const int32_t *selected,
-        uint32_t row,
-        uint32_t out_dim,
-        uint32_t expert_split);
 
-__global__ static void moe_owned_packed_combine_fixed3_kernel(
-        float *out,
-        const float *home_slots,
-        const float *peer_packed,
-        const int32_t *selected,
-        uint32_t out_dim,
-        uint32_t expert_split);
 
 __global__ static void moe_down_q4K_sum3_qwarp32_kernel(
         float *out,
@@ -4347,100 +3423,36 @@ __global__ static void moe_down_expert_tile16_rowspan_kernel(
         uint32_t n_expert,
         uint32_t atomic_out);
 
-extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
-        ds4_gpu_tensor *out,
-        ds4_gpu_tensor *gate,
-        ds4_gpu_tensor *up,
-        ds4_gpu_tensor *mid,
-        ds4_gpu_tensor *down,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint32_t gate_type,
-        uint32_t down_type,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t expert_in_dim,
-        uint32_t expert_mid_dim,
-        uint32_t out_dim,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t n_total_expert,
-        uint32_t n_expert,
-        uint32_t resident_expert_base,
-        uint32_t resident_expert_count,
-        float clamp,
-        const ds4_gpu_tensor *x,
-        ds4_gpu_tensor *down_output,
-        bool pack_fixed3,
-        ds4_gpu_tensor *shared_prequant);
 
-extern "C" int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
-        ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_slots,
-        const ds4_gpu_tensor *selected,
-        uint32_t out_dim,
-        uint32_t expert_split,
-        uint32_t rows);
 
-extern "C" int ds4_gpu_routed_moe_owned_slots_combine_tensor(
-        ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_slots,
-        const ds4_gpu_tensor *selected,
-        uint32_t out_dim,
-        uint32_t expert_split);
 
-extern "C" int ds4_gpu_routed_moe_owned_packed_combine_tensor(
-        ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_packed,
-        const ds4_gpu_tensor *selected,
-        uint32_t out_dim,
-        uint32_t expert_split);
 
-extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
-        const ds4_gpu_tensor *add_in,
-        uint32_t layer_index,
-        bool force_resident);
 
-extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident);
 
-extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
-        ds4_gpu_tensor *out,
-        ds4_gpu_tensor *gate,
-        ds4_gpu_tensor *up,
-        ds4_gpu_tensor *mid,
-        ds4_gpu_tensor *down,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint32_t gate_type,
-        uint32_t down_type,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t expert_in_dim,
-        uint32_t expert_mid_dim,
-        uint32_t out_dim,
-        ds4_gpu_tensor *selected,
-        ds4_gpu_tensor *weights,
-        uint32_t n_total_expert,
-        uint32_t n_expert,
-        uint32_t resident_expert_base,
-        uint32_t resident_expert_count,
-        float clamp,
-        const ds4_gpu_tensor *x,
-        uint32_t layer_index,
-        uint32_t n_tokens,
+extern "C" int ds4_gpu_routed_moe_one_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map,
+        uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
+        uint32_t layer_index);
+
+extern "C" int ds4_gpu_routed_moe_batch_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map,
+        uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens,
         bool *mid_is_f16);
 
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps);
@@ -4498,8 +3510,6 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
 
 extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc);
 
-extern "C" int ds4_gpu_hc_expand_add2_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *block_add2, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc);
-
 extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
@@ -4515,39 +3525,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-extern "C" int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
-        ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *shared_out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *shared_mid,
-        const ds4_gpu_tensor *routed_out,
-        const ds4_gpu_tensor *routed_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc);
 
-extern "C" int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(
-        ds4_gpu_tensor *out_hc,
-        ds4_gpu_tensor *shared_out,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t weight_offset,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        const ds4_gpu_tensor *shared_mid,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_packed,
-        const ds4_gpu_tensor *selected,
-        uint32_t expert_split,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t n_embd,
-        uint32_t n_hc);
 
 extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,
@@ -4562,44 +3540,9 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
-#if 0
 
-/* --gpu-vram auto probe. Defined here (in the .cu unit) so the
- * C-side parser (ds4_gpu_args.c) does not need to include
- * <cuda_runtime.h>. Returns 0 on success, nonzero on error
- * (errbuf populated). See ds4_gpu_args.h.
- *
- * Side-effect-light: changes cudaSetDevice during probing; callers
- * that care about the active device should reset it themselves
- * before continuing. (The mgpu init path resets it anyway.) */
-extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
-                                              int             filter_len,
-                                              ds4_gpu_config *out,
-                                              size_t          safety_margin_bytes,
-                                              char           *errbuf,
-                                              size_t          errbuflen);
-#endif
-#if 0
-
-typedef struct ds4_gpu_stream_expert_table {
-    const void *model_map;
-    uint64_t    model_size;
-    uint32_t    layer;
-    uint32_t    n_total_expert;
-    uint64_t    gate_offset;
-    uint64_t    up_offset;
-    uint64_t    down_offset;
-    uint64_t    gate_expert_bytes;
-    uint64_t    down_expert_bytes;
-} ds4_gpu_stream_expert_table;
-#endif
-
-/* Compatibility surface shared with the canonical Metal/ROCm graph. CUDA
- * either delegates to its equivalent primitive or reports an unavailable
- * optional fast path so the graph can use its established fallback. */
-extern "C" int ds4_gpu_commit_and_wait_selected_readback(
-        uint64_t event_value, const char *label);
-
+/* Compatibility hooks for optional CUDA graph fast paths. Each unavailable
+ * operation returns zero so the engine uses its established fallback. */
 extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 
 extern "C" int ds4_gpu_argmax_tensor(
@@ -4618,13 +3561,6 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
         const ds4_gpu_tensor *x,
         uint64_t n_tok);
 
-extern "C" int ds4_gpu_set_model_map_spans(
-        const void *model_map,
-        uint64_t model_size,
-        const uint64_t *offsets,
-        const uint64_t *sizes,
-        uint32_t count,
-        uint64_t max_tensor_bytes);
 
 extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
         ds4_gpu_tensor *out_h,
@@ -4645,20 +3581,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float freq_base, float freq_scale, float ext_factor,
         float attn_factor, float beta_fast, float beta_slow, float eps);
 
-extern "C" int ds4_gpu_attention_prefill_raw_heads_range_tensor(
-        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
-        uint64_t sinks_offset, const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv, uint32_t q_row0, uint32_t n_q,
-        uint32_t n_kv, uint32_t window, uint32_t n_head,
-        uint32_t head_dim);
 
-extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
-        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
-        uint64_t sinks_offset, const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv,
-        uint32_t comp_kv_f16, uint32_t q_row0, uint32_t n_q,
-        uint32_t n_tokens, uint32_t n_comp, uint32_t window,
-        uint32_t ratio, uint32_t n_head, uint32_t head_dim);
 
 extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
         ds4_gpu_tensor *out_h, ds4_gpu_tensor *low,

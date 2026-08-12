@@ -134,9 +134,9 @@ source runtime. The Makefile only builds the CUDA implementation.
 - Attention projection/shared-expert/output tensors: Q8 in the benchmark GGUF
 - Maximum tested allocated context: 1,048,576 tokens
 
-The build intentionally defines `DS4_CUDA_HAVE_MXF4=1` and
-`DS4_CUDA_SPARK_ONLY=1`. Compilation should fail rather than silently emit a
-portable fallback for another GPU generation.
+The build intentionally defines `DS4_CUDA_HAVE_MXF4=1` and targets fixed
+`sm_121a`; it should fail rather than silently emit a portable fallback for
+another GPU generation.
 
 ## Build
 

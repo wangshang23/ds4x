@@ -116,10 +116,6 @@ bool spec_frontier_commit_prefix(ds4_session *s, uint32_t prefix_len) {
     return ok;
 }
 
-static bool spec_frontier_commit_prefix1(ds4_session *s) {
-    return spec_frontier_commit_prefix(s, 1);
-}
-
 void session_greedy_splitkv_reset(ds4_session *s) {
     if (!s) return;
     s->greedy_splitkv_segment.len = 0;

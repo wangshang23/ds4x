@@ -1,7 +1,6 @@
 #include "engine_internal.h"
 
 /* Graph State module. */
-#ifndef DS4_NO_GPU
 /* This repository has one persistent-cache ABI: the native GB10 packed
  * representation. F32 is retained only for short-lived compressor staging. */
 
@@ -12,45 +11,10 @@
  * engine-owned set can be aliased by all resident session graphs. */
 
 
-/* Class P accessors. Each Class P kernel-scratch buffer is
- * replicated across every tier the placement uses; the active_tier field
- * names the slot the current dispatch step reads/writes. Single-tier paths
- * leave active_tier == 0 (byte-equivalent to the legacy single-tier
- * pointer). Multi-tier dispatch (wired up in B6) updates active_tier with
- * the current layer's home tier before each kernel-dispatch wrapper runs. */
+/* Class P accessors retain a one-element array ABI for uniform graph code.
+ * The single-GB10 runtime always uses active_tier zero. */
 
-#ifdef DS4_NO_GPU
-
-static inline int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
-static inline int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
-static inline void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
-static inline void ds4_gpu_decode_graphs_invalidate(void) {}
-static inline int ds4_gpu_moe_handoff_pack_tensor(
-        ds4_gpu_tensor       *packed,
-        const ds4_gpu_tensor *ffn_norm,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t              n_embd,
-        uint32_t              n_expert) {
-    (void)packed; (void)ffn_norm; (void)selected; (void)weights;
-    (void)n_embd; (void)n_expert; return 1;
-}
-static inline int ds4_gpu_q8_cache_suppressed(void) { return 0; }
-static inline void ds4_gpu_set_q8_cache_suppressed(int suppressed) { (void)suppressed; }
-static inline int ds4_gpu_set_decode_fast_attention(int enabled) {
-    (void)enabled;
-    return 0;
-}
-static inline int ds4_gpu_set_decode_score_vec4(int enabled) {
-    (void)enabled;
-    return 0;
-}
-#endif
-
-/* Upstream: --power N GPU duty-cycle throttling helpers. The single-tier
- * --power=100 path is a no-op; multi-tier inherits the same helpers via
- * graph_power_note_prefill_layer / graph_power_note_decode_token which we
- * call from the shared encode / decode loops. */
+/* --power N GPU duty-cycle throttling helpers. --power=100 is a no-op. */
 
 bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
     return g && g->power_percent > 0 && g->power_percent < 100;
@@ -89,17 +53,6 @@ void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) {
     graph_power_sleep(g->decode_token_avg_sec, g->power_percent);
 }
 
-static void metal_graph_copy_prefill_workspace_pointers(
-        ds4_gpu_graph       *dst,
-        const ds4_gpu_graph *src) {
-#define DS4_COPY_PREFILL_FIELD(name) \
-    memcpy(dst->name##_by_tier, src->name##_by_tier, \
-           sizeof(dst->name##_by_tier));
-    DS4_GPU_PREFILL_WORKSPACE_FIELDS(DS4_COPY_PREFILL_FIELD)
-#undef DS4_COPY_PREFILL_FIELD
-    dst->batch_q_half = src->batch_q_half;
-}
-
 static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
     if (!g || !g->owns_prefill_workspace) return;
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
@@ -114,7 +67,7 @@ static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
     g->owns_prefill_workspace = false;
 }
 
-/* Release every Metal tensor owned by the whole-model graph runtime. */
+/* Release every tensor owned by the whole-model CUDA graph runtime. */
 void metal_graph_free(ds4_gpu_graph *g) {
     /* Captured decode-island graphs bake this graph's buffer addresses
      * into their kernel nodes; retire them before the buffers go away. */
@@ -262,7 +215,7 @@ bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
  * =========================================================================
  *
  * A steering file contains one normalized 4096-wide direction per layer.  When
- * enabled, the Metal graph edits selected block outputs in-place:
+ * enabled, the CUDA graph edits selected block outputs in-place:
  *
  *     y = y - scale * v * dot(v, y)
  *
@@ -522,38 +475,28 @@ ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor_on(
         bool managed,
         int tier,
         uint64_t bytes) {
-    if (g_n_gpus <= 1) {
-        return managed ? ds4_gpu_tensor_alloc_managed(bytes)
-                       : ds4_gpu_tensor_alloc(bytes);
-    }
+    (void)tier;
     return managed ? ds4_gpu_tensor_alloc_managed_on(tier, bytes)
                    : ds4_gpu_tensor_alloc_ptr_on(tier, bytes);
-}
-
-static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
-    return metal_graph_alloc_kv_cache_tensor_on(managed, 0, bytes);
 }
 
 const metal_graph_debug_config *metal_graph_debug_get_config(void) {
     static metal_graph_debug_config cfg;
     if (!cfg.init) {
         cfg.init = 1;
-        cfg.prefix = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_PREFIX",
-                                         "DS4_METAL_GRAPH_DUMP_PREFIX");
+        cfg.prefix = ds4_graph_env_value("DS4_METAL_GRAPH_DUMP_PREFIX");
         if (cfg.prefix && !cfg.prefix[0]) cfg.prefix = NULL;
-        cfg.name = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_NAME",
-                                       "DS4_METAL_GRAPH_DUMP_NAME");
+        cfg.name = ds4_graph_env_value("DS4_METAL_GRAPH_DUMP_NAME");
         if (cfg.name && !cfg.name[0]) cfg.name = NULL;
 
-        const char *layer_env = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_LAYER",
-                                                    "DS4_METAL_GRAPH_DUMP_LAYER");
+        const char *layer_env =
+            ds4_graph_env_value("DS4_METAL_GRAPH_DUMP_LAYER");
         if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0) {
             cfg.layer_set = 1;
             cfg.layer = (uint32_t)strtoul(layer_env, NULL, 10);
         }
 
-        const char *pos_env = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_POS",
-                                                  "DS4_METAL_GRAPH_DUMP_POS");
+        const char *pos_env = ds4_graph_env_value("DS4_METAL_GRAPH_DUMP_POS");
         if (pos_env && pos_env[0]) {
             cfg.pos_set = 1;
             cfg.pos = (uint32_t)strtoul(pos_env, NULL, 10);
@@ -582,8 +525,7 @@ void metal_graph_debug_dump_tensor(
         uint32_t          il,
         uint32_t          pos) {
     const char *prefix = metal_graph_debug_prefix_for(name, il, pos);
-    if (glm_graph_env_present("DS4_ROCM_GRAPH_DUMP_TRACE",
-                              "DS4_METAL_GRAPH_DUMP_TRACE"))
+    if (ds4_graph_env_present("DS4_METAL_GRAPH_DUMP_TRACE"))
         fprintf(stderr, "ds4: dump? name=%s il=%u pos=%u t=%p n=%llu wants=%d\n",
                 name, il, pos, (void *)t, (unsigned long long)n_f32,
                 metal_graph_debug_wants(name, il, pos));
@@ -605,7 +547,7 @@ void metal_graph_debug_dump_tensor(
     free(buf);
 
     if (ds4_gpu_begin_commands() == 0) {
-        fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
+        fprintf(stderr, "ds4: failed to resume CUDA command batch after dumping %s layer %u pos %u\n", name, il, pos);
     }
 }
 
@@ -615,8 +557,7 @@ void metal_graph_debug_dump_f16_tensor(
         uint64_t          n_f16,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_PREFIX",
-                                             "DS4_METAL_GRAPH_DUMP_PREFIX");
+    const char *prefix = ds4_graph_env_value("DS4_METAL_GRAPH_DUMP_PREFIX");
     if (!t || n_f16 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
 
     if (ds4_gpu_synchronize() == 0) {
@@ -638,7 +579,7 @@ void metal_graph_debug_dump_f16_tensor(
     free(hbuf);
 
     if (ds4_gpu_begin_commands() == 0) {
-        fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
+        fprintf(stderr, "ds4: failed to resume CUDA command batch after dumping %s layer %u pos %u\n", name, il, pos);
     }
 }
 
@@ -672,7 +613,7 @@ void metal_graph_debug_dump_i32_tensor(
     free(buf);
 
     if (ds4_gpu_begin_commands() == 0) {
-        fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
+        fprintf(stderr, "ds4: failed to resume CUDA command batch after dumping %s layer %u pos %u\n", name, il, pos);
     }
 }
 
@@ -714,88 +655,31 @@ static bool metal_graph_tp_env_flag(const char *name, bool dflt) {
     return strcmp(env, "0") != 0;
 }
 
-static bool metal_graph_cuda_greedy_split_top1_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    const char *no = getenv("DS4_CUDA_NO_GREEDY_SPLIT_TOP1");
-    if (no && no[0] && strcmp(no, "0") != 0) return false;
-    return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_SPLIT_TOP1", false);
-#endif
-}
-
-static bool metal_graph_cuda_output_fused_top1_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_OUTPUT_FUSED_TOP1", false);
-#endif
-}
-
-static bool metal_graph_cuda_verify_decode2_split_top1_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    const char *no = getenv("DS4_CUDA_NO_VERIFY_DECODE2_SPLIT_TOP1");
-    if (no && no[0] && strcmp(no, "0") != 0) return false;
-    return metal_graph_tp_env_flag("DS4_CUDA_VERIFY_DECODE2_SPLIT_TOP1", false);
-#endif
-}
-
 bool metal_graph_cuda_greedy_splitkv_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
     const char *no = getenv("DS4_CUDA_NO_GREEDY_SPLITKV");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_SPLITKV", false);
-#endif
 }
 
 bool metal_graph_cuda_greedy_vec4_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
     const char *no = getenv("DS4_CUDA_NO_GREEDY_VEC4");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_VEC4", false);
-#endif
 }
 
 bool metal_graph_cuda_splitkv_spec_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
     const char *no = getenv("DS4_CUDA_NO_SPLITKV_SPEC");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_SPLITKV_SPEC", false);
-#endif
-}
-
-static bool metal_graph_cuda_splitkv_spec_toponly_row0_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    const char *no = getenv("DS4_CUDA_NO_SPLITKV_SPEC_TOPONLY_ROW0");
-    if (no && no[0] && strcmp(no, "0") != 0) return false;
-    return metal_graph_tp_env_flag("DS4_CUDA_SPLITKV_SPEC_TOPONLY_ROW0", false);
-#endif
 }
 
 bool metal_graph_cuda_splitkv_spec_batch_verify_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
     const char *no = getenv("DS4_CUDA_NO_SPLITKV_SPEC_BATCH_VERIFY");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_SPLITKV_SPEC_BATCH_VERIFY", false);
-#endif
 }
 
 static float metal_graph_cuda_greedy_vec4_margin_threshold(void) {
-#if defined(__APPLE__)
-    return 0.0f;
-#else
     const char *env = getenv("DS4_CUDA_GREEDY_VEC4_MARGIN");
     if (env && env[0]) {
         char *end = NULL;
@@ -809,23 +693,15 @@ static float metal_graph_cuda_greedy_vec4_margin_threshold(void) {
                 env);
     }
     return 0.25f;
-#endif
 }
 
 bool metal_graph_cuda_greedy_vec4_fallback_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
     const char *no = getenv("DS4_CUDA_NO_GREEDY_VEC4_FALLBACK");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_cuda_greedy_vec4_margin_threshold() > 0.0f;
-#endif
 }
 
 static float metal_graph_cuda_greedy_splitkv_margin_threshold(void) {
-#if defined(__APPLE__)
-    return 0.0f;
-#else
     const char *env = getenv("DS4_CUDA_GREEDY_SPLITKV_MARGIN");
     if (env && env[0]) {
         char *end = NULL;
@@ -839,111 +715,21 @@ static float metal_graph_cuda_greedy_splitkv_margin_threshold(void) {
                 env);
     }
     return 0.25f;
-#endif
 }
 
 bool metal_graph_cuda_greedy_splitkv_fallback_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
     const char *no = getenv("DS4_CUDA_NO_GREEDY_SPLITKV_FALLBACK");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_cuda_greedy_splitkv_margin_threshold() > 0.0f;
-#endif
-}
-
-static bool metal_graph_cuda_greedy_splitkv_top2_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    const char *no = getenv("DS4_CUDA_NO_GREEDY_SPLITKV_TOP2");
-    if (no && no[0] && strcmp(no, "0") != 0) return false;
-    return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_SPLITKV_TOP2", true);
-#endif
-}
-
-static bool metal_graph_cuda_greedy_splitkv_trust_replay_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_SPLITKV_TRUST_REPLAY", false);
-#endif
-}
-
-static bool metal_graph_cuda_greedy_splitkv_pair_replay_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    const char *no = getenv("DS4_CUDA_NO_GREEDY_SPLITKV_PAIR_REPLAY");
-    if (no && no[0] && strcmp(no, "0") != 0) return false;
-    return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_SPLITKV_PAIR_REPLAY", false);
-#endif
-}
-
-static DS4_MAYBE_UNUSED uint32_t metal_graph_cuda_greedy_max_segment(const char *name) {
-    const char *env = getenv(name);
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(env, &end, 10);
-        while (end && isspace((unsigned char)*end)) end++;
-        if (end != env && end && *end == '\0' && v <= INT32_MAX) {
-            return (uint32_t)v;
-        }
-        fprintf(stderr,
-                "ds4: invalid %s=%s; expected 0..%d, using disabled\n",
-                name,
-                env,
-                INT32_MAX);
-    }
-    return 0;
-}
-
-static uint32_t metal_graph_cuda_greedy_splitkv_max_segment(void) {
-#if defined(__APPLE__)
-    return 0;
-#else
-    return metal_graph_cuda_greedy_max_segment("DS4_CUDA_GREEDY_SPLITKV_MAX_SEGMENT");
-#endif
-}
-
-static uint32_t metal_graph_cuda_greedy_vec4_max_segment(void) {
-#if defined(__APPLE__)
-    return 0;
-#else
-    return metal_graph_cuda_greedy_max_segment("DS4_CUDA_GREEDY_VEC4_MAX_SEGMENT");
-#endif
-}
-
-static uint32_t metal_graph_cuda_greedy_splitkv_min_score(void) {
-    const char *env = getenv("DS4_CUDA_SPLITKV_MIN_SCORE");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(env, &end, 10);
-        while (end && isspace((unsigned char)*end)) end++;
-        if (end != env && end && *end == '\0' && v <= UINT32_MAX) {
-            return (uint32_t)v;
-        }
-    }
-    return metal_graph_tp_env_flag("DS4_CUDA_SPLITKV_DECODE", false) ? 0u : 512u;
 }
 
 bool metal_graph_cuda_q_norm_rope_fuse_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
     return metal_graph_tp_env_flag("DS4_CUDA_Q_NORM_ROPE_FUSE", true);
-#endif
 }
 
 bool metal_graph_cuda_qkv_kv_rope_fuse_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
     const char *no = getenv("DS4_CUDA_NO_QKV_KV_ROPE_FUSE");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     if (getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") != NULL) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_QKV_KV_ROPE_FUSE", true);
-#endif
 }
-
-#endif /* !DS4_NO_GPU */

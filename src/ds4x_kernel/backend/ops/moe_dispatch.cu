@@ -78,45 +78,6 @@ __global__ static void moe_down_sorted_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
 
-__global__ static DS4_CUDA_UNUSED void moe_down_expert_tile8_kernel(
-        float *down_out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t n_expert) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t group = threadIdx.x >> 3u;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t pair_slot = group & 7u;
-    uint32_t row_lane = group >> 3u;
-    uint32_t expert = tile_experts[tile];
-    uint32_t local_pair = tile_starts[tile] + pair_slot;
-    if (local_pair >= counts[expert]) return;
-    uint32_t sorted_idx = offsets[expert] + local_pair;
-    uint32_t pair = sorted_pairs[sorted_idx];
-    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
-
-    for (uint32_t rr = 0; rr < 2u; rr++) {
-        uint32_t row = blockIdx.x * 8u + row_lane + rr * 4u;
-        if (row >= out_dim) continue;
-        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
-        float acc = 0.0f;
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
-        acc = quarter_warp_sum_f32(acc, lane);
-        if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
-    }
-}
-
 __global__ static void moe_down_expert_tile4_row32_kernel(
         float *down_out,
         const char *down_base,
@@ -425,30 +386,6 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
     out[gid] = acc;
 }
 
-__global__ static void moe_sum_owned_kernel(
-        float *out,
-        const float *down,
-        const int32_t *selected,
-        uint32_t out_dim,
-        uint32_t n_expert,
-        uint32_t n_tokens) {
-    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t n = (uint64_t)n_tokens * out_dim;
-    if (gid >= n) return;
-    const uint32_t tok = (uint32_t)(gid / out_dim);
-    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim);
-    float acc = 0.0f;
-    #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
-        if (slot >= n_expert) break;
-        const uint64_t pair = (uint64_t)tok * n_expert + slot;
-        const float value = selected[pair] >= 0
-            ? down[pair * out_dim + row] : 0.0f;
-        acc = __fadd_rn(acc, value);
-    }
-    out[gid] = acc;
-}
-
 __device__ static float dev_iq2_xxs_dot_f32(const cuda_block_iq2_xxs *row, const float *x, uint32_t nb) {
     float acc = 0.0f;
     for (uint32_t b = 0; b < nb; b++) {
@@ -627,10 +564,7 @@ static int routed_moe_launch(
         float clamp,
         const ds4_gpu_tensor *x,
         uint32_t layer_index,
-        uint32_t n_tokens,
-        int allow_streaming,
-        int owned_filtered) {
-    (void)allow_streaming;
+        uint32_t n_tokens) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -653,8 +587,8 @@ static int routed_moe_launch(
     /* The aligned artifacts replace the raw expert tensors on integrated
      * CUDA systems.  Route both prefill and decode before resolving a raw
      * pointer, otherwise the fallback cache would duplicate tens of GiB. */
-    if (iq2_path && !owned_filtered &&
-        cuda_aligned_iq2_enabled() && cuda_aligned_q2k_enabled()) {
+    if (iq2_path && cuda_aligned_iq2_enabled() &&
+        cuda_aligned_q2k_enabled()) {
         const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
         const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
         const uint64_t gate_aligned_bytes = ds4_mmq_iq2_xxs_aligned_bytes(
@@ -824,9 +758,7 @@ static int routed_moe_launch(
                 moe_mmq_sum_kernel<<<
                     (uint32_t)((n + 255u) / 256u), 256, 0, stream>>>(
                     (float *)out->ptr, (const float *)down->ptr,
-                    owned_filtered
-                        ? (const int32_t *)mx_selected->ptr
-                        : NULL,
+                    NULL,
                     out_dim, n_expert, n_tokens, /*guard_nonfinite=*/1);
                 rc = cuda_ok(cudaGetLastError(),
                              "mxfp4 moe sum launch") ? 0 : -1;
@@ -847,7 +779,7 @@ static int routed_moe_launch(
      * [n_tokens, n_expert, *] by the validation above.  Any entry
      * failure falls through to the legacy sorted-pairs path (the
      * buffers are scratch there too). */
-    if (iq2_path && n_tokens > 1u && !owned_filtered && cuda_use_mmq()) {
+    if (iq2_path && n_tokens > 1u && cuda_use_mmq()) {
         const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
         const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
         const int mmq_tier = ds4_tensor_device_idx(out);
@@ -901,8 +833,6 @@ static int routed_moe_launch(
      *                  + moe_down_q4K_sum6_qwarp32.
      *   n_tokens == 1 and n_expert == 3:
      *                  use the same direct path with moe_down_q4K_sum3_qwarp32.
-     *                  Decode TP relies on this for splitting the six selected
-     *                  experts into two groups.
      *   n_tokens == 1 and other n_expert:
      *                  use the same per-pair gate/up kernel plus the generic
      *                  q4K down + sum path.
@@ -951,41 +881,33 @@ static int routed_moe_launch(
         const uint32_t pair_count = n_tokens * n_expert;
         const uint32_t use_q4_sorted_pairs =
             q4k_path && n_tokens > 1u &&
-            (owned_filtered ||
-             (getenv("DS4_CUDA_MOE_NO_Q4_SORTED") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL &&
-              getenv("DS4_CUDA_MOE_TILE4") == NULL));
+            getenv("DS4_CUDA_MOE_NO_Q4_SORTED") == NULL &&
+            getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL &&
+            getenv("DS4_CUDA_MOE_TILE4") == NULL;
         const uint32_t use_sorted_pairs =
-            n_tokens > 1u &&
-            (owned_filtered || !q4k_path || use_q4_sorted_pairs);
+            n_tokens > 1u && (!q4k_path || use_q4_sorted_pairs);
         const uint32_t use_expert_tiles =
             use_sorted_pairs &&
-            (owned_filtered || getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL);
-        const uint32_t q4_owned_batch =
-            owned_filtered && q4k_path && n_tokens >= 4u && n_tokens <= 16u;
+            getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
         /* Small batches (DSpark stage chain / verify, n<=8) leave most of an
          * 8-slot expert tile empty (1-2 rows per expert): tile4 halves the
-         * wasted dot-slots and measures ~2x faster there. Q4 TP batches use
-         * tile8 because its exact tensor-core row-span kernels recover more
-         * than the empty slots cost. Large prefill also keeps tile8. */
+         * wasted dot-slots and measures ~2x faster there. Large prefill uses
+         * tile8 because its tensor-core row-span kernels amortize better. */
         const uint32_t expert_tile_m =
             getenv("DS4_CUDA_MOE_TILE4") ? 4u :
             (getenv("DS4_CUDA_MOE_TILE8") ? 8u :
-             (q4_owned_batch || n_tokens > 8u ? 8u : 4u));
+             (n_tokens > 8u ? 8u : 4u));
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
         const uint32_t use_p2_sorted =
-            use_sorted_pairs && !owned_filtered &&
-            getenv("DS4_CUDA_MOE_NO_P2") == NULL;
+            use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_P2") == NULL;
         const uint32_t use_atomic_down = !q4k_path && use_expert_tiles &&
             (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
              (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));
-        const uint32_t use_owned_sparse_buffers = owned_filtered &&
-            getenv("DS4_CUDA_MOE_NO_OWNED_SPARSE_BUFFERS") == NULL;
         const uint32_t use_gate_row2048 = use_expert_tiles && expert_tile_m == 8u &&
             (getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ||
              getenv("DS4_CUDA_MOE_GATE_ROW256") != NULL ||
              getenv("DS4_CUDA_MOE_GATE_ROW128") != NULL ||
-             ((q4_owned_batch || n_tokens >= 128u) &&
+             (n_tokens >= 128u &&
               getenv("DS4_CUDA_MOE_NO_GATE_ROW2048") == NULL &&
               getenv("DS4_CUDA_MOE_NO_GATE_ROW256") == NULL &&
               getenv("DS4_CUDA_MOE_NO_GATE_ROW128") == NULL));
@@ -994,17 +916,13 @@ static int routed_moe_launch(
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL;
         const uint32_t use_down_tile16 = !q4k_path && use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
-        const uint32_t use_small_sorted_prep =
-            owned_filtered && q4k_path && n_tokens <= 16u && pair_count <= 96u &&
-            n_total_expert <= 128u && use_sorted_pairs && use_expert_tiles &&
-            getenv("DS4_CUDA_MOE_NO_SMALL_SORTED_PREP") == NULL;
         const uint32_t force_q4_down_rowspan =
             getenv("DS4_CUDA_MOE_DOWN_ROW512") != NULL ||
             getenv("DS4_CUDA_MOE_DOWN_ROW1024") != NULL ||
             getenv("DS4_CUDA_MOE_DOWN_ROW2048") != NULL;
         const uint32_t use_q4_down_rowspan =
             q4k_path && use_expert_tiles && expert_tile_m == 8u &&
-            (q4_owned_batch || n_tokens >= 128u || force_q4_down_rowspan) &&
+            (n_tokens >= 128u || force_q4_down_rowspan) &&
             getenv("DS4_CUDA_MOE_NO_Q4_DOWN_ROWSPAN") == NULL;
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u &&
@@ -1064,7 +982,6 @@ static int routed_moe_launch(
             getenv("DS4_CUDA_MOE_NO_MIDQ_SIDECAR") == NULL;
         float *midq_sidecar = use_q4_midq_sidecar ? (float *)up->ptr : NULL;
         if (g_cuda_moe_decode_graph &&
-            !owned_filtered &&
             !profile_moe &&
             q4k_path &&
             n_tokens == 1u &&
@@ -1160,20 +1077,9 @@ static int routed_moe_launch(
                 tile16_total = (use_down_tile16 || use_q4_mma_tiles16) ? (uint32_t *)(scratch + tile16_total_off) : NULL;
                 tile16_experts = (use_down_tile16 || use_q4_mma_tiles16) ? (uint32_t *)(scratch + tile16_experts_off) : NULL;
                 tile16_starts = (use_down_tile16 || use_q4_mma_tiles16) ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
-                if (use_small_sorted_prep) {
-                    moe_prepare_sorted_tiles_small_kernel<<<1, 128, 0, cuda_decode_stream()>>>(
-                        counts, offsets, cursors, sorted_pairs,
-                        tile_offsets, tile_total, tile_experts, tile_starts,
-                        tile16_offsets, tile16_total, tile16_experts, tile16_starts,
-                        (const int32_t *)selected->ptr, pair_count, n_total_expert,
-                        expert_tile_m, use_down_tile16 || use_q4_mma_tiles16);
-                    ok = cuda_ok(cudaGetLastError(),
-                                 "routed_moe small sorted setup launch");
-                } else {
-                    ok = cuda_ok(cudaMemset(counts, 0, counts_bytes),
-                                 "routed_moe sorted counts clear");
-                }
-                if (ok && !use_small_sorted_prep) {
+                ok = cuda_ok(cudaMemset(counts, 0, counts_bytes),
+                             "routed_moe sorted counts clear");
+                if (ok) {
                     moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
                         counts,
                         (const int32_t *)selected->ptr,
@@ -1181,11 +1087,11 @@ static int routed_moe_launch(
                         n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
                 }
-                if (ok && !use_small_sorted_prep) {
+                if (ok) {
                     moe_prefix_sorted_pairs_kernel<<<1, 1, 0, cuda_decode_stream()>>>(offsets, cursors, counts, n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
                 }
-                if (ok && !use_small_sorted_prep) {
+                if (ok) {
                     moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
                         sorted_pairs,
                         cursors,
@@ -1194,21 +1100,21 @@ static int routed_moe_launch(
                         n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
-                if (ok && use_expert_tiles && !use_small_sorted_prep) {
+                if (ok && use_expert_tiles) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1, 0, cuda_decode_stream()>>>(tile_offsets, tile_total, counts, expert_tile_m, n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
                 }
-                if (ok && use_expert_tiles && !use_small_sorted_prep) {
+                if (ok && use_expert_tiles) {
                     moe_build_expert_tiles_kernel<<<(n_total_expert + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
                         tile_experts, tile_starts, tile_offsets, counts, expert_tile_m, n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
                 }
-                if (ok && use_expert_tiles && !use_small_sorted_prep &&
+                if (ok && use_expert_tiles &&
                     (use_down_tile16 || use_q4_mma_tiles16)) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1, 0, cuda_decode_stream()>>>(tile16_offsets, tile16_total, counts, 16u, n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
                 }
-                if (ok && use_expert_tiles && !use_small_sorted_prep &&
+                if (ok && use_expert_tiles &&
                     (use_down_tile16 || use_q4_mma_tiles16)) {
                     moe_build_expert_tiles_kernel<<<(n_total_expert + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
                         tile16_experts, tile16_starts, tile16_offsets, counts, 16u, n_total_expert);
@@ -1217,13 +1123,6 @@ static int routed_moe_launch(
             }
         }
         if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
-        if (ok && owned_filtered && use_sorted_pairs &&
-            !use_owned_sparse_buffers) {
-            const uint64_t mid_bytes =
-                (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float);
-            ok = cuda_ok(cudaMemset(mid->ptr, 0, (size_t)mid_bytes),
-                         "owned routed_moe mid clear");
-        }
         if (ok) {
             dim3 mgrid((expert_mid_dim + 31u) / 32u, n_tokens * n_expert, 1);
             if (ok && sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts && tile_total && tile_experts && tile_starts) {
@@ -1598,30 +1497,12 @@ static int routed_moe_launch(
                         expert_mid_dim,
                         n_tokens * n_expert);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe mid sidecar quantize launch");
-            } else if (use_owned_sparse_buffers) {
-                q8_K_quantize_owned_kernel<<<midq_grid, 256, 0, cuda_decode_stream()>>>(
-                        midq,
-                        (const float *)mid->ptr,
-                        (const int32_t *)selected->ptr,
-                        expert_mid_dim,
-                        n_tokens * n_expert,
-                        0u,
-                        n_total_expert);
-                ok = cuda_ok(cudaGetLastError(),
-                             "owned routed_moe active mid quantize launch");
             } else {
                 q8_K_quantize_kernel<<<midq_grid, 256, 0, cuda_decode_stream()>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
             }
         }
         if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
-        if (ok && owned_filtered && use_sorted_pairs && !use_atomic_down &&
-            !use_owned_sparse_buffers) {
-            const uint64_t down_clear_bytes =
-                (uint64_t)n_tokens * n_expert * out_dim * sizeof(float);
-            ok = cuda_ok(cudaMemset(down->ptr, 0, (size_t)down_clear_bytes),
-                         "owned routed_moe down clear");
-        }
         if (ok) {
             dim3 dgrid((out_dim + 31u) / 32u, n_tokens * n_expert, 1);
             uint32_t *down_tile_total = tile_total;
@@ -1893,22 +1774,12 @@ static int routed_moe_launch(
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
         if (ok && !use_atomic_down && !use_direct_down_sum) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            if (use_owned_sparse_buffers) {
-                moe_sum_owned_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>(
-                        (float *)out->ptr,
-                        (const float *)down->ptr,
-                        (const int32_t *)selected->ptr,
-                        out_dim,
-                        n_expert,
-                        n_tokens);
-            } else {
-                moe_sum_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>(
-                        (float *)out->ptr,
-                        (const float *)down->ptr,
-                        out_dim,
-                        n_expert,
-                        n_tokens);
-            }
+            moe_sum_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>(
+                    (float *)out->ptr,
+                    (const float *)down->ptr,
+                    out_dim,
+                    n_expert,
+                    n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         if (prof_ev[6]) {
@@ -1972,409 +1843,9 @@ static int routed_moe_launch(
     return ok;
 }
 
-extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
-        ds4_gpu_tensor *out,
-        ds4_gpu_tensor *gate,
-        ds4_gpu_tensor *up,
-        ds4_gpu_tensor *mid,
-        ds4_gpu_tensor *down,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint32_t gate_type,
-        uint32_t down_type,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t expert_in_dim,
-        uint32_t expert_mid_dim,
-        uint32_t out_dim,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t n_total_expert,
-        uint32_t n_expert,
-        uint32_t resident_expert_base,
-        uint32_t resident_expert_count,
-        float clamp,
-        const ds4_gpu_tensor *x,
-        ds4_gpu_tensor *down_output,
-        bool pack_fixed3,
-        ds4_gpu_tensor *shared_prequant) {
-    if (!out || !gate || !up || !mid || !down || !model_map ||
-        !selected || !weights || !x || n_expert != 6u ||
-        n_total_expert == 0u || resident_expert_count == 0u ||
-        gate_expert_bytes == 0u || gate_row_bytes == 0u ||
-        down_expert_bytes == 0u || down_row_bytes == 0u ||
-        resident_expert_base >= n_total_expert ||
-        resident_expert_count > n_total_expert - resident_expert_base ||
-        expert_in_dim % CUDA_QK_K != 0u ||
-        expert_mid_dim % CUDA_QK_K != 0u ||
-        selected->bytes < 6u * sizeof(int32_t) ||
-        weights->bytes < 6u * sizeof(float) ||
-        x->bytes < (uint64_t)expert_in_dim * sizeof(float) ||
-        mid->bytes < 6ull * expert_mid_dim * sizeof(float) ||
-        out->bytes < (uint64_t)out_dim * sizeof(float)) {
-        return 0;
-    }
-    if (pack_fixed3 && resident_expert_base == 0u) return 0;
-    const bool q4k_path = gate_type == 12u && down_type == 12u;
-    const bool mxfp4_path = gate_type == 39u && down_type == 39u;
-    if (!q4k_path && !mxfp4_path &&
-        (gate_type != 16u || down_type != 10u)) {
-        return 0;
-    }
-    if (q4k_path && getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL) {
-        fprintf(stderr, "ds4: CUDA owned Q4 decode does not support gate/up auxiliary output\n");
-        return 0;
-    }
-    if (!q4k_path && !mxfp4_path &&
-        getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") != NULL) {
-        fprintf(stderr, "ds4: CUDA owned IQ2 decode requires the LUT gate path\n");
-        return 0;
-    }
-    const bool write_aux =
-        !q4k_path && !mxfp4_path &&
-        getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
-
-    if (resident_expert_base > UINT64_MAX / gate_expert_bytes ||
-        resident_expert_count > UINT64_MAX / gate_expert_bytes ||
-        resident_expert_base > UINT64_MAX / down_expert_bytes ||
-        resident_expert_count > UINT64_MAX / down_expert_bytes) {
-        return 0;
-    }
-    const uint64_t gate_shift = (uint64_t)resident_expert_base * gate_expert_bytes;
-    const uint64_t down_shift = (uint64_t)resident_expert_base * down_expert_bytes;
-    const uint64_t gate_bytes = (uint64_t)resident_expert_count * gate_expert_bytes;
-    const uint64_t down_bytes = (uint64_t)resident_expert_count * down_expert_bytes;
-    if (gate_offset > model_size || gate_shift > model_size - gate_offset ||
-        gate_bytes > model_size - gate_offset - gate_shift ||
-        up_offset > model_size || gate_shift > model_size - up_offset ||
-        gate_bytes > model_size - up_offset - gate_shift ||
-        down_offset > model_size || down_shift > model_size - down_offset ||
-        down_bytes > model_size - down_offset - down_shift) {
-        return 0;
-    }
-
-    const int logical_tier = ds4_tensor_device_idx(out);
-    const char *gate_w = (const char *)cuda_resolve_weight_ptr(
-            model_map, gate_offset + gate_shift, gate_bytes,
-            logical_tier, "moe_owned_gate");
-    const char *up_w = (const char *)cuda_resolve_weight_ptr(
-            model_map, up_offset + gate_shift, gate_bytes,
-            logical_tier, "moe_owned_up");
-    const char *down_w = (const char *)cuda_resolve_weight_ptr(
-            model_map, down_offset + down_shift, down_bytes,
-            logical_tier, "moe_owned_down");
-    if (!gate_w || !up_w || !down_w) return 0;
-
-    const uint64_t down_output_bytes =
-        (uint64_t)(pack_fixed3 ? 4u : 6u) * out_dim * sizeof(float);
-    if (mxfp4_path) {
-        const uint64_t slot_bytes = 6ull * out_dim * sizeof(float);
-        if (!cuda_use_mxfp4_mmq() ||
-            gate->bytes < 6u * sizeof(int32_t) ||
-            up->bytes < 6u * sizeof(float) ||
-            down->bytes < slot_bytes ||
-            (down_output && down_output->bytes < down_output_bytes)) {
-            return 0;
-        }
-
-        cudaStream_t stream = cuda_decode_stream();
-        int32_t *local_ids = (int32_t *)gate->ptr;
-        float *local_weights = (float *)up->ptr;
-        mxfp4_prepare_owned_assignments_kernel<<<1, 32, 0, stream>>>(
-                local_ids,
-                local_weights,
-                (const int32_t *)selected->ptr,
-                (const float *)weights->ptr,
-                resident_expert_base,
-                resident_expert_count);
-        if (!cuda_ok(cudaGetLastError(),
-                     "owned MXFP4 assignment prepare launch")) {
-            return 0;
-        }
-        if (ds4_mmq_mxfp4_moe_gate_up_mid_vec(
-                    gate_w,
-                    up_w,
-                    (const float *)x->ptr,
-                    local_ids,
-                    local_weights,
-                    (float *)mid->ptr,
-                    expert_mid_dim,
-                    expert_in_dim,
-                    1,
-                    resident_expert_count,
-                    6,
-                    clamp,
-                    stream) != 0) {
-            return 0;
-        }
-
-        if (ds4_mmq_mxfp4_moe_vec(
-                    down_w,
-                    (const float *)mid->ptr,
-                    local_ids,
-                    (float *)down->ptr,
-                    out_dim,
-                    expert_mid_dim,
-                    6,
-                    resident_expert_count,
-                    1,
-                    stream) != 0) {
-            return 0;
-        }
-        if (pack_fixed3) {
-            float *packed_dst = down_output
-                ? (float *)down_output->ptr
-                : (float *)down->ptr;
-            moe_down_owned_pack_f32_slots_kernel<<<
-                    (out_dim + 255u) / 256u, 256, 0, stream>>>(
-                    packed_dst,
-                    (const float *)down->ptr,
-                    (const int32_t *)selected->ptr,
-                    out_dim,
-                    resident_expert_base,
-                    resident_expert_count);
-            if (!cuda_ok(cudaGetLastError(),
-                         "owned MXFP4 down pack launch")) {
-                return 0;
-            }
-        } else if (down_output) {
-            const uint64_t slot_count = 6ull * out_dim;
-            moe_down_owned_copy_f32_slots_kernel<<<
-                    (slot_count + 255u) / 256u, 256, 0, stream>>>(
-                    (float *)down_output->ptr,
-                    (const float *)down->ptr,
-                    slot_count);
-            if (!cuda_ok(cudaGetLastError(),
-                         "owned MXFP4 down peer copy launch")) {
-                return 0;
-            }
-        }
-        return 1;
-    }
-
-    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
-    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
-    const uint64_t xq_bytes = (uint64_t)xq_blocks * sizeof(cuda_block_q8_K);
-    const uint64_t midq_bytes = 6ull * midq_blocks * sizeof(cuda_block_q8_K);
-    const uint64_t aux_bytes = 6ull * expert_mid_dim * sizeof(float);
-    const uint64_t shared_q8_blocks = expert_in_dim / 32u;
-    const uint64_t shared_q8_bytes = shared_q8_blocks * 32u;
-    const uint64_t shared_scale_offset =
-        (shared_q8_bytes + 15u) & ~15ull;
-    const uint64_t shared_prequant_bytes =
-        shared_scale_offset + shared_q8_blocks * sizeof(float);
-    if (down->bytes < xq_bytes || down->bytes < down_output_bytes ||
-        (down_output && down_output->bytes < down_output_bytes) ||
-        gate->bytes < midq_bytes ||
-        (shared_prequant &&
-         (shared_prequant->bytes < shared_prequant_bytes ||
-          ds4_tensor_device_idx(shared_prequant) != logical_tier)) ||
-        (write_aux && (gate->bytes < aux_bytes || up->bytes < aux_bytes))) {
-        return 0;
-    }
-    float *down_dst = (float *)(down_output ? down_output->ptr : down->ptr);
-    cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
-    cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
-
-    dim3 xq_grid(xq_blocks, 1, 1);
-    if (shared_prequant) {
-        int8_t *shared_xq = (int8_t *)shared_prequant->ptr;
-        float *shared_scale = (float *)((char *)shared_prequant->ptr +
-                                        shared_scale_offset);
-        q8_K_q8_0_quantize_kernel<<<xq_grid, 256>>>(
-                xq, shared_xq, shared_scale, (const float *)x->ptr,
-                expert_in_dim, 1u);
-    } else {
-        q8_K_quantize_kernel<<<xq_grid, 256>>>(
-                xq, (const float *)x->ptr, expert_in_dim, 1u);
-    }
-    if (!cuda_ok(cudaGetLastError(), "owned routed_moe x quantize launch")) return 0;
-
-    if (q4k_path) {
-        dim3 gate_grid((expert_mid_dim + 7u) / 8u, 6u, 1u);
-        moe_gate_up_mid_decode_q4K_owned_warp32_noaux_kernel<<<gate_grid, 256>>>(
-                (float *)mid->ptr,
-                gate_w,
-                up_w,
-                xq,
-                (const int32_t *)selected->ptr,
-                (const float *)weights->ptr,
-                gate_expert_bytes,
-                gate_row_bytes,
-                xq_blocks,
-                expert_mid_dim,
-                6u,
-                resident_expert_base,
-                resident_expert_count,
-                clamp);
-    } else {
-        dim3 gate_grid((expert_mid_dim + 31u) / 32u, 6u, 1u);
-        moe_gate_up_mid_decode_lut_owned_qwarp32_kernel<<<gate_grid, 256>>>(
-                (float *)gate->ptr,
-                (float *)up->ptr,
-                (float *)mid->ptr,
-                gate_w,
-                up_w,
-                xq,
-                (const int32_t *)selected->ptr,
-                (const float *)weights->ptr,
-                gate_expert_bytes,
-                gate_row_bytes,
-                xq_blocks,
-                expert_mid_dim,
-                6u,
-                resident_expert_base,
-                resident_expert_count,
-                write_aux,
-                clamp);
-    }
-    if (!cuda_ok(cudaGetLastError(), "owned routed_moe gate/up launch")) return 0;
-
-    dim3 midq_grid(midq_blocks, 6u, 1u);
-    q8_K_quantize_owned_kernel<<<midq_grid, 256>>>(
-            midq,
-            (const float *)mid->ptr,
-            (const int32_t *)selected->ptr,
-            expert_mid_dim,
-            6u,
-            resident_expert_base,
-            resident_expert_count);
-    if (!cuda_ok(cudaGetLastError(), "owned routed_moe mid quantize launch")) return 0;
-
-    dim3 down_grid((out_dim + 31u) / 32u, pack_fixed3 ? 4u : 6u, 1u);
-    if (q4k_path && pack_fixed3) {
-        moe_down_q4K_owned_packed_qwarp32_kernel<<<down_grid, 256>>>(
-                down_dst,
-                down_w,
-                midq,
-                (const int32_t *)selected->ptr,
-                down_expert_bytes,
-                down_row_bytes,
-                midq_blocks,
-                out_dim,
-                resident_expert_base,
-                resident_expert_count);
-    } else if (q4k_path) {
-        moe_down_q4K_owned_slots_qwarp32_kernel<<<down_grid, 256>>>(
-                down_dst,
-                down_w,
-                midq,
-                (const int32_t *)selected->ptr,
-                down_expert_bytes,
-                down_row_bytes,
-                midq_blocks,
-                out_dim,
-                resident_expert_base,
-                resident_expert_count);
-    } else if (pack_fixed3) {
-        moe_down_owned_packed_qwarp32_kernel<<<down_grid, 256>>>(
-                down_dst,
-                down_w,
-                midq,
-                (const int32_t *)selected->ptr,
-                down_expert_bytes,
-                down_row_bytes,
-                midq_blocks,
-                out_dim,
-                resident_expert_base,
-                resident_expert_count);
-    } else {
-        moe_down_owned_slots_qwarp32_kernel<<<down_grid, 256>>>(
-                down_dst,
-                down_w,
-                midq,
-                (const int32_t *)selected->ptr,
-                down_expert_bytes,
-                down_row_bytes,
-                midq_blocks,
-                out_dim,
-                resident_expert_base,
-                resident_expert_count);
-    }
-    return cuda_ok(cudaGetLastError(), "owned routed_moe down launch");
-}
-
-extern "C" int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
-        ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_slots,
-        const ds4_gpu_tensor *selected,
-        uint32_t out_dim,
-        uint32_t expert_split,
-        uint32_t rows) {
-    if (!out || !home_slots || !peer_slots || !selected || out_dim == 0u ||
-        rows == 0u || rows > 65535u) {
-        return 0;
-    }
-    const uint64_t row_elems = (uint64_t)rows * out_dim;
-    if (row_elems > UINT64_MAX / (6u * sizeof(float))) return 0;
-    const uint64_t out_bytes = row_elems * sizeof(float);
-    const uint64_t slots_bytes = row_elems * 6u * sizeof(float);
-    const uint64_t selected_bytes = (uint64_t)rows * 6u * sizeof(int32_t);
-    if (out->bytes < out_bytes || home_slots->bytes < slots_bytes ||
-        peer_slots->bytes < slots_bytes || selected->bytes < selected_bytes) {
-        return 0;
-    }
-    const dim3 grid((out_dim + 255u) / 256u, rows, 1u);
-    moe_owned_slots_combine_fixed3_kernel<<<grid, 256>>>(
-            (float *)out->ptr,
-            (const float *)home_slots->ptr,
-            (const float *)peer_slots->ptr,
-            (const int32_t *)selected->ptr,
-            out_dim,
-            expert_split);
-    return cuda_ok(cudaGetLastError(),
-                   "owned routed_moe slot rows combine launch");
-}
-
-extern "C" int ds4_gpu_routed_moe_owned_slots_combine_tensor(
-        ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_slots,
-        const ds4_gpu_tensor *selected,
-        uint32_t out_dim,
-        uint32_t expert_split) {
-    return ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
-            out, home_slots, peer_slots, selected,
-            out_dim, expert_split, 1u);
-}
-
-extern "C" int ds4_gpu_routed_moe_owned_packed_combine_tensor(
-        ds4_gpu_tensor *out,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_packed,
-        const ds4_gpu_tensor *selected,
-        uint32_t out_dim,
-        uint32_t expert_split) {
-    const uint64_t home_bytes = 6ull * out_dim * sizeof(float);
-    const uint64_t peer_bytes = 4ull * out_dim * sizeof(float);
-    if (!out || !home_slots || !peer_packed || !selected || out_dim == 0u ||
-        out->bytes < (uint64_t)out_dim * sizeof(float) ||
-        home_slots->bytes < home_bytes || peer_packed->bytes < peer_bytes ||
-        selected->bytes < 6u * sizeof(int32_t)) {
-        return 0;
-    }
-    moe_owned_packed_combine_fixed3_kernel<<<
-            (out_dim + 255u) / 256u, 256>>>(
-            (float *)out->ptr,
-            (const float *)home_slots->ptr,
-            (const float *)peer_packed->ptr,
-            (const int32_t *)selected->ptr,
-            out_dim,
-            expert_split);
-    return cuda_ok(cudaGetLastError(),
-                   "owned routed_moe packed combine launch");
-}
-
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
-        uint32_t layer_index,
-        bool force_resident) {
+        uint32_t layer_index) {
     if (add_in) {
         if (!ds4_gpu_add_tensor(out, out, add_in,
                                 (uint32_t)(out->bytes / sizeof(float)))) return 0;
@@ -2386,10 +1857,9 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, 1, force_resident ? 0 : 1, 0);
+                             layer_index, 1);
 }
-extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
-    (void)force_resident;
+extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
@@ -2398,87 +1868,9 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens, 1, 0);
+                             layer_index, n_tokens);
 }
 
-extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
-        ds4_gpu_tensor *out,
-        ds4_gpu_tensor *gate,
-        ds4_gpu_tensor *up,
-        ds4_gpu_tensor *mid,
-        ds4_gpu_tensor *down,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint32_t gate_type,
-        uint32_t down_type,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t expert_in_dim,
-        uint32_t expert_mid_dim,
-        uint32_t out_dim,
-        ds4_gpu_tensor *selected,
-        ds4_gpu_tensor *weights,
-        uint32_t n_total_expert,
-        uint32_t n_expert,
-        uint32_t resident_expert_base,
-        uint32_t resident_expert_count,
-        float clamp,
-        const ds4_gpu_tensor *x,
-        uint32_t layer_index,
-        uint32_t n_tokens,
-        bool *mid_is_f16) {
-    if (mid_is_f16) *mid_is_f16 = false;
-    if (!selected || !weights || n_tokens == 0u || n_expert == 0u ||
-        n_total_expert == 0u || resident_expert_count == 0u ||
-        gate_expert_bytes == 0u || gate_row_bytes == 0u ||
-        down_expert_bytes == 0u || down_row_bytes == 0u ||
-        resident_expert_base >= n_total_expert ||
-        resident_expert_count > n_total_expert - resident_expert_base ||
-        resident_expert_base > UINT64_MAX / gate_expert_bytes ||
-        resident_expert_base > UINT64_MAX / down_expert_bytes) {
-        return 0;
-    }
-    const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
-    if (pair_count > UINT32_MAX ||
-        selected->bytes < pair_count * sizeof(int32_t) ||
-        weights->bytes < pair_count * sizeof(float)) {
-        return 0;
-    }
-    const uint64_t gate_shift =
-        (uint64_t)resident_expert_base * gate_expert_bytes;
-    const uint64_t down_shift =
-        (uint64_t)resident_expert_base * down_expert_bytes;
-    if (gate_offset > model_size || gate_shift > model_size - gate_offset ||
-        up_offset > model_size || gate_shift > model_size - up_offset ||
-        down_offset > model_size || down_shift > model_size - down_offset) {
-        return 0;
-    }
-    moe_filter_owned_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
-            (int32_t *)selected->ptr,
-            (float *)weights->ptr,
-            pair_count,
-            n_total_expert,
-            resident_expert_base,
-            resident_expert_count);
-    if (!cuda_ok(cudaGetLastError(), "owned routed_moe pair filter launch")) return 0;
-
-    return routed_moe_launch(
-            out, gate, up, mid, down, model_map, model_size,
-            gate_offset + gate_shift,
-            up_offset + gate_shift,
-            down_offset + down_shift,
-            gate_type, down_type,
-            gate_expert_bytes, gate_row_bytes,
-            down_expert_bytes, down_row_bytes,
-            expert_in_dim, expert_mid_dim, out_dim,
-            selected, weights, resident_expert_count, n_expert,
-            clamp, x, layer_index, n_tokens, 0, 1);
-}
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);
@@ -2736,25 +2128,6 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
     return cuda_ok(cudaGetLastError(), "hc_expand_add_split launch");
 }
 
-extern "C" int ds4_gpu_hc_expand_add2_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *block_add2, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    if (!out_hc || !block_out || !block_add || !block_add2 ||
-        !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
-    uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
-                                                    (const float *)block_out->ptr,
-                                                    (const float *)block_add->ptr,
-                                                    (const float *)block_add2->ptr,
-                                                    (const float *)residual_hc->ptr,
-                                                    base + n_hc,
-                                                    base + 2u * n_hc,
-                                                    n_embd, n_hc, n_tokens,
-                                                    mix_hc, mix_hc, 1, 1);
-    return cuda_ok(cudaGetLastError(), "hc_expand_add2_split launch");
-}
-
 extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
@@ -2777,7 +2150,6 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
                                                         shared_mid,
                                                         routed_out,
                                                         NULL,
-                                                        NULL, NULL, NULL, 0,
                                                         residual_hc,
                                                         split,
                                                         n_embd, n_hc,
@@ -2788,83 +2160,6 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
                                         shared_mid, 1) &&
            ds4_gpu_hc_expand_add_split_tensor(out_hc, shared_out, routed_out,
 	                                                residual_hc, split, n_embd, n_hc);
-}
-
-extern "C" int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
-        ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *shared_out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *shared_mid,
-        const ds4_gpu_tensor *routed_out,
-        const ds4_gpu_tensor *routed_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
-        return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
-                                                        model_map, model_size,
-                                                        weight_offset,
-                                                        in_dim, out_dim,
-                                                        shared_mid,
-                                                        routed_out,
-                                                        routed_add,
-                                                        NULL, NULL, NULL, 0,
-                                                        residual_hc,
-                                                        split,
-                                                        n_embd, n_hc,
-                                                        "shared_down_hc_expand_add");
-    }
-    return ds4_gpu_matmul_q8_0_tensor(shared_out, model_map, model_size,
-                                        weight_offset, in_dim, out_dim,
-                                        shared_mid, 1) &&
-           ds4_gpu_hc_expand_add2_split_tensor(out_hc, shared_out, routed_out,
-                                                routed_add, residual_hc, split,
-                                                n_embd, n_hc);
-}
-
-extern "C" int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(
-        ds4_gpu_tensor *out_hc,
-        ds4_gpu_tensor *shared_out,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t weight_offset,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        const ds4_gpu_tensor *shared_mid,
-        const ds4_gpu_tensor *home_slots,
-        const ds4_gpu_tensor *peer_packed,
-        const ds4_gpu_tensor *selected,
-        uint32_t expert_split,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t n_embd,
-        uint32_t n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") != NULL) return 0;
-    return cuda_matmul_q8_0_hc_expand_tensor_labeled(
-            out_hc,
-            shared_out,
-            model_map,
-            model_size,
-            weight_offset,
-            in_dim,
-            out_dim,
-            shared_mid,
-            NULL,
-            NULL,
-            home_slots,
-            peer_packed,
-            selected,
-            expert_split,
-            residual_hc,
-            split,
-            n_embd,
-            n_hc,
-            "shared_down_hc_expand_owned");
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
@@ -2888,7 +2183,6 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
                                                         x,
                                                         NULL,
                                                         NULL,
-                                                        NULL, NULL, NULL, 0,
                                                         residual_hc,
                                                         split,
                                                         n_embd, n_hc,
@@ -2899,306 +2193,3 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
            ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
 }
-
-#if 0
-/* --gpu-vram auto probe. Defined here (in the .cu unit) so the
- * C-side parser (ds4_gpu_args.c) does not need to include
- * <cuda_runtime.h>. Returns 0 on success, nonzero on error
- * (errbuf populated). See ds4_gpu_args.h.
- *
- * Side-effect-light: changes cudaSetDevice during probing; callers
- * that care about the active device should reset it themselves
- * before continuing. (The mgpu init path resets it anyway.) */
-extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
-                                              int             filter_len,
-                                              ds4_gpu_config *out,
-                                              size_t          safety_margin_bytes,
-                                              char           *errbuf,
-                                              size_t          errbuflen) {
-    if (!out) {
-        if (errbuf && errbuflen) snprintf(errbuf, errbuflen, "internal: NULL out");
-        return 1;
-    }
-    int visible = 0;
-    cudaError_t rc = cudaGetDeviceCount(&visible);
-    if (rc != cudaSuccess || visible <= 0) {
-        if (errbuf && errbuflen) {
-            snprintf(errbuf, errbuflen,
-                     "cudaGetDeviceCount failed: %s",
-                     rc == cudaSuccess ? "no devices" : cudaGetErrorString(rc));
-        }
-        return 1;
-    }
-    /* Build the device list: either the explicit filter or 0..visible-1. */
-    int devs[DS4_MAX_GPUS];
-    int n_dev = 0;
-    if (device_filter && filter_len > 0) {
-        if (filter_len > DS4_MAX_GPUS) {
-            if (errbuf && errbuflen) {
-                snprintf(errbuf, errbuflen,
-                         "--gpu-devices filter has %d entries (max %d)",
-                         filter_len, DS4_MAX_GPUS);
-            }
-            return 1;
-        }
-        for (int i = 0; i < filter_len; i++) {
-            int d = device_filter[i];
-            if (d < 0 || d >= visible) {
-                if (errbuf && errbuflen) {
-                    snprintf(errbuf, errbuflen,
-                             "--gpu-devices: device %d not in 0..%d",
-                             d, visible - 1);
-                }
-                return 1;
-            }
-            devs[n_dev++] = d;
-        }
-    } else {
-        int cap = visible < DS4_MAX_GPUS ? visible : DS4_MAX_GPUS;
-        for (int i = 0; i < cap; i++) devs[n_dev++] = i;
-    }
-    out->n_gpus = n_dev;
-    out->safety_margin_bytes = safety_margin_bytes;
-    for (int i = 0; i < n_dev; i++) {
-        int d = devs[i];
-        rc = cudaSetDevice(d);
-        if (rc != cudaSuccess) {
-            if (errbuf && errbuflen) {
-                snprintf(errbuf, errbuflen,
-                         "cudaSetDevice(%d) failed: %s",
-                         d, cudaGetErrorString(rc));
-            }
-            return 1;
-        }
-        size_t free_b = 0, total_b = 0;
-        rc = cudaMemGetInfo(&free_b, &total_b);
-        if (rc != cudaSuccess) {
-            if (errbuf && errbuflen) {
-                snprintf(errbuf, errbuflen,
-                         "cudaMemGetInfo on device %d failed: %s",
-                         d, cudaGetErrorString(rc));
-            }
-            return 1;
-        }
-        /* Auto-mode reserve. Auto-probe is the only place we override
-         * the user's stated budget, so this is where the conservative-
-         * on-the-user's-behalf reserve belongs. The
-         * engine path (engine_classify_multi_tier) still subtracts the
-         * user-supplied safety_margin_bytes + the cuBLAS workspace from
-         * whatever budget we hand back; that math is unchanged and
-         * applies on top of the reserve we trim here.
-         *
-         * Reserve = max(2 GiB, 5 % of free). Why these numbers:
-         *   - 2 GiB floor covers runtime scratch / Q8 dequant caches /
-         *     MTP optional state on small GPUs (8-12 GB cards) where
-         *     5 % is < 1 GiB and not enough headroom.
-         *   - 5 % of free scales the reserve up on larger cards where
-         *     workspace + KV growth needs proportionally more room.
-         * Explicit --gpu-vram 47,37 budgets do not go through this
-         * probe and are unaffected. */
-        const size_t reserve_floor = (size_t)2ull * 1024ull * 1024ull * 1024ull;
-        const size_t reserve_pct = free_b / 20u;
-        const size_t reserve = reserve_floor > reserve_pct ? reserve_floor : reserve_pct;
-        const size_t budget = free_b > reserve ? (free_b - reserve) : 0;
-        (void)safety_margin_bytes;
-        out->device_indices[i] = d;
-        out->vram_bytes[i] = budget;
-    }
-    return 0;
-}
-#endif
-
-#if 0
-
-
-static int cuda_stream_selected_ensure_bytes(
-        char **ptr, uint64_t *capacity, uint64_t bytes, const char *label) {
-    if (*ptr && *capacity >= bytes) return 1;
-    if (*ptr) {
-        (void)cudaFree(*ptr);
-        *ptr = NULL;
-        *capacity = 0;
-    }
-    if (bytes == 0 || bytes > (uint64_t)SIZE_MAX) return 0;
-    cudaError_t err = cudaMalloc((void **)ptr, (size_t)bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA streaming %s allocation failed for %.2f MiB: %s\n",
-                label, (double)bytes / 1048576.0, cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-    *capacity = bytes;
-    return 1;
-}
-
-static int cuda_stream_selected_ensure_i32(uint64_t count) {
-    if (count == 0 || count > UINT64_MAX / sizeof(int32_t)) return 0;
-    const uint64_t bytes = count * sizeof(int32_t);
-    return cuda_stream_selected_ensure_bytes(
-            (char **)&g_stream_selected_cache.slot_selected_ptr,
-            &g_stream_selected_cache.slot_selected_capacity,
-            bytes,
-            "selected-id remap");
-}
-
-static int cuda_stream_selected_ranges_valid(
-        const ds4_gpu_stream_expert_table *table) {
-    if (!table || !table->model_map || table->model_size == 0 ||
-        table->n_total_expert == 0 || table->gate_expert_bytes == 0 ||
-        table->down_expert_bytes == 0) {
-        return 0;
-    }
-    if ((uint64_t)table->n_total_expert >
-            UINT64_MAX / table->gate_expert_bytes ||
-        (uint64_t)table->n_total_expert >
-            UINT64_MAX / table->down_expert_bytes) {
-        return 0;
-    }
-    const uint64_t gate_bytes =
-        (uint64_t)table->n_total_expert * table->gate_expert_bytes;
-    const uint64_t down_bytes =
-        (uint64_t)table->n_total_expert * table->down_expert_bytes;
-    return table->gate_offset <= table->model_size &&
-           gate_bytes <= table->model_size - table->gate_offset &&
-           table->up_offset <= table->model_size &&
-           gate_bytes <= table->model_size - table->up_offset &&
-           table->down_offset <= table->model_size &&
-           down_bytes <= table->model_size - table->down_offset;
-}
-
-static int cuda_stream_selected_cache_begin_load(
-        const ds4_gpu_stream_expert_table *table,
-        const int32_t *selected_ids,
-        uint32_t slot_count) {
-    cuda_stream_selected_cache_invalidate();
-    if (!g_ssd_streaming_mode) return 1;
-    if (!cuda_stream_selected_ranges_valid(table) || !selected_ids ||
-        slot_count == 0) {
-        return 0;
-    }
-    if (g_n_gpus != 1) {
-        fprintf(stderr,
-                "ds4: CUDA SSD streaming requires single-GPU placement\n");
-        return 0;
-    }
-
-    std::vector<int32_t> expert_to_slot;
-    std::vector<int32_t> compact_ids;
-    std::vector<int32_t> slot_ids;
-    try {
-        expert_to_slot.assign(table->n_total_expert, -1);
-        compact_ids.reserve(slot_count < table->n_total_expert ?
-                            slot_count : table->n_total_expert);
-        slot_ids.resize(slot_count);
-    } catch (...) {
-        return 0;
-    }
-    for (uint32_t i = 0; i < slot_count; i++) {
-        const int32_t expert = selected_ids[i];
-        if (expert < 0 || (uint32_t)expert >= table->n_total_expert) {
-            fprintf(stderr,
-                    "ds4: CUDA streaming expert id %d is outside 0..%u at layer %u\n",
-                    expert, table->n_total_expert, table->layer);
-            return 0;
-        }
-        int32_t compact = expert_to_slot[(uint32_t)expert];
-        if (compact < 0) {
-            compact = (int32_t)compact_ids.size();
-            expert_to_slot[(uint32_t)expert] = compact;
-            compact_ids.push_back(expert);
-        }
-        slot_ids[i] = compact;
-    }
-    if (compact_ids.empty() || compact_ids.size() > UINT32_MAX) return 0;
-    const uint64_t compact_count = compact_ids.size();
-    if (compact_count > UINT64_MAX / table->gate_expert_bytes ||
-        compact_count > UINT64_MAX / table->down_expert_bytes) {
-        return 0;
-    }
-    const uint64_t gate_bytes = compact_count * table->gate_expert_bytes;
-    const uint64_t down_bytes = compact_count * table->down_expert_bytes;
-    const int logical_tier = 0;
-    if (g_stream_selected_cache.logical_tier != logical_tier &&
-        (g_stream_selected_cache.gate_ptr ||
-         g_stream_selected_cache.up_ptr ||
-         g_stream_selected_cache.down_ptr ||
-         g_stream_selected_cache.slot_selected_ptr)) {
-        cuda_stream_selected_cache_release();
-    }
-    if (ds4_gpu_set_current_device(logical_tier) != 0 ||
-        !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.gate_ptr,
-                &g_stream_selected_cache.gate_capacity,
-                gate_bytes, "gate experts") ||
-        !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.up_ptr,
-                &g_stream_selected_cache.up_capacity,
-                gate_bytes, "up experts") ||
-        !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.down_ptr,
-                &g_stream_selected_cache.down_capacity,
-                down_bytes, "down experts") ||
-        !cuda_stream_selected_ensure_i32(slot_count)) {
-        cuda_stream_selected_cache_invalidate();
-        return 0;
-    }
-
-    for (uint32_t i = 0; i < compact_ids.size(); i++) {
-        const uint64_t expert = (uint32_t)compact_ids[i];
-        const uint64_t gate_src =
-            table->gate_offset + expert * table->gate_expert_bytes;
-        const uint64_t up_src =
-            table->up_offset + expert * table->gate_expert_bytes;
-        const uint64_t down_src =
-            table->down_offset + expert * table->down_expert_bytes;
-        const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
-        const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
-        if (!cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.gate_ptr + gate_dst,
-                    table->model_map, table->model_size,
-                    gate_src, table->gate_expert_bytes,
-                    "stream gate expert copy") ||
-            !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.up_ptr + gate_dst,
-                    table->model_map, table->model_size,
-                    up_src, table->gate_expert_bytes,
-                    "stream up expert copy") ||
-            !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.down_ptr + down_dst,
-                    table->model_map, table->model_size,
-                    down_src, table->down_expert_bytes,
-                    "stream down expert copy")) {
-            cuda_stream_selected_cache_invalidate();
-            return 0;
-        }
-    }
-    if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
-                            slot_ids.data(),
-                            (size_t)slot_count * sizeof(int32_t),
-                            cudaMemcpyHostToDevice),
-                 "stream selected-id remap copy")) {
-        cuda_stream_selected_cache_invalidate();
-        return 0;
-    }
-
-    g_stream_selected_cache.logical_tier = logical_tier;
-    g_stream_selected_cache.model_map = table->model_map;
-    g_stream_selected_cache.layer = table->layer;
-    g_stream_selected_cache.n_total_expert = table->n_total_expert;
-    g_stream_selected_cache.slot_count = slot_count;
-    g_stream_selected_cache.compact_count = (uint32_t)compact_count;
-    g_stream_selected_cache.gate_offset = table->gate_offset;
-    g_stream_selected_cache.up_offset = table->up_offset;
-    g_stream_selected_cache.down_offset = table->down_offset;
-    g_stream_selected_cache.gate_expert_bytes = table->gate_expert_bytes;
-    g_stream_selected_cache.down_expert_bytes = table->down_expert_bytes;
-    g_stream_selected_cache.slot_selected_tensor.ptr =
-        g_stream_selected_cache.slot_selected_ptr;
-    g_stream_selected_cache.slot_selected_tensor.bytes =
-        (uint64_t)slot_count * sizeof(int32_t);
-    g_stream_selected_cache.slot_selected_tensor.owner = 0;
-    g_stream_selected_cache.slot_selected_tensor.device_id = logical_tier;
-    g_stream_selected_cache.valid = 1;
-    return 1;
-}
-#endif

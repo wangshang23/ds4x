@@ -1,7 +1,6 @@
 #include "engine_internal.h"
 
 /* Graph Setup module. */
-#ifndef DS4_NO_GPU
 /* Allocate the complete target runtime on the single GB10. */
 bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
@@ -409,5 +408,3 @@ bool metal_graph_alloc_raw_cap(
     if (!ok) metal_graph_free(g);
     return ok;
 }
-
-#endif /* !DS4_NO_GPU */

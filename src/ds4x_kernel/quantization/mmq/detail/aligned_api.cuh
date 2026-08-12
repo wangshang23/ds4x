@@ -29,14 +29,14 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
 // Aligned-SoA Q8_0 dense decode matvec (megakernel program M1-Inc3).
 //
 // block_q8_0 is 34 bytes ([half d][int8 qs[32]]), so the raw code stream is
-// only 2-byte aligned — the same misalignment class proto_iq2_aligned proved
-// costly.  Artifact layout (weight server --repack-q8-aligned, derived kind
+// only 2-byte aligned, which is costly on GB10. Artifact layout (weight server
+// --repack-q8-aligned, derived kind
 // DERIVED_Q8_0_ALIGNED_DENSE): [__half dq[nblk]][pad to 64B][int8 qs[nblk*32]]
 // with nblk = M * (K/32), block order equal to the raw tensor byte order.
 // Unlike the IQ2 expert repack, the raw spans stay SERVED (dense tensors are
 // ~6 GiB total, affordable to duplicate), so every other consumer is
-// unchanged.  proto_q8_aligned.cu A/B (GB10, L2-defeating rotation, double-ref
-// parity): attn_q_b 217->235, mid 2048x4096 172->218, out_a 8192x4096
+// unchanged. GB10 L2-defeating A/B rotation with double-reference parity gave:
+// attn_q_b 217->235, mid 2048x4096 172->218, out_a 8192x4096
 // 199->230, head 224->243 GB/s; the warp-per-row accumulation is also ~1000x
 // closer to the double reference than the mmvq tile order at K>=4096.
 __global__ void q8_0_aligned_dense_vec_kernel(
@@ -74,12 +74,12 @@ __global__ void q8_0_aligned_dense_vec_kernel(
     if (lane == 0) out[row] = acc;
 }
 
-// Verify-width variant (v0.4 dense chase, proto_q8_aligned_nc): same aligned
+// Verify-width variant: same aligned
 // weight stream read ONCE per row, NC output columns accumulated per lane
 // against col-strided q8_1 activations (which L1/L2-broadcast across rows).
 // Bytes identical to the N=1 kernel, so it holds the aligned tier's rate at
 // the spec-verify widths where the raw-block mmvq fallback ran 90-200 GB/s
-// (proto: +17..+87% per shape, family within 4% of the weight-bytes floor).
+// (+17..+87% per shape, family within 4% of the weight-bytes floor).
 // out is column-major [NC][M], the engine's [n_tok, out_dim] flattening.
 template <int NC>
 __global__ void q8_0_aligned_dense_vec_nc_kernel(
@@ -158,12 +158,7 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
     ggml_cuda_pool_alloc<char> q8_pool;
-    // M2-Inc2a: producer-emitted q8_1 codes (qr_norm from the qkv-rms
-    // kernel) -- take them and skip the quantize prelude.  Single-column
-    // producers only; verify widths always quantize.
-    char *x8 = N == 1 ? ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded) : NULL;
-    cudaError_t err;
-    if (!x8) {
+    char *x8;
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         x8 = (char *)g_q81_scratch_ptr;
     } else {
@@ -176,13 +171,11 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N, /*s13=*/(int64_t)K * N,
         /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
         stream);
-    err = cudaGetLastError();
+    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
         return -2;
     }
-    }
-
     const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
     const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
     const int4   *qsp = (const int4 *)((const char *)W_aligned + dq_bytes);
@@ -232,8 +225,8 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
 //
 // Lane mapping, scale-byte values, q8 side and the float accumulation order
 // are copied verbatim from mul_mat_vec_q_moe/vec_dot_q2_K_q8_1 -> outputs are
-// bit-identical to the raw path (proto_m2_q2k.cu: 240/240 parity + graph
-// capture/replay, and 214 GB/s vs 154 raw on the same rotating rig).
+// bit-identical to the raw path across 240 parity and graph replay cases, with
+// 214 GB/s versus 154 GB/s raw on the same rotating rig.
 // ---------------------------------------------------------------------------
 
 // Same float chain as vec_dot_q2_K_q8_1_impl_mmvq; the four scale bytes come
@@ -523,47 +516,6 @@ static char *iq2_aligned_quantize_xn(
     ds4_pool_set_stream(stream);
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
-    // M2-Inc2a: producer-emitted q8_1 codes (ffn_norm from the fused HC
-    // stage) -- take them and skip the quantize prelude.
-    char *folded = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
-    if (folded) {
-        // C3-Inc4 fold twin selftest (DS4_Q8_FOLD_SELFTEST=<call budget>,
-        // eager legs only -- syncs the stream): the taken sidecar must be
-        // byte-identical to the fresh quantize this prelude would have run.
-        // Do NOT combine with DS4_HC_STAGE_BATCH_PARITY (the probe rewrites
-        // norm_out after the sidecar was emitted).
-        static int fold_st = -1;
-        if (fold_st < 0) {
-            const char *st = getenv("DS4_Q8_FOLD_SELFTEST");
-            fold_st = st && *st ? atoi(st) : 0;
-            if (st && *st && fold_st <= 1) fold_st = 512;
-        }
-        cudaStreamCaptureStatus fold_cs = cudaStreamCaptureStatusNone;
-        if (fold_st > 0) (void)cudaStreamIsCapturing(stream, &fold_cs);
-        if (fold_st > 0 && fold_cs == cudaStreamCaptureStatusNone &&
-            nbytes_q8_1 <= 16384u) {
-            fold_st--;
-            static char h[2][16384];
-            pool->alloc(ctx->pool(), nbytes_q8_1);
-            char *fresh = pool->get();
-            quantize_row_q8_1_cuda(
-                X_f32, /*ids=*/nullptr, (void *)fresh,
-                GGML_TYPE_IQ2_XXS, /*ne00=*/K,
-                /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_tokens,
-                /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
-                stream);
-            if (cudaGetLastError() == cudaSuccess &&
-                cudaStreamSynchronize(stream) == cudaSuccess &&
-                cudaMemcpy(h[0], folded, nbytes_q8_1, cudaMemcpyDeviceToHost) == cudaSuccess &&
-                cudaMemcpy(h[1], fresh, nbytes_q8_1, cudaMemcpyDeviceToHost) == cudaSuccess) {
-                fprintf(stderr, "ds4: Q8F-SELFTEST(q81 moe) K=%d %s\n", K,
-                        memcmp(h[0], h[1], nbytes_q8_1) == 0 ? "PASS" : "FAIL");
-            } else {
-                fprintf(stderr, "ds4: Q8F-SELFTEST(q81 moe) SKIP (setup failed)\n");
-            }
-        }
-        return folded;
-    }
     char *ptr = nullptr;
     if (g_aligned_q81_scratch_ptr &&
         g_aligned_q81_scratch_bytes >= nbytes_q8_1) {

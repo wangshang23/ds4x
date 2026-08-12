@@ -1,7 +1,6 @@
 #include "engine_internal.h"
 
 /* Prefill Runner module. */
-#ifndef DS4_NO_GPU
 /* Execute graph-backend prefill in layer-major order so intermediate
  * activations stay on the GPU and cache state is built exactly once. */
 static void gpu_graph_report_prefill_display_progress(
@@ -263,8 +262,8 @@ bool metal_graph_prefill_raw_swa(
         bool                  *cancelled) {
     if (n_tokens <= 0 || n_tokens > prompt->len) return false;
     if ((uint32_t)n_tokens > g->prefill_cap) return false;
-    /* The layer-major fallback below may submit the whole short prefill as one
-     * Metal command buffer.  Once that command is in flight there is no useful
+    /* The layer-major fallback may submit the whole short prefill as one CUDA
+     * batch. Once it is in flight there is no useful
      * safe prefix to expose: by the time cancellation can be observed again,
      * the prompt has already been fully read and the KV is valid.  Let the
      * caller observe the pending interrupt at generation time instead. */
@@ -315,8 +314,7 @@ bool metal_graph_prefill_chunked_range(
     if (chunk_cap == 0) return false;
 
     const bool profile =
-        glm_graph_env_present("DS4_ROCM_GRAPH_PREFILL_PROFILE",
-                              "DS4_METAL_GRAPH_PREFILL_PROFILE");
+        ds4_graph_env_present("DS4_METAL_GRAPH_PREFILL_PROFILE");
     const double t0 = profile ? now_sec() : 0.0;
     const uint32_t end = start + n_tokens;
 
@@ -356,7 +354,7 @@ bool metal_graph_prefill_chunked_range(
                                                   display_progress_ud);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
+                fprintf(stderr, "ds4: CUDA synchronize after chunked prefill failure also failed\n");
             }
             return false;
         }
@@ -384,5 +382,3 @@ bool metal_graph_prefill_chunked_range(
     }
     return true;
 }
-
-#endif /* !DS4_NO_GPU */

@@ -124,36 +124,8 @@ extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_bytes = ptr ? bytes : 0;
 }
 
-// Read by ds4_mmq_moe_vec_impl; non-zero means use the persistent buffer.
-// Set by ds4_mmq_init once based on env.  (Single-threaded GPU work; no
-// atomicity needed.)
-extern "C" int ds4_mmq_q81_persistent_enabled(void) {
-    return g_q81_scratch_enabled ? 1 : 0;
-}
-
 extern "C" void *ds4_mmq_q81_scratch_ptr(void) {
     return g_q81_scratch_ptr;
-}
-
-// M2-Inc2a: registry of producer-emitted q8_1 activations (ds4_cuda.cu).
-// A hit returns canonical block_q8_1 codes for this exact activation
-// pointer (bit-exact vs quantize_row_q8_1_cuda), letting the caller skip
-// its quantize prelude.  Only valid for single-token unpadded rows
-// (ne10_padded == K); the registry itself guarantees freshness (slots are
-// reset by the producing entry every layer and pops are one-shot).
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
-                                         const void **q81);
-static char *ds4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
-                                int64_t ne10_padded) {
-    if (n_tokens != 1 || ne10_padded != K) return nullptr;
-    const void *p = nullptr;
-    if (!ds4_cuda_q8_fold_take_q81((const void *)X_f32, (uint64_t)K, &p)) return nullptr;
-    static int logged = 0;
-    if (!logged) {
-        logged = 1;
-        fprintf(stderr, "ds4: M2-Inc2a q8_1 activation fold active (mmvq decode)\n");
-    }
-    return (char *)(uintptr_t)p;
 }
 
 // Default ON (2026-07-09 gated increment: same-boot ABBA 427->493 tok/s @12k,
@@ -278,10 +250,6 @@ static int64_t d2r_min_cols() {
     return cached;
 }
 
-extern "C" size_t ds4_mmq_q81_scratch_bytes(void) {
-    return g_q81_scratch_bytes;
-}
-
 extern "C" int ds4_mmq_init(int device) {
     if (device < 0) {
         fprintf(stderr, "ds4_mmq_init: invalid device %d\n", device);
@@ -321,97 +289,6 @@ extern "C" int ds4_mmq_init(int device) {
         }
     }
     return 0;
-}
-
-// ----------------------------------------------------------------------------
-// Gating: when should the caller choose mmq over dequant+cublas?
-//
-// Body lifted verbatim from llama.cpp's ggml/src/ggml-cuda/mmq.cu:267-372
-// (we do not vendor mmq.cu itself, since its other half talks to ggml_tensor
-// and ggml_backend internals we don't carry over).
-// ----------------------------------------------------------------------------
-
-static bool ds4_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
-#ifdef GGML_CUDA_FORCE_CUBLAS
-    GGML_UNUSED(type); GGML_UNUSED(cc); GGML_UNUSED(ne11); GGML_UNUSED(n_experts);
-    return false;
-#endif
-
-    bool mmq_supported;
-    switch (type) {
-        case GGML_TYPE_Q1_0:
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_MXFP4:
-        case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_IQ2_XXS:
-        case GGML_TYPE_IQ2_XS:
-        case GGML_TYPE_IQ2_S:
-        case GGML_TYPE_IQ3_XXS:
-        case GGML_TYPE_IQ3_S:
-        case GGML_TYPE_IQ1_S:
-        case GGML_TYPE_IQ4_XS:
-        case GGML_TYPE_IQ4_NL:
-            mmq_supported = true;
-            break;
-        default:
-            mmq_supported = false;
-            break;
-    }
-    if (!mmq_supported) return false;
-
-    if (turing_mma_available(cc)) {
-        return true;
-    }
-    if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
-        return false;
-    }
-#ifdef GGML_CUDA_FORCE_MMQ
-    GGML_UNUSED(ne11); GGML_UNUSED(n_experts);
-    return true;
-#endif
-
-    if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-        return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
-    }
-    if (amd_mfma_available(cc)) {
-        if (GGML_CUDA_CC_IS_CDNA3(cc)) return true;
-        if (n_experts > 64 || ne11 <= 128) return true;
-        if (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ||
-            type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1) return true;
-        if (ne11 <= 256 && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)) return true;
-        return false;
-    }
-    if (amd_wmma_available(cc)) {
-        if (GGML_CUDA_CC_IS_RDNA3(cc)) {
-            if (n_experts >= 64) return true;
-            switch (type) {
-                case GGML_TYPE_Q2_K: return ne11 <= 128;
-                case GGML_TYPE_Q6_K: return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
-                case GGML_TYPE_IQ2_XS:
-                case GGML_TYPE_IQ2_S:
-                    return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
-                default: return true;
-            }
-        }
-        return true;
-    }
-    return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
-}
-
-extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
-    const int dev = ggml_cuda_get_device();
-    const int cc  = ggml_cuda_info().devices[dev].cc;
-    const enum ggml_type t = (enum ggml_type) type_x;
-    return ds4_should_use_mmq_impl(t, cc, ne11, n_experts) ? 1 : 0;
 }
 
 // ----------------------------------------------------------------------------
@@ -620,4 +497,3 @@ int ds4_mmq_dense_impl(
 }
 
 } // anonymous namespace
-

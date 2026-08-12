@@ -1,7 +1,7 @@
 // ============================================================================
 
 #pragma once
-// Dense Q8_0 D2R (2026-07-09; proto_gemm_dense_q8_d2r.cu passes 0-5).
+// Dense Q8_0 decode-to-registers path, validated across production shapes.
 //
 // Reads the kind-5 aligned artifact (CUDA_DERIVED_Q8_0_ALIGNED_DENSE, weight
 // server --repack-q8-aligned, ADDITIVE) in place: [half dq[nblk]][pad to 64B]

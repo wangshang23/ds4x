@@ -1,15 +1,6 @@
 #include "../internal/backend_internal.cuh"
 
-/* Compat implementation. */
-/* Compatibility surface shared with the canonical Metal/ROCm graph. CUDA
- * either delegates to its equivalent primitive or reports an unavailable
- * optional fast path so the graph can use its established fallback. */
-extern "C" int ds4_gpu_commit_and_wait_selected_readback(
-        uint64_t event_value, const char *label) {
-    (void)event_value;
-    return cuda_ok(cudaDeviceSynchronize(),
-                   label ? label : "selected readback wait");
-}
+/* Compatibility implementation for optional graph fallbacks. */
 
 extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     const int ok = ds4_gpu_set_model_fd(fd);
@@ -50,24 +41,6 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
     }
 }
 
-extern "C" int ds4_gpu_set_model_map_spans(
-        const void *model_map,
-        uint64_t model_size,
-        const uint64_t *offsets,
-        const uint64_t *sizes,
-        uint32_t count,
-        uint64_t max_tensor_bytes) {
-    (void)max_tensor_bytes;
-    if (!model_map || !offsets || !sizes || count == 0u) return 0;
-    for (uint32_t i = 0; i < count; i++) {
-        if (offsets[i] > model_size || sizes[i] == 0u ||
-            sizes[i] > model_size - offsets[i]) {
-            return 0;
-        }
-    }
-    return ds4_gpu_set_model_map(model_map, model_size);
-}
-
 extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
         ds4_gpu_tensor *out_h,
         const void *model_map,
@@ -96,32 +69,6 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     (void)n_ctx_orig; (void)inverse; (void)freq_base; (void)freq_scale;
     (void)ext_factor; (void)attn_factor; (void)beta_fast; (void)beta_slow;
     (void)eps;
-    return 0;
-}
-
-extern "C" int ds4_gpu_attention_prefill_raw_heads_range_tensor(
-        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
-        uint64_t sinks_offset, const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv, uint32_t q_row0, uint32_t n_q,
-        uint32_t n_kv, uint32_t window, uint32_t n_head,
-        uint32_t head_dim) {
-    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset;
-    (void)q; (void)raw_kv; (void)q_row0; (void)n_q; (void)n_kv;
-    (void)window; (void)n_head; (void)head_dim;
-    return 0;
-}
-
-extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
-        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
-        uint64_t sinks_offset, const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv,
-        uint32_t comp_kv_f16, uint32_t q_row0, uint32_t n_q,
-        uint32_t n_tokens, uint32_t n_comp, uint32_t window,
-        uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
-    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset;
-    (void)q; (void)raw_kv; (void)comp_kv; (void)comp_kv_f16;
-    (void)q_row0; (void)n_q; (void)n_tokens; (void)n_comp; (void)window;
-    (void)ratio; (void)n_head; (void)head_dim;
     return 0;
 }
 
@@ -180,5 +127,3 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
     (void)residual_hc; (void)split; (void)n_embd; (void)n_hc;
     return 0;
 }
-
-#pragma GCC diagnostic pop

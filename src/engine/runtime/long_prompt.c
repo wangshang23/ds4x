@@ -1,7 +1,6 @@
 #include "engine_internal.h"
 
 /* Long Prompt module. */
-#ifndef DS4_NO_GPU
 /* Long prompts are prefetched in fixed-size chunks.  Chunks bound transient
  * attention buffers while preserving the same final KV/cache state. */
 bool metal_graph_prefill_chunked(
@@ -37,7 +36,7 @@ bool metal_graph_prefill_chunked(
                                              cancelled);
 }
 
-/* Layer-major speculative target verifier for tiny MTP suffixes.
+/* Layer-major speculative target verifier for tiny DSpark suffixes.
  *
  * This is the first production-shaped verifier attempt: unlike repeated decode
  * it runs the target model layer-by-layer for the whole speculative suffix, and
@@ -249,7 +248,7 @@ bool metal_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, float *log
                                  row_bytes) != 0;
 }
 
-/* Exact N=2 target verifier for MTP.
+/* Exact small-suffix target verifier for DSpark.
  *
  * The generic batch prefill path is fast, but it is not a safe substitute for
  * autoregressive decode: small row-wise differences in HC/MoE/output kernels
@@ -276,7 +275,6 @@ uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
     uint32_t raw_cap = (uint32_t)wanted;
     if (raw_cap < raw_window) raw_cap = raw_window;
 
-#ifndef DS4_ROCM_BUILD
     const char *env = getenv("DS4_METAL_GRAPH_RAW_CAP");
     if (env && env[0]) {
         char *endp = NULL;
@@ -288,7 +286,6 @@ uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
             if (raw_cap < raw_window) raw_cap = raw_window;
         }
     }
-#endif
 
     return raw_cap;
 }
@@ -305,7 +302,6 @@ uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len,
  * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
  * as a conservative crossover.  The env knob remains useful for retuning. */
 uint32_t metal_graph_resume_prefill_min_tokens(void) {
-#ifndef DS4_ROCM_BUILD
     const char *env = getenv("DS4_METAL_RESUME_PREFILL_MIN");
     if (env && env[0]) {
         char *endp = NULL;
@@ -315,8 +311,5 @@ uint32_t metal_graph_resume_prefill_min_tokens(void) {
             return (uint32_t)v;
         }
     }
-#endif
     return 4u;
 }
-
-#endif /* !DS4_NO_GPU */

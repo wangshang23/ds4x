@@ -188,7 +188,7 @@ int ds4_mmq_moe_vec_impl(
 // vec_dot_iq2_xxs_q8_1 (vecdotq.cuh); only the float accumulation order
 // differs (per-warp-row here vs per-mmvq-tile there).  Proven +12% over the
 // raw-layout vec path at the production decode shape
-// (tests/ds4x_kernel/mmq/proto_iq2_aligned.cu).
+// in the MMQ parity suite.
 __global__ void iq2_xxs_aligned_moe_vec_kernel(
         float             *out,        // [n_tokens*n_expert_used, M]
         const uint2       *qs,         // 64B-aligned code pairs
@@ -406,7 +406,7 @@ __global__ void iq2_xxs_aligned_moe_gate_up_mid_kernel(
 }
 
 // v0.4 V6: expert-overlap dedup for the gate_up mid kernel at DSpark
-// verify widths (proto_gemm_gateup_iq2xxs_dedup).  A live census measured
+// verify widths. A live census measured
 // a mean of 18.2 DISTINCT experts per 30 assignment slots at w5 (~40%
 // overlap across the verify tokens); the per-slot kernel above re-reads
 // every duplicate's weights from DRAM.  First-owner dedup keeps the grid
@@ -416,8 +416,8 @@ __global__ void iq2_xxs_aligned_moe_gate_up_mid_kernel(
 // otherwise accumulates ALL matching slots (<= n_tokens; top-k is
 // without replacement) as extra q8_1 columns.  Weight bytes and the iq2
 // grid/sign decode collapse to distinct experts.  Per-slot int dots are
-// exact and float folds stay block-major => outputs are BITWISE the
-// per-slot kernel's (proto: 0 mismatches on every leg incl. invalid-id
+// exact and float folds stay block-major, so outputs are bitwise identical to
+// the per-slot kernel on every leg, including invalid-id
 // sign-zeros; timing D=18 1.53x, D=12 2.03x, D=30 0.93x -- the
 // no-overlap tail is ~9% of live launches and priced).
 template <int MAXM>

@@ -393,84 +393,6 @@ static int indexer_scores_spark_try(
 #endif
 }
 
-/* Return 1 when the SM121 path handled the call, 0 to use the established
- * scorer, and -1 on a launch failure. */
-static int indexer_scores_mxf4_try(
-        ds4_gpu_tensor *scores,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *index_comp,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t ratio,
-        float scale) {
-#ifndef DS4_CUDA_HAVE_MXF4
-    (void)scores; (void)q; (void)weights; (void)index_comp;
-    (void)n_comp; (void)n_tokens; (void)pos0; (void)n_head;
-    (void)head_dim; (void)ratio; (void)scale;
-    return 0;
-#else
-    if (g_quality_mode || getenv("DS4_CUDA_NO_INDEXER_MXF4") != NULL ||
-        g_n_gpus != 1 || ds4_tensor_device_idx(scores) != 0 ||
-        n_head != DS4_MXF4_INDEXER_HEADS ||
-        head_dim != DS4_MXF4_INDEXER_DIM || ratio != 4u ||
-        n_comp < 1024u || n_tokens < 32u) {
-        return 0;
-    }
-    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(0, &capture) != cudaSuccess ||
-        capture != cudaStreamCaptureStatusNone) {
-        return 0;
-    }
-
-    const uint64_t q_rows64 =
-        (uint64_t)n_tokens * DS4_MXF4_INDEXER_HEADS;
-    if (q_rows64 > UINT32_MAX) return 0;
-    const uint32_t q_rows = (uint32_t)q_rows64;
-    const uint64_t k_codes_bytes = ((uint64_t)n_comp * 64u + 255u) & ~255ull;
-    const uint64_t k_scales_bytes = ((uint64_t)n_comp * 4u + 255u) & ~255ull;
-    const uint64_t q_codes_bytes = (q_rows64 * 64u + 255u) & ~255ull;
-    const uint64_t q_scales_bytes = (q_rows64 * 4u + 255u) & ~255ull;
-    const uint64_t scratch_bytes = k_codes_bytes + k_scales_bytes +
-                                   q_codes_bytes + q_scales_bytes;
-    unsigned char *scratch = (unsigned char *)
-        indexer_mxf4_scratch_alloc(scratch_bytes);
-    if (!scratch) return 0;
-
-    unsigned char *k_codes = scratch;
-    uint32_t *k_scales = (uint32_t *)(scratch + k_codes_bytes);
-    unsigned char *q_codes = scratch + k_codes_bytes + k_scales_bytes;
-    uint32_t *q_scales = (uint32_t *)(q_codes + q_codes_bytes);
-
-    indexer_mxf4_encode_rows_kernel<<<
-        (uint32_t)(((uint64_t)n_comp * 32u + 255u) / 256u), 256>>>(
-            (const float *)index_comp->ptr, k_codes, k_scales, n_comp);
-    if (!cuda_ok(cudaGetLastError(), "indexer mxf4 K encode launch")) {
-        return -1;
-    }
-    indexer_mxf4_encode_rows_kernel<<<
-        (uint32_t)(((uint64_t)q_rows * 32u + 255u) / 256u), 256>>>(
-            (const float *)q->ptr, q_codes, q_scales, q_rows);
-    if (!cuda_ok(cudaGetLastError(), "indexer mxf4 Q encode launch")) {
-        return -1;
-    }
-
-    dim3 grid((n_comp + 255u) / 256u,
-              (n_tokens + 15u) / 16u, 1u);
-    indexer_scores_mxf4_kernel<<<grid, 512>>>(
-        (float *)scores->ptr, q_codes, q_scales,
-        (const float *)weights->ptr, n_comp, n_tokens, pos0, ratio,
-        1u, scale, k_codes, k_scales, 64u, 0u);
-    if (!cuda_ok(cudaGetLastError(), "indexer mxf4 score launch")) {
-        return -1;
-    }
-    return 1;
-#endif
-}
-
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
@@ -486,25 +408,6 @@ __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scor
                 break;
             }
         }
-    }
-}
-
-__device__ __forceinline__ static void top2_insert_candidate(
-        float     v,
-        uint32_t  i,
-        float    *v0,
-        uint32_t *i0,
-        float    *v1,
-        uint32_t *i1) {
-    if (i == *i0 || i == *i1) return;
-    if (topk_score_better(v, i, *v0, *i0)) {
-        *v1 = *v0;
-        *i1 = *i0;
-        *v0 = v;
-        *i0 = i;
-    } else if (topk_score_better(v, i, *v1, *i1)) {
-        *v1 = v;
-        *i1 = i;
     }
 }
 
@@ -616,109 +519,6 @@ __global__ static void indexer_top1_kernel(
     }
 
     if (tid == 0u) selected[t] = idxs[0];
-}
-
-__global__ static void indexer_top1_value_kernel(
-        uint32_t *selected,
-        float *values,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t index_offset) {
-    const uint32_t t = blockIdx.x;
-    const uint32_t tid = threadIdx.x;
-    if (t >= n_tokens || tid >= 1024u) return;
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    float best_v = -INFINITY;
-    uint32_t best_i = 0;
-    for (uint32_t i = tid; i < n_comp; i += 1024u) {
-        const float v = row[i];
-        const uint32_t gi = index_offset + i;
-        const uint32_t best_gi = index_offset + best_i;
-        if (topk_score_better(v, gi, best_v, best_gi)) {
-            best_v = v;
-            best_i = i;
-        }
-    }
-
-    __shared__ float vals[1024];
-    __shared__ uint32_t idxs[1024];
-    vals[tid] = best_v;
-    idxs[tid] = best_i;
-    __syncthreads();
-
-    for (uint32_t stride = 512u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            const float ov = vals[tid + stride];
-            const uint32_t oi = idxs[tid + stride];
-            const uint32_t ogi = index_offset + oi;
-            const uint32_t gi = index_offset + idxs[tid];
-            if (topk_score_better(ov, ogi, vals[tid], gi)) {
-                vals[tid] = ov;
-                idxs[tid] = oi;
-            }
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0u) {
-        selected[t] = index_offset + idxs[0];
-        values[t] = vals[0];
-    }
-}
-
-__global__ static void indexer_top2_value_kernel(
-        uint32_t *selected,
-        float *values,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t index_offset) {
-    const uint32_t t = blockIdx.x;
-    const uint32_t tid = threadIdx.x;
-    if (t >= n_tokens || tid >= 1024u) return;
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    float best0_v = -INFINITY;
-    float best1_v = -INFINITY;
-    uint32_t best0_i = UINT32_MAX;
-    uint32_t best1_i = UINT32_MAX;
-    for (uint32_t i = tid; i < n_comp; i += 1024u) {
-        const uint32_t gi = index_offset + i;
-        top2_insert_candidate(row[i], gi,
-                              &best0_v, &best0_i,
-                              &best1_v, &best1_i);
-    }
-
-    __shared__ float vals0[1024];
-    __shared__ float vals1[1024];
-    __shared__ uint32_t idxs0[1024];
-    __shared__ uint32_t idxs1[1024];
-    vals0[tid] = best0_v;
-    vals1[tid] = best1_v;
-    idxs0[tid] = best0_i;
-    idxs1[tid] = best1_i;
-    __syncthreads();
-
-    for (uint32_t stride = 512u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            top2_insert_candidate(vals0[tid + stride], idxs0[tid + stride],
-                                  &vals0[tid], &idxs0[tid],
-                                  &vals1[tid], &idxs1[tid]);
-            top2_insert_candidate(vals1[tid + stride], idxs1[tid + stride],
-                                  &vals0[tid], &idxs0[tid],
-                                  &vals1[tid], &idxs1[tid]);
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0u) {
-        selected[(uint64_t)t * 2u + 0u] = idxs0[0];
-        selected[(uint64_t)t * 2u + 1u] = idxs1[0];
-        values[(uint64_t)t * 2u + 0u] = vals0[0];
-        values[(uint64_t)t * 2u + 1u] = vals1[0];
-    }
 }
 
 __device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
@@ -1244,76 +1044,7 @@ static int indexer_scores_launch(
         scores, q, weights, index_comp, n_comp, n_tokens, pos0,
         n_head, head_dim, ratio, scale, causal);
     if (spark != 0) return spark > 0;
-#ifdef DS4_CUDA_SPARK_ONLY
     return 0;
-#endif
-    const int mxf4 = indexer_scores_mxf4_try(
-        scores, q, weights, index_comp, n_comp, n_tokens, pos0,
-        n_head, head_dim, ratio, scale);
-    if (mxf4 != 0) return mxf4 > 0;
-    /* The tensor-core scorer overtakes the direct B1 kernel once the
-     * compressed history is long enough; keep the exact path for quality
-     * mode and short contexts where launch/staging overhead dominates. */
-    if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
-        (g_quality_mode || n_comp < 8192u ||
-         getenv("DS4_CUDA_NO_INDEXER_WMMA") != NULL) &&
-        getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") == NULL) {
-        indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
-                                                         (const float *)q->ptr,
-                                                         (const float *)weights->ptr,
-                                                         (const float *)index_comp->ptr,
-                                                         n_comp, pos0, ratio,
-                                                         scale, causal ? 1 : 0);
-        return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
-    }
-    if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
-        getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
-        if (getenv("DS4_CUDA_NO_INDEXER_WMMA128") == NULL) {
-            dim3 grid((n_comp + 127u) / 128u, (n_tokens + 31u) / 32u, 1);
-            indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
-                                                         (const float *)q->ptr,
-                                                         (const float *)weights->ptr,
-                                                         (const float *)index_comp->ptr,
-                                                         n_comp, n_tokens, pos0, n_head,
-                                                         head_dim, ratio, scale, causal ? 1 : 0);
-            return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
-        } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA64") == NULL) {
-            dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1);
-            indexer_scores_wmma64_kernel<<<grid, 128>>>((float *)scores->ptr,
-                                                        (const float *)q->ptr,
-                                                        (const float *)weights->ptr,
-                                                        (const float *)index_comp->ptr,
-                                                        n_comp, n_tokens, pos0, n_head,
-                                                        head_dim, ratio, scale, causal ? 1 : 0);
-            return cuda_ok(cudaGetLastError(), "indexer scores wmma64 launch");
-        } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA32") == NULL) {
-            dim3 grid((n_comp + 31u) / 32u, (n_tokens + 15u) / 16u, 1);
-            indexer_scores_wmma32_kernel<<<grid, 64>>>((float *)scores->ptr,
-                                                       (const float *)q->ptr,
-                                                       (const float *)weights->ptr,
-                                                       (const float *)index_comp->ptr,
-                                                       n_comp, n_tokens, pos0, n_head,
-                                                       head_dim, ratio, scale, causal ? 1 : 0);
-            return cuda_ok(cudaGetLastError(), "indexer scores wmma32 launch");
-        } else {
-            dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
-            indexer_scores_wmma_kernel<<<grid, 32>>>((float *)scores->ptr,
-                                                     (const float *)q->ptr,
-                                                     (const float *)weights->ptr,
-                                                     (const float *)index_comp->ptr,
-                                                     n_comp, n_tokens, pos0, n_head,
-                                                     head_dim, ratio, scale, causal ? 1 : 0);
-            return cuda_ok(cudaGetLastError(), "indexer scores wmma launch");
-        }
-    }
-    dim3 grid(n_comp, n_tokens, 1);
-    indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
-                                         (const float *)q->ptr,
-                                         (const float *)weights->ptr,
-                                         (const float *)index_comp->ptr,
-                                         n_comp, n_tokens, pos0, n_head,
-                                         head_dim, ratio, scale, causal ? 1 : 0);
-    return cuda_ok(cudaGetLastError(), "indexer scores launch");
 }
 
 extern "C" int ds4_gpu_indexer_score_one_tensor(
@@ -1747,50 +1478,6 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
-}
-
-extern "C" int ds4_gpu_indexer_top1_value_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *values,
-        const ds4_gpu_tensor *scores,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                index_offset) {
-    if (!selected || !values || !scores || n_comp == 0 || n_tokens == 0 ||
-        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
-        selected->bytes < (uint64_t)n_tokens * sizeof(uint32_t) ||
-        values->bytes < (uint64_t)n_tokens * sizeof(float)) {
-        return 0;
-    }
-    indexer_top1_value_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                  (float *)values->ptr,
-                                                  (const float *)scores->ptr,
-                                                  n_comp,
-                                                  n_tokens,
-                                                  index_offset);
-    return cuda_ok(cudaGetLastError(), "indexer top1 value launch");
-}
-
-extern "C" int ds4_gpu_indexer_top2_value_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *values,
-        const ds4_gpu_tensor *scores,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                index_offset) {
-    if (!selected || !values || !scores || n_comp < 2u || n_tokens == 0 ||
-        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
-        selected->bytes < (uint64_t)n_tokens * 2u * sizeof(uint32_t) ||
-        values->bytes < (uint64_t)n_tokens * 2u * sizeof(float)) {
-        return 0;
-    }
-    indexer_top2_value_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                  (float *)values->ptr,
-                                                  (const float *)scores->ptr,
-                                                  n_comp,
-                                                  n_tokens,
-                                                  index_offset);
-    return cuda_ok(cudaGetLastError(), "indexer top2 value launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(

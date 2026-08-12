@@ -15,7 +15,6 @@ const void *g_model_host_base;
 const char *g_model_device_base;
 uint64_t g_model_registered_size;
 int g_model_registered;
-thread_local bool g_glm_mtp_verify_mode;
 int g_model_device_owned;
 int g_model_range_mapping_supported = 1;
 int g_model_hmm_direct;
@@ -31,9 +30,6 @@ int g_cublas_ready;
 int g_quality_mode;
 int g_decode_fast_attention;
 int g_decode_score_vec4;
-int g_xdev_sync_debug;
-int g_xdev_force_cuda_peer;
-int g_xdev_force_host_bounce;
 int g_cuda_disable_qkv_rms_fused;
 int g_cuda_no_window_attention;
 int g_cuda_decode_heads8_online;
@@ -42,7 +38,6 @@ int g_cuda_decode_score8;
 int g_cuda_no_decode_value512;
 int g_cuda_no_top1;
 int g_cuda_end_stream_sync;
-int g_cuda_no_setdevice_cache;
 int g_cuda_exact_score_split_graph;
 int g_cuda_exact_score_split_ldg;
 int g_cuda_exact_score_split_vec4;
@@ -50,7 +45,6 @@ int g_cuda_exact_score_split_vec4_plain;
 int g_cuda_exact_score_split_dim2;
 int g_cuda_exact_score_split_fuse_inv_rope;
 int g_cuda_moe_decode_graph;
-int g_current_logical_tier = -1;
 
 cuda_score_split_graph_cache g_score_split_graph[DS4_MAX_GPUS];
 
@@ -75,14 +69,6 @@ int cuda_q4_mma_ok(void) {
 
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
-int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
-
-/* Per-pair pinned-host bounce buffers, indexed [src][dst]. Lazily grown
- * to the largest copy seen for that pair. Each pair is its own allocation
- * so concurrent fan-out copies from a single source GPU to multiple
- * destinations cannot race for staging memory. */
-void   *g_xdev_bounce[DS4_MAX_GPUS][DS4_MAX_GPUS];
-size_t  g_xdev_bounce_bytes[DS4_MAX_GPUS][DS4_MAX_GPUS];
 
 /* Internal helper: resolve a tensor's device index. -1 (untagged) is
  * treated as device 0 for legacy callers. */
@@ -102,7 +88,6 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_no_decode_value512 = getenv("DS4_CUDA_NO_DECODE_VALUE512") != NULL;
     g_cuda_no_top1 = getenv("DS4_CUDA_NO_TOP1") != NULL;
     g_cuda_end_stream_sync = getenv("DS4_CUDA_END_STREAM_SYNC") != NULL;
-    g_cuda_no_setdevice_cache = getenv("DS4_CUDA_NO_SETDEVICE_CACHE") != NULL;
     g_cuda_exact_score_split_graph =
         getenv("DS4_CUDA_EXACT_SCORE_SPLIT_GRAPH") != NULL;
     g_cuda_exact_score_split_ldg =
@@ -134,16 +119,11 @@ static void cuda_decode_dispatch_env_refresh(void) {
  * required `{ ... }` block in the call site.
  */
 
-cuda_device_cache g_dev_cache[DS4_MAX_GPUS];
-std::vector<cache_range_entry> g_cache_ranges;
-
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
 static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
-std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
-std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 std::vector<cuda_derived_range> g_derived_ranges;
 const void *g_derived_replace_map;
 uint64_t g_derived_artifact_bytes;
@@ -152,7 +132,6 @@ int g_derived_replaces_complete;
 void *g_aligned_q81_scratch;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
-uint64_t g_q8_f32_bytes;
 int g_q8_cache_suppressed;
 int g_q8_f16_disabled_after_oom;
 int g_q8_f16_budget_notice_printed;
@@ -321,73 +300,9 @@ uint64_t tt_align256_u64(uint64_t x) {
     return (x + 255ull) & ~255ull;
 }
 
-/* Per-tier scratch accessor.
- *
- * Behavior:
- *   - At g_n_gpus <= 1 (single-tier), delegates to cuda_tmp_alloc which
- *     manages the legacy g_cuda_tmp slab. This guarantees byte-identical
- *     behavior to pre-task code for the gpu_cfg == NULL case.
- *   - For multi-tier, grows the per-device g_gpu[logical_tier].scratch
- *     slab on the corresponding physical device. Cleanup is already
- *     handled by ds4_gpu_cleanup (which walks g_gpu[i].scratch).
- *
- * The legacy g_cuda_tmp slab is untouched: init-time / preload callers
- * still use cuda_tmp_alloc directly. No aliasing between g_cuda_tmp
- * and g_gpu[0].scratch — they are independently owned and freed.
- *
- * Added for multi-GPU execution (multi-GPU execution), step A3 of the
- * spec (sub-area 2). */
 void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *what) {
-    if (bytes == 0) return NULL;
-    if (g_n_gpus <= 1) {
-        return cuda_tmp_alloc(bytes, what);
-    }
-    if (logical_tier < 0 || logical_tier >= g_n_gpus) {
-        fprintf(stderr, "ds4: cuda_tmp_alloc_on: bad tier %d (n_gpus=%d, what=%s)\n",
-                logical_tier, g_n_gpus, what ? what : "?");
-        return NULL;
-    }
-    ds4_gpu_ctx *ctx = &g_gpu[logical_tier];
-    if (ctx->scratch_bytes >= bytes) return ctx->scratch;
-    int prev = -1;
-    cudaError_t derr = cudaGetDevice(&prev);
-    if (derr != cudaSuccess) {
-        fprintf(stderr,
-                "ds4: cudaGetDevice failed before scratch alloc on tier %d (dev=%d, what=%s): %s\n",
-                logical_tier, ctx->device_id, what ? what : "scratch",
-                cudaGetErrorString(derr));
-        (void)cudaGetLastError();
-        return NULL;
-    }
-    derr = cudaSetDevice(ctx->device_id);
-    if (derr != cudaSuccess) {
-        fprintf(stderr,
-                "ds4: cudaSetDevice(%d) failed before scratch alloc on tier %d (what=%s): %s\n",
-                ctx->device_id, logical_tier, what ? what : "scratch",
-                cudaGetErrorString(derr));
-        (void)cudaGetLastError();
-        if (prev >= 0) (void)cudaSetDevice(prev);
-        return NULL;
-    }
-    if (ctx->scratch) {
-        (void)cudaFree(ctx->scratch);
-        ctx->scratch = NULL;
-        ctx->scratch_bytes = 0;
-    }
-    void *p = NULL;
-    cudaError_t err = cudaMalloc(&p, (size_t)bytes);
-    if (prev >= 0) (void)cudaSetDevice(prev);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                "ds4: CUDA scratch alloc on tier %d (dev=%d) failed for %s (%.2f MiB): %s\n",
-                logical_tier, ctx->device_id, what ? what : "scratch",
-                (double)bytes / 1048576.0, cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return NULL;
-    }
-    ctx->scratch = p;
-    ctx->scratch_bytes = (size_t)bytes;
-    return p;
+    (void)logical_tier;
+    return cuda_tmp_alloc(bytes, what);
 }
 
 int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -506,32 +421,9 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
     return (const char *)dev;
 }
 
-/* Per-tier cuBLAS handle. Used by kernel-dispatch wrappers; returns the
- * cuBLAS handle for the logical tier. The wrapper is expected to have
- * cudaSetDevice'd to that tier's physical device already (kernels and
- * cuBLAS calls ride the default stream and are naturally serialized).
- *
- * Added for multi-GPU execution (multi-GPU execution), sub-area 1. */
 cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
-    if (g_n_gpus <= 1) {
-        return (cublasHandle_t)g_gpu[0].cublas;
-    }
-    /* The executing device is authoritative: GLM per-layer switching runs
-     * generic launchers whose out tensors live on device 0 while the layer
-     * executes elsewhere. On DS4 paths the current device always equals the
-     * requested tier, so this is behavior-preserving there. */
-    int cur_dev = -1;
-    if (cudaGetDevice(&cur_dev) == cudaSuccess) {
-        for (int t = 0; t < g_n_gpus; t++) {
-            if (g_gpu[t].device_id == cur_dev) {
-                return (cublasHandle_t)g_gpu[t].cublas;
-            }
-        }
-    }
-    if (logical_tier < 0 || logical_tier >= g_n_gpus) {
-        return (cublasHandle_t)g_gpu[0].cublas;
-    }
-    return (cublasHandle_t)g_gpu[logical_tier].cublas;
+    (void)logical_tier;
+    return (cublasHandle_t)g_gpu[0].cublas;
 }
 
 /* ------------------------------------------------------------------------
@@ -756,23 +648,13 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
  * prefill logits drift at ULP scale: validated against the official
  * continuation vectors rather than byte-diffs.  DS4_CUDA_MMQ=0 restores
  * the legacy dispatch. */
-/* Producer-fold registry lookup the vendored ds4_mmq.cu entries probe for
- * pre-quantized q8_1 activations (the fork's flat-pool M2-Inc2a fold).
- * The flat-pool producers are not ported, so nothing is ever registered:
- * always miss, and the entries run their own activation quantize. */
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
-                                         const void **q81) {
-    (void)src; (void)in_dim; (void)q81;
-    return 0;
-}
-
 int cuda_use_mmq(void) {
     static int init = 0;
     static int use = 0;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_MMQ");
-        const int off = (s && s[0] == '0') || g_quality_mode || g_n_gpus > 1;
+        const int off = (s && s[0] == '0') || g_quality_mode;
         if (off) {
             if (s && s[0] == '0') {
                 fprintf(stderr, "ds4: DS4_CUDA_MMQ=0 - mmq prefill tier disabled\n");
@@ -786,11 +668,6 @@ int cuda_use_mmq(void) {
     return use;
 }
 
-/* MXFP4 has no dequant+cublas fallback, so it must retain MMQ on multi-GPU
- * placements where the optional Q8/IQ2 prefill tier stays disabled. MMQ
- * resolves the active CUDA device on every call; initialization only warms
- * its device-info singleton. The experimental global persistent scratch is
- * intentionally rejected because one pointer cannot span CUDA devices. */
 int cuda_use_mxfp4_mmq(void) {
     static int init = 0;
     static int use = 0;
@@ -800,10 +677,6 @@ int cuda_use_mxfp4_mmq(void) {
         if (s && s[0] == '0') {
             fprintf(stderr,
                     "ds4: DS4_CUDA_MMQ=0 - MXFP4 MMQ disabled\n");
-        } else if (g_n_gpus > 1 &&
-                   getenv("DS4_CUDA_MMQ_Q81_PERSISTENT") != NULL) {
-            fprintf(stderr,
-                    "ds4: persistent MMQ Q8_1 scratch is unavailable with multi-GPU MXFP4\n");
         } else {
             int device = 0;
             if (cudaGetDevice(&device) == cudaSuccess &&
@@ -834,99 +707,14 @@ extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) {
     }
 }
 
-/* Multi-tier-aware weight pointer resolver.
- *
- * Used by kernel-dispatch wrappers in the per-layer execution path to
- * obtain a device pointer for a weight slice on the layer's logical
- * tier. Behavior:
- *
- *   - When g_n_gpus <= 1 (single-tier engine), delegates to the existing
- *     cuda_model_range_ptr path. This short-circuit guarantees byte-
- *     identical behavior to pre-multi-tier code for the gpu_cfg == NULL
- *     case.
- *
- *   - When g_n_gpus >= 2 (multi-tier engine), translates the logical
- *     tier index to the corresponding physical CUDA device id via
- *     g_gpu[logical_tier].device_id and looks up the slice strictly
- *     in the per-device selective cache via ds4_gpu_lookup_cache_strict.
- *     On miss, logs a diagnostic and returns NULL (no host-pointer
- *     fallback — a miss here is a placement/install bug).
- *
- * The caller is responsible for cudaSetDevice'ing to the right physical
- * device before launching the kernel that consumes the returned pointer.
- * Wrappers in this file thread `int logical_tier` from the dispatch
- * caller; single-tier callers pass 0, which hits the short-circuit.
- *
- * Added for multi-GPU execution (multi-GPU execution), sub-area 3 of the
- * spec. */
-/* Optional second (support) model map for speculative decoding. The strict
- * multi-tier cache is keyed by source offset only, so support tensors are
- * installed and resolved with a large disjoint offset bias. */
-const void *g_support_host_base = NULL;
-uint64_t g_support_host_size = 0;
-uint64_t g_support_offset_bias = 0;
-
-extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
-    if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
-    int prev = -1;
-    if (cudaGetDevice(&prev) != cudaSuccess) prev = -1;
-    if (cudaSetDevice(g_gpu[logical_tier].device_id) != cudaSuccess) return 0;
-    size_t free_b = 0, total_b = 0;
-    uint64_t out = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) out = (uint64_t)free_b;
-    if (prev >= 0) (void)cudaSetDevice(prev);
-    return out;
-}
-
-extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) {
-    if (!map || size == 0 || bias == 0) return 0;
-    g_support_host_base = map;
-    g_support_host_size = size;
-    g_support_offset_bias = bias;
-    return 1;
-}
-
+/* Resolve a model slice through the single-GB10 range cache. */
 const char *cuda_resolve_weight_ptr(const void *model_map,
                                             uint64_t offset,
                                             uint64_t bytes,
                                             int logical_tier,
                                             const char *label) {
-    if (g_n_gpus <= 1) {
-        return cuda_model_range_ptr(model_map, offset, bytes, label);
-    }
-    if (g_support_host_base && model_map == g_support_host_base) {
-        offset += g_support_offset_bias;
-    }
-    if (logical_tier < 0 || logical_tier >= g_n_gpus) {
-        fprintf(stderr,
-            "ds4: cuda_resolve_weight_ptr: bad tier %d (n_gpus=%d, label=%s)\n",
-            logical_tier, g_n_gpus, label ? label : "?");
-        return NULL;
-    }
-    const int physical_device = g_gpu[logical_tier].device_id;
-    void *dev_ptr = NULL;
-    if (ds4_gpu_lookup_cache_strict(offset, bytes, physical_device, &dev_ptr)
-        && dev_ptr) {
-        return (const char *)dev_ptr;
-    }
-    /* GLM multi-tier: generic launchers resolve by the OUT tensor's tier,
-     * but the executing device (set per layer) is where the weights were
-     * cached. Retry with the current device before declaring a miss;
-     * DS4 paths never reach this (out tier == current device). */
-    int cur_dev = -1;
-    if (cudaGetDevice(&cur_dev) == cudaSuccess &&
-        cur_dev != physical_device &&
-        ds4_gpu_lookup_cache_strict(offset, bytes, cur_dev, &dev_ptr) &&
-        dev_ptr) {
-        return (const char *)dev_ptr;
-    }
-    fprintf(stderr,
-        "ds4: selective-cache miss for offset=%llu bytes=%llu on "
-        "logical_tier=%d (physical_device=%d, current_device=%d, "
-        "label=%s); this is a placement/cache-install bug\n",
-        (unsigned long long)offset, (unsigned long long)bytes,
-        logical_tier, physical_device, cur_dev, label ? label : "?");
-    return NULL;
+    (void)logical_tier;
+    return cuda_model_range_ptr(model_map, offset, bytes, label);
 }
 
 int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
@@ -996,18 +784,6 @@ int cuda_env_flag_enabled(const char *name, int fallback) {
     const char *env = getenv(name);
     if (!env || !env[0]) return fallback;
     return strcmp(env, "0") != 0;
-}
-
-extern "C" int ds4_gpu_set_decode_fast_attention(int enabled) {
-    const int old = g_decode_fast_attention;
-    g_decode_fast_attention = enabled != 0;
-    return old;
-}
-
-extern "C" int ds4_gpu_set_decode_score_vec4(int enabled) {
-    const int old = g_decode_score_vec4;
-    g_decode_score_vec4 = enabled != 0;
-    return old;
 }
 
 bool cuda_splitkv_decode_requested(void) {
@@ -1209,37 +985,7 @@ int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out
     return cuda_q8_f16_cache_allowed(label, in_dim, out_dim);
 }
 
-int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
-#ifdef DS4_CUDA_SPARK_ONLY
-    (void)label;
-    (void)in_dim;
-    (void)out_dim;
-    return 0;
-#else
-    if (g_q8_cache_suppressed) return 0;
-    if (getenv("DS4_CUDA_NO_Q8_F32_CACHE") != NULL) return 0;
-    if (getenv("DS4_CUDA_Q8_F32_ALL") != NULL) return 1;
-    if (label && strstr(label, "attn_q_b") != NULL) {
-        return getenv("DS4_CUDA_ATTN_Q_B_F32_CACHE") != NULL;
-    }
-    return getenv("DS4_CUDA_Q8_F32_LARGE") != NULL &&
-           in_dim == 1024u && out_dim == 32768u;
-#endif
-}
-
-/* Look up a per-device dequantized fp16 slice of the Q8_0 weight at
- * (model_map, offset, weight_bytes, in_dim, out_dim). expected_device is a
- * PHYSICAL CUDA device id (0 in single-tier; g_gpu[logical_tier].device_id in
- * multi-tier). On hit returns the cached pointer for that device. On miss
- * cudaSetDevice's to expected_device, allocates + dequants there, stamps the
- * new entry with device_id == expected_device, restores the previous device,
- * and returns the new pointer.
- *
- * Single-tier (g_n_gpus <= 1) uses the offset-keyed map for a fast path —
- * legacy entries were stamped device_id=0, so the map remains authoritative.
- * Multi-tier linear-scans the ranges vector filtering on device_id (the same
- * offset may now legitimately map to multiple entries, one per device).
- */
+/* Look up or create a dequantized FP16 slice of a Q8_0 weight. */
 const __half *cuda_q8_f16_ptr(
         const void *model_map,
         uint64_t offset,
@@ -1248,83 +994,29 @@ const __half *cuda_q8_f16_ptr(
         uint64_t out_dim,
         int expected_device,
         const char *label) {
-    if (g_n_gpus <= 1) {
-        auto exact = g_q8_f16_by_offset.find(offset);
-        if (exact != g_q8_f16_by_offset.end()) {
-            const cuda_q8_f16_range &r = g_q8_f16_ranges[exact->second];
-            if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
-                r.in_dim == in_dim && r.out_dim == out_dim) {
-                return r.device_ptr;
-            }
-        }
-    } else {
-        for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
-            if (r.host_base == model_map &&
-                r.offset == offset &&
-                r.weight_bytes == weight_bytes &&
-                r.in_dim == in_dim &&
-                r.out_dim == out_dim &&
-                r.device_id == expected_device) {
-                return r.device_ptr;
-            }
+    auto exact = g_q8_f16_by_offset.find(offset);
+    if (exact != g_q8_f16_by_offset.end()) {
+        const cuda_q8_f16_range &r = g_q8_f16_ranges[exact->second];
+        if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
+            r.in_dim == in_dim && r.out_dim == out_dim) {
+            return r.device_ptr;
         }
     }
     if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
 
-    /* Source Q8 bytes:
-     *  - Single-tier (g_n_gpus <= 1): cuda_model_range_ptr — preserves the
-     *    legacy behavior (FD cache, host-register, or cudaMalloc-and-copy).
-     *  - Multi-tier (g_n_gpus > 1): the per-device selective cache must
-     *    already contain the weight on expected_device. Use the strict
-     *    lookup; on miss this is a placement bug and we hard-fail.
-     */
-    const char *q8;
-    if (g_n_gpus <= 1) {
-        q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
-    } else {
-        void *strict_ptr = NULL;
-        if (!ds4_gpu_lookup_cache_strict(offset, weight_bytes, expected_device, &strict_ptr) ||
-            !strict_ptr) {
-            fprintf(stderr,
-                "ds4: q8 fp16 cache miss: source bytes not in selective cache for "
-                "offset=%llu bytes=%llu device=%d (label=%s); placement bug\n",
-                (unsigned long long)offset, (unsigned long long)weight_bytes,
-                expected_device, label ? label : "?");
-            return NULL;
-        }
-        q8 = (const char *)strict_ptr;
-    }
+    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
     if (!q8) return NULL;
 
     if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half)) return NULL;
     const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
     if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
 
-    int prev = -1;
-    if (g_n_gpus > 1) {
-        cudaError_t derr = cudaGetDevice(&prev);
-        if (derr != cudaSuccess) {
-            fprintf(stderr, "ds4: cudaGetDevice failed before q8 fp16 alloc on device %d: %s\n",
-                    expected_device, cudaGetErrorString(derr));
-            (void)cudaGetLastError();
-            return NULL;
-        }
-        derr = cudaSetDevice(expected_device);
-        if (derr != cudaSuccess) {
-            fprintf(stderr, "ds4: cudaSetDevice(%d) failed before q8 fp16 alloc: %s\n",
-                    expected_device, cudaGetErrorString(derr));
-            (void)cudaGetLastError();
-            if (prev >= 0) (void)cudaSetDevice(prev);
-            return NULL;
-        }
-    }
     __half *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA q8 fp16 cache alloc failed on device %d (%.2f MiB): %s\n",
                 expected_device, (double)out_bytes / 1048576.0, cudaGetErrorString(err));
         cuda_q8_f16_cache_disable_after_failure("allocation failure", out_bytes);
-        if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
         return NULL;
     }
     const uint64_t blocks = (in_dim + 31) / 32;
@@ -1337,126 +1029,16 @@ const __half *cuda_q8_f16_ptr(
     if (!cuda_ok(cudaGetLastError(), "q8 fp16 dequant launch")) {
         (void)cudaFree(dev);
         cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
-        if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
         return NULL;
     }
     g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev, expected_device});
-    if (g_n_gpus <= 1) {
-        g_q8_f16_by_offset[offset] = g_q8_f16_ranges.size() - 1u;
-    }
+    g_q8_f16_by_offset[offset] = g_q8_f16_ranges.size() - 1u;
     g_q8_f16_bytes += out_bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "ds4: CUDA cached q8 fp16 %.2f MiB on device %d (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0, expected_device,
                 (double)g_q8_f16_bytes / 1073741824.0);
     }
-    if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
-    return dev;
-}
-
-/* Per-device dequantized fp32 cache. Same conventions as cuda_q8_f16_ptr. */
-float *cuda_q8_f32_ptr(
-        const void *model_map,
-        uint64_t offset,
-        uint64_t weight_bytes,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        int expected_device,
-        const char *label) {
-    if (g_n_gpus <= 1) {
-        auto exact = g_q8_f32_by_offset.find(offset);
-        if (exact != g_q8_f32_by_offset.end()) {
-            const cuda_q8_f32_range &r = g_q8_f32_ranges[exact->second];
-            if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
-                r.in_dim == in_dim && r.out_dim == out_dim) {
-                return r.device_ptr;
-            }
-        }
-    } else {
-        for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
-            if (r.host_base == model_map &&
-                r.offset == offset &&
-                r.weight_bytes == weight_bytes &&
-                r.in_dim == in_dim &&
-                r.out_dim == out_dim &&
-                r.device_id == expected_device) {
-                return r.device_ptr;
-            }
-        }
-    }
-    if (!cuda_q8_f32_cache_allowed(label, in_dim, out_dim)) return NULL;
-
-    /* Source Q8 bytes: legacy path in single-tier; strict per-device lookup
-     * in multi-tier (same rationale as cuda_q8_f16_ptr). */
-    const char *q8;
-    if (g_n_gpus <= 1) {
-        q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, label ? label : "q8_0");
-    } else {
-        void *strict_ptr = NULL;
-        if (!ds4_gpu_lookup_cache_strict(offset, weight_bytes, expected_device, &strict_ptr) ||
-            !strict_ptr) {
-            fprintf(stderr,
-                "ds4: q8 fp32 cache miss: source bytes not in selective cache for "
-                "offset=%llu bytes=%llu device=%d (label=%s); placement bug\n",
-                (unsigned long long)offset, (unsigned long long)weight_bytes,
-                expected_device, label ? label : "?");
-            return NULL;
-        }
-        q8 = (const char *)strict_ptr;
-    }
-    if (!q8) return NULL;
-
-    const uint64_t out_bytes = in_dim * out_dim * sizeof(float);
-    int prev = -1;
-    if (g_n_gpus > 1) {
-        cudaError_t derr = cudaGetDevice(&prev);
-        if (derr != cudaSuccess) {
-            fprintf(stderr, "ds4: cudaGetDevice failed before q8 fp32 alloc on device %d: %s\n",
-                    expected_device, cudaGetErrorString(derr));
-            (void)cudaGetLastError();
-            return NULL;
-        }
-        derr = cudaSetDevice(expected_device);
-        if (derr != cudaSuccess) {
-            fprintf(stderr, "ds4: cudaSetDevice(%d) failed before q8 fp32 alloc: %s\n",
-                    expected_device, cudaGetErrorString(derr));
-            (void)cudaGetLastError();
-            if (prev >= 0) (void)cudaSetDevice(prev);
-            return NULL;
-        }
-    }
-    float *dev = NULL;
-    cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA q8 fp32 cache alloc failed on device %d (%.2f MiB): %s\n",
-                expected_device, (double)out_bytes / 1048576.0, cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
-        return NULL;
-    }
-    const uint64_t blocks = (in_dim + 31) / 32;
-    const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f32_kernel<<<(n + 255) / 256, 256>>>(dev,
-                                                          (const unsigned char *)q8,
-                                                          in_dim,
-                                                          out_dim,
-                                                          blocks);
-    if (!cuda_ok(cudaGetLastError(), "q8 fp32 dequant launch")) {
-        (void)cudaFree(dev);
-        if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
-        return NULL;
-    }
-    g_q8_f32_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev, expected_device});
-    if (g_n_gpus <= 1) {
-        g_q8_f32_by_offset[offset] = g_q8_f32_ranges.size() - 1u;
-    }
-    g_q8_f32_bytes += out_bytes;
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA cached q8 fp32 %.2f MiB on device %d (total %.2f GiB)\n",
-                (double)out_bytes / 1048576.0, expected_device,
-                (double)g_q8_f32_bytes / 1073741824.0);
-    }
-    if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
     return dev;
 }
 
@@ -1763,156 +1345,6 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
     return cuda_pread_full(g_model_fd, stage, bytes, offset);
 }
 
-#if 0
-static void cuda_stream_selected_stage_release(void) {
-    for (size_t i = 0; i < 4; i++) {
-        if (g_stream_selected_stage_event[i]) {
-            (void)cudaEventDestroy(g_stream_selected_stage_event[i]);
-            g_stream_selected_stage_event[i] = NULL;
-        }
-        if (g_stream_selected_stage_raw[i]) {
-            (void)cudaFreeHost(g_stream_selected_stage_raw[i]);
-            g_stream_selected_stage_raw[i] = NULL;
-            g_stream_selected_stage[i] = NULL;
-        }
-    }
-    g_stream_selected_stage_bytes = 0;
-    if (g_stream_selected_upload_stream) {
-        (void)cudaStreamDestroy(g_stream_selected_upload_stream);
-        g_stream_selected_upload_stream = NULL;
-    }
-}
-
-static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
-    if (g_stream_selected_stage_bytes >= bytes) return 1;
-    cuda_stream_selected_stage_release();
-    cudaError_t err = cudaStreamCreateWithFlags(
-            &g_stream_selected_upload_stream, cudaStreamNonBlocking);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                "ds4: CUDA streaming selected upload stream creation failed: %s\n",
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-    for (size_t i = 0; i < 4; i++) {
-        err = cudaMallocHost(&g_stream_selected_stage_raw[i], (size_t)bytes);
-        if (err != cudaSuccess) {
-            fprintf(stderr,
-                    "ds4: CUDA streaming selected staging allocation failed: %s\n",
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            cuda_stream_selected_stage_release();
-            return 0;
-        }
-        g_stream_selected_stage[i] = cuda_align_ptr(
-                g_stream_selected_stage_raw[i], g_model_direct_align);
-        err = cudaEventCreateWithFlags(&g_stream_selected_stage_event[i],
-                                       cudaEventDisableTiming);
-        if (err != cudaSuccess) {
-            fprintf(stderr,
-                    "ds4: CUDA streaming selected staging event creation failed: %s\n",
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            cuda_stream_selected_stage_release();
-            return 0;
-        }
-    }
-    g_stream_selected_stage_bytes = bytes;
-    return 1;
-}
-
-int cuda_model_copy_to_device_streamed(
-        char *dst,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t offset,
-        uint64_t bytes,
-        const char *what) {
-    if (!dst || !model_map || offset > model_size ||
-        bytes > model_size - offset) {
-        return 0;
-    }
-    if (bytes == 0) return 1;
-    if (g_model_fd < 0 ||
-        (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
-        return cuda_ok(cudaMemcpy(dst,
-                                  (const char *)model_map + offset,
-                                  (size_t)bytes,
-                                  cudaMemcpyHostToDevice),
-                       what ? what : "stream selected expert copy");
-    }
-
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    const uint64_t stage_bytes =
-        chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
-
-    uint64_t copied = 0;
-    uint64_t chunk_idx = 0;
-    while (copied < bytes) {
-        const uint64_t n = bytes - copied < chunk ? bytes - copied : chunk;
-        const uint64_t bi = chunk_idx % 4u;
-        cudaError_t err;
-        if (chunk_idx >= 4u) {
-            err = cudaEventSynchronize(g_stream_selected_stage_event[bi]);
-            if (err != cudaSuccess) {
-                fprintf(stderr,
-                        "ds4: CUDA streaming selected staging wait failed for %s: %s\n",
-                        what ? what : "expert", cudaGetErrorString(err));
-                (void)cudaGetLastError();
-                return 0;
-            }
-        }
-        const char *payload = NULL;
-        if (!cuda_model_stage_read(g_stream_selected_stage[bi],
-                                   g_stream_selected_stage_bytes,
-                                   offset + copied, n, &payload)) {
-            fprintf(stderr,
-                    "ds4: CUDA streaming selected read failed for %s at %.2f MiB: %s\n",
-                    what ? what : "expert", (double)copied / 1048576.0,
-                    strerror(errno));
-            return 0;
-        }
-        err = cudaMemcpyAsync(dst + copied, payload, (size_t)n,
-                              cudaMemcpyHostToDevice,
-                              g_stream_selected_upload_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr,
-                    "ds4: CUDA streaming selected copy failed for %s at %.2f MiB: %s\n",
-                    what ? what : "expert", (double)copied / 1048576.0,
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return 0;
-        }
-        err = cudaEventRecord(g_stream_selected_stage_event[bi],
-                              g_stream_selected_upload_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr,
-                    "ds4: CUDA streaming selected staging record failed for %s: %s\n",
-                    what ? what : "expert", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return 0;
-        }
-        cuda_model_drop_file_pages(offset + copied, n);
-        cuda_model_discard_source_pages(model_map, model_size,
-                                        offset + copied, n);
-        copied += n;
-        chunk_idx++;
-    }
-
-    const cudaError_t err =
-        cudaStreamSynchronize(g_stream_selected_upload_stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                "ds4: CUDA streaming selected upload sync failed for %s: %s\n",
-                what ? what : "expert", cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-    return 1;
-}
-#endif
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
     uint64_t gb = 0;
@@ -2208,209 +1640,13 @@ int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
-#if 0
-extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
-    if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
-    cuda_xdev_env_refresh();
-    cuda_decode_dispatch_env_refresh();
-    g_current_logical_tier = -1;
-
-    /* g_n_gpus is published incrementally so ds4_gpu_cleanup() can unwind
-     * partial state on failure. We publish `i + 1` BEFORE allocating any
-     * resources for context `i`, so even if (e.g.) stream creation
-     * succeeds but event creation fails, cleanup still walks device `i`
-     * and destroys the stream. ds4_gpu_cleanup is null-safe per field —
-     * partial state is OK. */
-    for (int i = 0; i < cfg->n_gpus; i++) {
-        ds4_gpu_ctx *c = &g_gpu[i];
-        c->device_id = cfg->device_indices[i];
-        if (c->device_id < 0) return 0;
-        /* Publish the in-progress device id so cleanup can target it on
-         * any later failure. cudaSetDevice is also required before
-         * cleanup's cudaEventDestroy / cudaStreamDestroy / cublasDestroy
-         * calls hit the right context. */
-        g_n_gpus = i + 1;
-        if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
-        cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
-                    prop.name, prop.major, prop.minor, c->device_id);
-        }
-        /* Per-device stream. */
-        cudaStream_t s = NULL;
-        if (!cuda_ok(cudaStreamCreate(&s), "init stream")) return 0;
-        c->stream = (void *)s;
-        /* Per-device boundary event (reusable, no timing). */
-        cudaEvent_t ev = NULL;
-        if (!cuda_ok(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
-                      "init event")) return 0;
-        c->boundary_event = (void *)ev;
-        /* Per-device cuBLAS handle. */
-        cublasHandle_t h = NULL;
-        if (!cublas_ok(cublasCreate(&h), "init cublas")) return 0;
-        c->cublas = (void *)h;
-        const cublasMath_t math_mode =
-            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
-                ? CUBLAS_DEFAULT_MATH
-                : CUBLAS_TF32_TENSOR_OP_MATH;
-        (void)cublasSetMathMode(h, math_mode);
-        c->cublas_ready = 1;
-        c->budget_bytes = cfg->vram_bytes[i];
-        c->used_bytes   = 0;
-        c->scratch      = NULL;
-        c->scratch_bytes = 0;
-    }
-
-    /* NxN peer-access matrix.
-     *
-     * Driver semantics: cudaDeviceCanAccessPeer + cudaDeviceEnablePeerAccess
-     * can both succeed even on hardware/drivers where cudaMemcpyPeerAsync
-     * silently delivers wrong data (notably RTX 6000 Ada under recent
-     * NVIDIA drivers, per the v0 design doc). The corruption is
-     * non-deterministic and can affect either or both directions of a
-     * pair. To guard against this, we run a multi-size, multi-iteration
-     * validation at init (see the loop below): write distinct known
-     * patterns, peer-copy them to the destination, read back, and only
-     * set peer_ok[i][j] if every probe round-trips byte-perfect. A
-     * single small probe is not sufficient — it can pass while realistic
-     * activation-sized copies still corrupt. On any failure the entry
-     * stays at 0 and cross-device copies fall back to the pinned-host
-     * bounce path automatically. */
-    for (int i = 0; i < g_n_gpus; i++) {
-        for (int j = 0; j < g_n_gpus; j++) {
-            if (i == j) { g_gpu_peer_ok[i][j] = 1; continue; }
-            int can = 0;
-            (void)cudaDeviceCanAccessPeer(&can, g_gpu[i].device_id,
-                                          g_gpu[j].device_id);
-            if (!can) { g_gpu_peer_ok[i][j] = 0; continue; }
-            (void)cudaSetDevice(g_gpu[i].device_id);
-            cudaError_t e = cudaDeviceEnablePeerAccess(g_gpu[j].device_id, 0);
-            int enabled = (e == cudaSuccess ||
-                           e == cudaErrorPeerAccessAlreadyEnabled);
-            (void)cudaGetLastError();
-            if (!enabled) { g_gpu_peer_ok[i][j] = 0; continue; }
-
-            /* Runtime validation: peer copies on RTX 6000 Ada under recent
-             * NVIDIA drivers silently corrupt at realistic sizes even though
-             * the API returns success. cudaDeviceCanAccessPeer and
-             * cudaDeviceEnablePeerAccess can both report success while
-             * cudaMemcpyPeer delivers wrong data non-deterministically.
-             * Probe with multiple sizes and iterations; ALL must round-trip
-             * byte-perfect or we disable peer for this pair and silently fall
-             * back to the pinned-host bounce path. */
-            static const size_t kValidateSizes[] = {
-                4u * 1024u,
-                256u * 1024u,
-                1u * 1024u * 1024u,
-                16u * 1024u * 1024u,
-            };
-            const int kValidateIters    = 4;
-            const int kNValidateSizes   = (int)(sizeof(kValidateSizes) /
-                                                sizeof(kValidateSizes[0]));
-            const size_t kMaxValidate   = kValidateSizes[kNValidateSizes - 1];
-
-            unsigned char *vh_src = (unsigned char *)malloc(kMaxValidate);
-            unsigned char *vh_dst = (unsigned char *)malloc(kMaxValidate);
-            if (!vh_src || !vh_dst) {
-                free(vh_src); free(vh_dst);
-                g_gpu_peer_ok[i][j] = 0; continue;
-            }
-
-            void *src_dev = NULL; void *dst_dev = NULL;
-            (void)cudaSetDevice(g_gpu[i].device_id);
-            if (cudaMalloc(&src_dev, kMaxValidate) != cudaSuccess) {
-                (void)cudaGetLastError();
-                free(vh_src); free(vh_dst);
-                g_gpu_peer_ok[i][j] = 0; continue;
-            }
-            (void)cudaSetDevice(g_gpu[j].device_id);
-            if (cudaMalloc(&dst_dev, kMaxValidate) != cudaSuccess) {
-                (void)cudaGetLastError();
-                (void)cudaSetDevice(g_gpu[i].device_id);
-                (void)cudaFree(src_dev);
-                free(vh_src); free(vh_dst);
-                g_gpu_peer_ok[i][j] = 0; continue;
-            }
-
-            int    peer_validated = 1;
-            size_t failed_bytes   = 0;
-            int    failed_iter    = -1;
-            for (int s_idx = 0;
-                 s_idx < kNValidateSizes && peer_validated;
-                 s_idx++) {
-                size_t n = kValidateSizes[s_idx];
-                for (int it = 0; it < kValidateIters && peer_validated; it++) {
-                    for (size_t k = 0; k < n; k++) {
-                        vh_src[k] = (unsigned char)
-                            ((k * 31u + (size_t)it * 17u +
-                              (size_t)s_idx * 53u + 11u) & 0xffu);
-                    }
-                    (void)cudaSetDevice(g_gpu[i].device_id);
-                    if (cudaMemcpy(src_dev, vh_src, n,
-                                   cudaMemcpyHostToDevice) != cudaSuccess) {
-                        peer_validated = 0; failed_bytes = n; failed_iter = it;
-                        break;
-                    }
-                    cudaError_t pc = cudaMemcpyPeer(
-                        dst_dev, g_gpu[j].device_id,
-                        src_dev, g_gpu[i].device_id, n);
-                    if (pc != cudaSuccess) {
-                        peer_validated = 0; failed_bytes = n; failed_iter = it;
-                        break;
-                    }
-                    (void)cudaSetDevice(g_gpu[j].device_id);
-                    if (cudaMemcpy(vh_dst, dst_dev, n,
-                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-                        peer_validated = 0; failed_bytes = n; failed_iter = it;
-                        break;
-                    }
-                    if (memcmp(vh_src, vh_dst, n) != 0) {
-                        peer_validated = 0; failed_bytes = n; failed_iter = it;
-                        break;
-                    }
-                }
-            }
-
-            (void)cudaSetDevice(g_gpu[j].device_id);
-            (void)cudaFree(dst_dev);
-            (void)cudaSetDevice(g_gpu[i].device_id);
-            (void)cudaFree(src_dev);
-            free(vh_src);
-            free(vh_dst);
-
-            g_gpu_peer_ok[i][j] = peer_validated;
-            if (peer_validated) {
-                fprintf(stderr,
-                    "ds4: peer access %d->%d validated across %d sizes x %d"
-                    " iterations (max %zu MiB)\n",
-                    g_gpu[i].device_id, g_gpu[j].device_id,
-                    kNValidateSizes, kValidateIters,
-                    kMaxValidate / (1024u * 1024u));
-            } else {
-                fprintf(stderr,
-                    "ds4: peer access %d->%d FAILED validation at"
-                    " size=%zu iter=%d; falling back to pinned-host bounce\n",
-                    g_gpu[i].device_id, g_gpu[j].device_id,
-                    failed_bytes, failed_iter);
-            }
-        }
-    }
-
-    g_cublas_ready = 1;
-    return 1;
-}
-
-#endif
 
 extern "C" int ds4_gpu_init(void) {
     cuda_decode_dispatch_env_refresh();
-    g_current_logical_tier = -1;
     memset(&g_gpu[0], 0, sizeof(g_gpu[0]));
     ds4_gpu_ctx *context = &g_gpu[0];
     context->device_id = 0;
     g_n_gpus = 1;
-    g_gpu_peer_ok[0][0] = 1;
-
     if (!cuda_ok(cudaSetDevice(0), "init set device")) return 0;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
@@ -2446,8 +1682,6 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
-    g_current_logical_tier = -1;
-
     /* The single GB10 owns one stream, one cuBLAS handle, and one scratch set. */
     for (int i = 0; i < g_n_gpus; i++) {
         ds4_gpu_ctx *c = &g_gpu[i];
@@ -2466,11 +1700,6 @@ extern "C" void ds4_gpu_cleanup(void) {
             (void)cublasDestroy((cublasHandle_t)c->cublas);
             c->cublas = NULL;
             c->cublas_ready = 0;
-        }
-        if (c->scratch) {
-            (void)cudaFree(c->scratch);
-            c->scratch = NULL;
-            c->scratch_bytes = 0;
         }
         if (g_tt_scratch && g_tt_scratch_device == c->device_id) {
             (void)cudaFree(g_tt_scratch);
@@ -2491,33 +1720,11 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_n_gpus = 0;
     g_cublas_ready = 0;
 
-    /* Per-device selective cache teardown (selective model cache). */
-    for (int d = 0; d < DS4_MAX_GPUS; d++) {
-        if (!g_dev_cache[d].present) continue;
-        int prev = -1;
-        (void)cudaGetDevice(&prev);
-        (void)cudaSetDevice(d);
-        if (g_dev_cache[d].base) (void)cudaFree(g_dev_cache[d].base);
-        g_dev_cache[d].base = NULL;
-        g_dev_cache[d].bytes = 0;
-        g_dev_cache[d].present = 0;
-        if (prev >= 0) (void)cudaSetDevice(prev);
-    }
-    g_cache_ranges.clear();
-
-    /* Continue with legacy global teardown below. */
-
     cuda_model_range_release_all();
     cuda_derived_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
-    for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
-        (void)cudaFree(r.device_ptr);
-    }
-    g_q8_f32_ranges.clear();
-    g_q8_f32_by_offset.clear();
-    g_q8_f32_bytes = 0;
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
@@ -2579,6 +1786,5 @@ extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
     t->bytes = bytes;
     t->owner = 1;
     t->device_id = device_id;
-    g_gpu[device_id].used_bytes += bytes;
     return 0;
 }

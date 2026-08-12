@@ -30,20 +30,6 @@ extern "C" {
 int ds4_mmq_init(int device);
 void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes);
 
-// Query whether ds4_mmq is willing to handle a given matmul. Returns
-//   1 if mmq is faster than dequant+cublas for this shape on this device,
-//   0 otherwise (caller should fall back to its existing dequant+cublas path).
-//
-// Wraps ggml_cuda_should_use_mmq. type_x uses ds4 quant codes which match
-// ggml's enum:
-//   8  = Q8_0
-//   10 = Q2_K
-//   16 = IQ2_XXS
-//
-//   ne11:      batch dimension (number of activation columns / tokens).
-//   n_experts: 0 for dense matmul, >0 for MoE (e.g. 256 for V4 Flash).
-int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
-
 // Dense matmul entry points. Per-type wrappers that all share the same
 // underlying mul_mat_q template, parameterised by the weight quant type.
 //
@@ -71,34 +57,6 @@ int ds4_mmq_q8_0_dense(
     int           K,
     cudaStream_t  stream);
 
-// v0.5 flat-pool p5a: same contract as ds4_mmq_q8_0_dense but the
-// activation arrives PRE-QUANTIZED in the block_q8_1_mmq D4 layout
-// (producer-emitted, op-for-op equal to quantize_mmq_q8_1<D4>; the fused
-// own out_a kernel is the producer).  Y_q8_mmq must hold N*(K/128)
-// 144-byte blocks (ib = kseg*N + row) plus mmq_x_max tail slack, which
-// this entry zeroes.  Requires K such that GGML_PAD(K, MATRIX_ROW_PADDING)
-// == K.  Returns 0 on success; callers fall back to the quantizing entry
-// on any non-zero.
-int ds4_mmq_q8_0_dense_preq(
-    const void  * W_q8_0,
-    const void  * Y_q8_mmq,
-    size_t        y_bytes,
-    float       * out_f32,
-    int           M,
-    int           N,
-    int           K,
-    cudaStream_t  stream);
-
-// p5a verify instrument: reference quantize (dense_impl parameters) into a
-// caller buffer, for byte-diffing producer emits.
-int ds4_mmq_q8_0_quantize_ref(
-    const float * X,
-    void        * y,
-    size_t        y_bytes,
-    int           N,
-    int           K,
-    cudaStream_t  stream);
-
 // Dense Q8_0 D2R on the kind-5 aligned artifact (weight server
 // --repack-q8-aligned).  Same in/out contract as ds4_mmq_q8_0_dense but W is
 // the ALIGNED artifact base ([half dq[nblk]][pad64][int8 qs]), and the shape
@@ -107,21 +65,6 @@ int ds4_mmq_q8_0_quantize_ref(
 int ds4_mmq_q8_0_dense_d2r(
     const void  * W_aligned,
     const float * X_f32,
-    float       * out_f32,
-    int           M,
-    int           N,
-    int           K,
-    cudaStream_t  stream);
-
-// flat-pool p5c: D2R dense over a producer-quantized token-major Y
-// (block_q8_1_mmq D4, ib = kseg*N + row, requires GGML_PAD(K) == K).
-// y_bytes must cover the payload plus max(mmq_x_max, 128) slack blocks;
-// the slack is zeroed here each call (S1.1a).  Returns 0 on success;
-// callers fall back to the quantizing entry on any non-zero.
-int ds4_mmq_q8_0_dense_d2r_preq(
-    const void  * W_aligned,
-    const void  * Y_q8_mmq,
-    size_t        y_bytes,
     float       * out_f32,
     int           M,
     int           N,

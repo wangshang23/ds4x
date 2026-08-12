@@ -189,15 +189,9 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
     return 0;
 }
 
-/* Pay the one-time first-submission GPU cost (pipeline ramp plus model-heap
- * residency for the batched prefill kernels) outside any measured window.
- * The TP worker calls this right after creating its session: it otherwise
- * encodes no main-queue GPU work until the first mirrored sync arrives, so
- * the cost lands inside the leader-timed prefill (measured ~1.1 s per run
- * on the M5 Max pair -- the whole first-run TP deficit vs single
- * node, which pays the same cost before its timing window starts). */
+/* Pay the one-time CUDA submission and model-residency cost outside any
+ * measured prefill window. */
 void ds4_session_gpu_warmup(ds4_session *s) {
-#ifndef DS4_NO_GPU
     if (!s || ds4_session_is_cpu(s)) return;
     if (!metal_graph_batch_hc_mix(&s->graph) ||
         !metal_graph_batch_flat_hc(&s->graph)) return;
@@ -206,12 +200,8 @@ void ds4_session_gpu_warmup(ds4_session *s) {
                                              &s->engine->model,
                                              &s->engine->weights,
                                              32);
-#else
-    (void)s;
-#endif
 }
 
-#ifndef DS4_NO_GPU
 static bool ds4_session_dspark_capture_current(const ds4_session *s) {
     if (!s || ds4_session_is_cpu(s) || !s->checkpoint_valid) return false;
     const ds4_gpu_graph *g = &s->graph;
@@ -753,8 +743,6 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
         s->engine->support_kind != DS4_SUPPORT_DSPARK) return;
     (void)ds4_session_prepare_dspark_draft(s, token, pos);
 }
-#endif
-
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
@@ -791,17 +779,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 0;
 }
 
-int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
-                                     char *err, size_t errlen) {
+int ds4_session_eval_probe_draft(ds4_session *s, int token, bool probe_mtp,
+                                 char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, probe_mtp, err, errlen);
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     bool probe_mtp = true;
-#ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
         probe_mtp = false;
     }
-#endif
-    return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    return ds4_session_eval_probe_draft(s, token, probe_mtp, err, errlen);
 }

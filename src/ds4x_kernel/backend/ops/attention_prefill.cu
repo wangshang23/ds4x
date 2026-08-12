@@ -442,37 +442,6 @@ extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint3
     rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
-extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
-        ds4_gpu_tensor                       *x,
-        const ds4_gpu_attention_decode_row   *rows,
-        uint32_t                              n_rows,
-        uint32_t                              n_head,
-        uint32_t                              head_dim,
-        uint32_t                              n_rot,
-        uint32_t                              n_ctx_orig,
-        bool                                  inverse,
-        float                                 freq_base,
-        float                                 freq_scale,
-        float                                 ext_factor,
-        float                                 attn_factor,
-        float                                 beta_fast,
-        float                                 beta_slow) {
-    if (!x || !rows || n_rows == 0u ||
-        n_rows > DS4_GPU_ATTENTION_DECODE_BATCH_MAX || n_head == 0u ||
-        n_rot == 0u || n_rot > head_dim || (n_rot & 1u) != 0u ||
-        x->bytes < (uint64_t)n_rows * n_head * head_dim * sizeof(float)) {
-        return 0;
-    }
-    cuda_attention_decode_row_table table;
-    memset(&table, 0, sizeof(table));
-    for (uint32_t i = 0; i < n_rows; i++) table.row[i].pos = rows[i].pos;
-    const uint32_t pairs = n_rows * n_head * (n_rot / 2u);
-    rope_tail_decode_rows_kernel<<<(pairs + 255u) / 256u, 256>>>(
-            (float *)x->ptr, table, n_rows, n_head, head_dim, n_rot,
-            n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    return cuda_ok(cudaGetLastError(), "rope tail decode rows launch");
-}
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
@@ -496,36 +465,6 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
     return cuda_ok(cudaGetLastError(), "fp8 KV quantize/store launch");
 }
 
-extern "C" int ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
-        ds4_gpu_tensor        *kv,
-        ds4_gpu_tensor *const *raw_caches,
-        const uint32_t        *raw_caps,
-        const uint32_t        *raw_rows,
-        uint32_t               n_rows,
-        uint32_t               head_dim,
-        uint32_t               n_rot) {
-    if (!kv || !raw_caches || !raw_caps || !raw_rows || n_rows == 0u ||
-        n_rows > DS4_GPU_ATTENTION_DECODE_BATCH_MAX || n_rot > head_dim ||
-        kv->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
-        return 0;
-    }
-    cuda_attention_decode_row_table table;
-    memset(&table, 0, sizeof(table));
-    for (uint32_t i = 0; i < n_rows; i++) {
-        const ds4_gpu_tensor *raw = raw_caches[i];
-        if (!raw || raw_caps[i] == 0u || raw_rows[i] >= raw_caps[i] ||
-            raw->device_id != kv->device_id ||
-            raw->bytes < (uint64_t)raw_caps[i] * DS4_SPARK_KV_ROW_BYTES) {
-            return 0;
-        }
-        table.row[i].raw_kv = (uint64_t)(uintptr_t)raw->ptr;
-        table.row[i].raw_cap = raw_caps[i];
-        table.row[i].raw_start = raw_rows[i];
-    }
-    spark_pack_kv_decode_rows_kernel<<<n_rows, 64>>>(
-            (float *)kv->ptr, table, n_rows);
-    return cuda_ok(cudaGetLastError(), "fp8 KV quantize/store rows launch");
-}
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
         head_dim != 512u ||
@@ -1838,274 +1777,6 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 
-extern "C" int ds4_gpu_attention_decode_heads_rope_tensor(
-        ds4_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        uint32_t                n_raw,
-        uint32_t                raw_cap,
-        uint32_t                raw_start,
-        const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        uint32_t                n_comp,
-        const ds4_gpu_tensor *comp_mask,
-        uint32_t                use_mask,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                n_rot,
-        uint32_t                pos0,
-        uint32_t                n_ctx_orig,
-        float                   freq_base,
-        float                   freq_scale,
-        float                   ext_factor,
-        float                   attn_factor,
-        float                   beta_fast,
-        float                   beta_slow,
-        int                    *fused_inv_rope) {
-    if (fused_inv_rope) *fused_inv_rope = 0;
-    if (!g_cuda_exact_score_split_fuse_inv_rope ||
-        n_rot == 0u || n_rot > head_dim || (n_rot & 1u) ||
-        head_dim != 512u) {
-        return ds4_gpu_attention_decode_heads_tensor(
-                heads, model_map, model_size, sinks_offset, q, raw_kv,
-                n_raw, raw_cap, raw_start, comp_kv, comp_kv_f16, n_comp,
-                comp_mask, use_mask, n_head, head_dim);
-    }
-    if (!use_mask && g_cuda_decode_heads8_online && !g_cuda_no_window_attention) {
-        return ds4_gpu_attention_decode_heads_tensor(
-                heads, model_map, model_size, sinks_offset, q, raw_kv,
-                n_raw, raw_cap, raw_start, comp_kv, comp_kv_f16, n_comp,
-                comp_mask, use_mask, n_head, head_dim);
-    }
-    if (comp_kv_f16 ||
-        !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
-        raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
-        sinks_offset > model_size ||
-        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
-        heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
-        q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
-        (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float)) ||
-        !cuda_attention_score_buffer_fits(n_comp)) {
-        return ds4_gpu_attention_decode_heads_tensor(
-                heads, model_map, model_size, sinks_offset, q, raw_kv,
-                n_raw, raw_cap, raw_start, comp_kv, comp_kv_f16, n_comp,
-                comp_mask, use_mask, n_head, head_dim);
-    }
-    const uint32_t score_lanes =
-        g_cuda_decode_score4 ? 4u : (g_cuda_decode_score8 ? 8u : 0u);
-    const uint32_t threads =
-        score_lanes == 0u && !g_cuda_no_decode_value512 ? 512u : 256u;
-    if (threads < 512u) {
-        return ds4_gpu_attention_decode_heads_tensor(
-                heads, model_map, model_size, sinks_offset, q, raw_kv,
-                n_raw, raw_cap, raw_start, comp_kv, comp_kv_f16, n_comp,
-                comp_mask, use_mask, n_head, head_dim);
-    }
-    const int logical_tier = ds4_tensor_device_idx(heads);
-    const float *sinks = (const float *)cuda_resolve_weight_ptr(
-            model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
-            logical_tier, "attn_sinks");
-    if (!sinks) return 0;
-    cuda_attention_inv_rope_params rope;
-    rope.n_rot = n_rot;
-    rope.pos0 = pos0;
-    rope.n_ctx_orig = n_ctx_orig;
-    rope.freq_base = freq_base;
-    rope.freq_scale = freq_scale;
-    rope.ext_factor = ext_factor;
-    rope.attn_factor = attn_factor;
-    rope.beta_fast = beta_fast;
-    rope.beta_slow = beta_slow;
-    int score_split_rc = attention_decode_score_split_launch(
-            logical_tier, (float *)heads->ptr, sinks, (const float *)q->ptr,
-            (const float *)raw_kv->ptr,
-            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-            use_mask ? (const float *)comp_mask->ptr : NULL, use_mask,
-            0, n_raw, raw_cap, raw_start, n_comp, 0, 0,
-            n_head, head_dim, threads, &rope);
-    if (score_split_rc == 1) {
-        if (fused_inv_rope) *fused_inv_rope = 1;
-        return cuda_ok(cudaGetLastError(),
-                       "attention exact score split fused inv rope launch");
-    }
-    if (score_split_rc < 0) return 0;
-    return ds4_gpu_attention_decode_heads_tensor(
-            heads, model_map, model_size, sinks_offset, q, raw_kv,
-            n_raw, raw_cap, raw_start, comp_kv, comp_kv_f16, n_comp,
-            comp_mask, use_mask, n_head, head_dim);
-}
-
-extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
-        ds4_gpu_tensor                       *heads,
-        const void                           *model_map,
-        uint64_t                              model_size,
-        uint64_t                              sinks_offset,
-        const ds4_gpu_tensor                 *q,
-        const ds4_gpu_attention_decode_row   *rows,
-        uint32_t                              n_rows,
-        uint32_t                              n_head,
-        uint32_t                              head_dim,
-        uint32_t                              n_rot,
-        uint32_t                              n_ctx_orig,
-        float                                 freq_base,
-        float                                 freq_scale,
-        float                                 ext_factor,
-        float                                 attn_factor,
-        float                                 beta_fast,
-        float                                 beta_slow) {
-    if (!heads || !q || !rows || !model_map || n_rows < 2u ||
-        n_rows > DS4_GPU_ATTENTION_DECODE_BATCH_MAX || n_head == 0u ||
-        head_dim != 512u || n_rot == 0u || n_rot > head_dim ||
-        (n_rot & 1u) != 0u || sinks_offset > model_size ||
-        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
-        heads->bytes < (uint64_t)n_rows * n_head * head_dim * sizeof(float) ||
-        q->bytes < (uint64_t)n_rows * n_head * head_dim * sizeof(float)) {
-        return 0;
-    }
-    const int logical_tier = ds4_tensor_device_idx(heads);
-    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
-        ds4_tensor_device_idx(q) != logical_tier) {
-        return 0;
-    }
-
-    /* This first grouped path mirrors the promoted default decode exactly.
-     * Alternative score kernels and graph/split-KV experiments retain the
-     * one-session dispatcher until they gain equivalent row-table variants. */
-    if (cuda_env_flag_enabled("DS4_CUDA_NO_EXACT_SCORE_SPLIT_DECODE", 0) ||
-        !cuda_env_flag_enabled("DS4_CUDA_EXACT_SCORE_SPLIT_DECODE", 1) ||
-        cuda_splitkv_decode_requested() ||
-        g_cuda_decode_heads8_online || g_cuda_decode_score4 ||
-        g_cuda_decode_score8 || g_cuda_no_decode_value512 ||
-        g_cuda_exact_score_split_graph || g_cuda_exact_score_split_ldg ||
-        g_cuda_exact_score_split_vec4 ||
-        g_cuda_exact_score_split_vec4_plain ||
-        g_cuda_exact_score_split_dim2 ||
-        g_cuda_exact_score_split_fuse_inv_rope ||
-        getenv("DS4_CUDA_NO_SCORE_TILE") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_MIN_SCORE") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_CHUNK") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S_FLOOR") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S_MAX") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S") != NULL) {
-        return 0;
-    }
-
-    cuda_attention_decode_row_table table;
-    memset(&table, 0, sizeof(table));
-    uint32_t max_dense_score = 0u;
-    bool have_dense = false;
-    bool have_indexed = false;
-    for (uint32_t i = 0; i < n_rows; i++) {
-        const ds4_gpu_attention_decode_row r = rows[i];
-        if (r.raw_kv == 0u || r.n_raw == 0u || r.raw_cap < r.n_raw ||
-            r.raw_start >= r.raw_cap || (r.n_comp != 0u && r.comp_kv == 0u)) {
-            return 0;
-        }
-        if (r.indexed) {
-            if (r.comp_kv == 0u || r.topk == 0u || r.n_comp == 0u ||
-                r.top_k == 0u || r.top_k > 512u || r.ratio == 0u) {
-                return 0;
-            }
-            have_indexed = true;
-        } else {
-            const uint32_t raw_count = r.n_raw > 256u ? 256u : r.n_raw;
-            const uint32_t n_score = raw_count + r.n_comp;
-            /* n_score==1 takes the legacy one-block kernel and is not a
-             * score-split shape. Decode after any nonempty prompt is >1. */
-            if (n_score <= 1u || n_score > DS4_CUDA_ATTENTION_SCORE_CAP) {
-                return 0;
-            }
-            if (n_score > max_dense_score) max_dense_score = n_score;
-            have_dense = true;
-        }
-        table.row[i] = r;
-    }
-
-    const float *sinks = (const float *)cuda_resolve_weight_ptr(
-        model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
-        logical_tier, "attn_sinks_rows");
-    if (!sinks) return 0;
-
-    if (have_dense) {
-        if ((uint64_t)n_rows > UINT64_MAX / n_head ||
-            (uint64_t)n_rows * n_head > UINT64_MAX / max_dense_score) {
-            return 0;
-        }
-        const uint64_t score_count =
-            (uint64_t)n_rows * n_head * max_dense_score;
-        float *scores = (float *)cuda_tmp_alloc_on(
-            logical_tier, score_count * sizeof(float),
-            "attention exact decode rows");
-        if (!scores) return 0;
-
-        const size_t tile_shmem =
-            (size_t)(DS4_SCORE_TILE_HEADS + DS4_SCORE_TILE_ROWS) *
-            DS4_SCORE_TILE_STRIDE * sizeof(float);
-        static int tile_shmem_ready[DS4_MAX_GPUS] = {0};
-        int physical_device = 0;
-        if (cudaGetDevice(&physical_device) != cudaSuccess ||
-            physical_device < 0 || physical_device >= DS4_MAX_GPUS) {
-            return 0;
-        }
-        if (!tile_shmem_ready[physical_device]) {
-            if (!cuda_ok(cudaFuncSetAttribute(
-                    attention_decode_score_split_scores_tile512_rows_kernel,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    (int)tile_shmem),
-                    "attention score rows shared-memory opt-in")) {
-                return 0;
-            }
-            tile_shmem_ready[physical_device] = 1;
-        }
-        dim3 score_grid(
-            (max_dense_score + DS4_SCORE_TILE_ROWS - 1u) /
-                DS4_SCORE_TILE_ROWS,
-            (n_head + DS4_SCORE_TILE_HEADS - 1u) /
-                DS4_SCORE_TILE_HEADS,
-            n_rows);
-        attention_decode_score_split_scores_tile512_rows_kernel
-            <<<score_grid, 256, tile_shmem>>>(
-                scores, (const float *)q->ptr, table, n_rows,
-                max_dense_score, n_head, head_dim);
-        if (!cuda_ok(cudaGetLastError(),
-                     "attention exact score rows launch")) {
-            return 0;
-        }
-        dim3 final_grid(n_rows, n_head, 1u);
-        attention_decode_score_split_finalize_rows_kernel
-            <<<final_grid, 512>>>(
-                (float *)heads->ptr, sinks, scores, table, n_rows,
-                max_dense_score, n_head, head_dim);
-        if (!cuda_ok(cudaGetLastError(),
-                     "attention exact finalize rows launch")) {
-            return 0;
-        }
-    }
-    if (have_indexed) {
-        dim3 indexed_grid(n_rows, n_head, 1u);
-        attention_indexed_mixed_decode_rows_kernel<<<indexed_grid, 256>>>(
-            (float *)heads->ptr, sinks, (const float *)q->ptr, table,
-            n_rows, n_head, head_dim);
-        if (!cuda_ok(cudaGetLastError(),
-                     "attention indexed decode rows launch")) {
-            return 0;
-        }
-    }
-
-    const uint32_t pairs = n_rows * n_head * (n_rot / 2u);
-    rope_tail_decode_rows_kernel<<<(pairs + 255u) / 256u, 256>>>(
-        (float *)heads->ptr, table, n_rows, n_head, head_dim, n_rot,
-        n_ctx_orig, 1, freq_base, freq_scale, ext_factor, attn_factor,
-        beta_fast, beta_slow);
-    return cuda_ok(cudaGetLastError(),
-                   "attention decode rows inverse rope launch");
-}
-
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
@@ -2462,7 +2133,6 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                window,
         uint32_t                n_head,
         uint32_t                head_dim) {
-#ifdef DS4_CUDA_SPARK_ONLY
     if (n_tokens > 1u && head_dim == 512u && heads && q && raw_kv && model_map &&
         n_raw != 0u && raw_cap >= n_raw && raw_start < raw_cap &&
         sinks_offset <= model_size &&
@@ -2483,7 +2153,6 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
             window, 1u, n_head);
         return rc == 1;
     }
-#endif
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
@@ -2967,27 +2636,6 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
                                        n_comp, window, ratio, n_head, head_dim);
 }
 
-extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
-        ds4_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        const ds4_gpu_tensor *comp_mask,
-        uint32_t                n_tokens,
-        uint32_t                n_comp,
-        uint32_t                window,
-        uint32_t                ratio,
-        uint32_t                n_head,
-        uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
-    return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
-                                       q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
-                                       n_comp, window, ratio, n_head, head_dim);
-}
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -3023,9 +2671,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out);
-    const int physical_device =
-        (g_n_gpus > 1 && logical_tier >= 0 && logical_tier < g_n_gpus)
-            ? g_gpu[logical_tier].device_id : 0;
+    const int physical_device = 0;
     const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
             cuda_resolve_weight_ptr(model_map, out_a_offset, out_a_bytes, logical_tier, "attn_out_a"));
     const unsigned char *out_b = reinterpret_cast<const unsigned char *>(
@@ -3331,63 +2977,6 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
             n_groups, 0u, n_groups, heads, 1u);
 }
 
-extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *low,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                out_a_offset,
-        uint64_t                out_b_offset,
-        uint64_t                group_dim,
-        uint64_t                rank,
-        uint32_t                n_groups_total,
-        uint32_t                group0,
-        uint32_t                group_cnt,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *heads) {
-    if (!out || !low || !heads || !model_map ||
-        group_dim == 0 || rank == 0 || n_groups_total == 0 ||
-        group_cnt == 0 || group0 > n_groups_total ||
-        group_cnt > n_groups_total - group0 || out_dim == 0) {
-        return 0;
-    }
-    const uint64_t blocks_a = (group_dim + 31u) / 32u;
-    const uint64_t row_a_bytes = blocks_a * 34u;
-    const uint64_t low_dim_total = (uint64_t)n_groups_total * rank;
-    const uint64_t k_off = (uint64_t)group0 * rank;
-    const uint64_t k_cnt = (uint64_t)group_cnt * rank;
-    if ((k_off % 32u) != 0 || (k_cnt % 32u) != 0) return 0;
-    if (heads->bytes < (uint64_t)(group0 + group_cnt) * group_dim * sizeof(float) ||
-        low->bytes < k_cnt * sizeof(float) ||
-        out->bytes < out_dim * sizeof(float)) {
-        return 0;
-    }
-
-    ds4_gpu_tensor heads_slice = *heads;
-    heads_slice.ptr = (char *)heads->ptr + (uint64_t)group0 * group_dim * sizeof(float);
-    heads_slice.bytes = (uint64_t)group_cnt * group_dim * sizeof(float);
-    heads_slice.owner = 0;
-
-    const uint64_t a_off = out_a_offset + (uint64_t)group0 * rank * row_a_bytes;
-    return ds4_gpu_attention_output_low_q8_tensor(low,
-                                                  model_map,
-                                                  model_size,
-                                                  a_off,
-                                                  group_dim,
-                                                  rank,
-                                                  group_cnt,
-                                                  &heads_slice) &&
-           ds4_gpu_matmul_q8_0_kslice_rows_tensor(out,
-                                             model_map,
-                                             model_size,
-                                             out_b_offset,
-                                             low_dim_total,
-                                             out_dim,
-                                             k_off,
-                                             k_cnt,
-                                             low,
-                                             1);
-}
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!out || !gate || !up ||
         out->bytes < (uint64_t)n * sizeof(float) ||
@@ -3423,92 +3012,6 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
 }
 
-extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
-        ds4_gpu_tensor       *mid,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        float                   clamp,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *prequant,
-        uint32_t                expert_split,
-        bool                    home_rank) {
-    if (!mid || !x || !model_map || in_dim == 0u || out_dim == 0u ||
-        x->bytes < in_dim * sizeof(float) ||
-        mid->bytes < out_dim * sizeof(float) ||
-        (selected && (selected->bytes < 6u * sizeof(int32_t) ||
-                      expert_split == 0u))) {
-        return 0;
-    }
-    const uint64_t blocks = (in_dim + 31u) / 32u;
-    if (gate_offset > model_size || up_offset > model_size ||
-        out_dim > UINT64_MAX / (blocks * 34u)) {
-        return 0;
-    }
-    const uint64_t weight_bytes = out_dim * blocks * 34u;
-    if (weight_bytes > model_size - gate_offset ||
-        weight_bytes > model_size - up_offset) {
-        return 0;
-    }
-    const int logical_tier = ds4_tensor_device_idx(x);
-    if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
-    if (selected && ds4_tensor_device_idx(selected) != logical_tier) return 0;
-    if (prequant && ds4_tensor_device_idx(prequant) != logical_tier) return 0;
-    const int mid_tier = ds4_tensor_device_idx(mid);
-    if (mid_tier != logical_tier && !g_gpu_peer_ok[logical_tier][mid_tier]) {
-        return 0;
-    }
-    const char *gate_w = cuda_resolve_weight_ptr(
-            model_map, gate_offset, weight_bytes, logical_tier,
-            "shared_mid_gate_exact");
-    const char *up_w = cuda_resolve_weight_ptr(
-            model_map, up_offset, weight_bytes, logical_tier,
-            "shared_mid_up_exact");
-    if (!gate_w || !up_w) return 0;
-
-    const uint64_t xq_bytes = blocks * 32u;
-    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
-    int8_t *xq;
-    float *xscale;
-    if (prequant) {
-        if (prequant->bytes < tmp_bytes) return 0;
-        xq = (int8_t *)prequant->ptr;
-        xscale = (float *)((char *)prequant->ptr + scale_offset);
-    } else {
-        void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes,
-                                      "shared mid q8 exact prequant");
-        if (!tmp) return 0;
-        xq = (int8_t *)tmp;
-        xscale = (float *)((char *)tmp + scale_offset);
-        quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, cuda_decode_stream()>>>(
-                xq, xscale, (const float *)x->ptr, in_dim, blocks);
-        if (!cuda_ok(cudaGetLastError(),
-                     "shared mid q8 exact quantize launch")) {
-            return 0;
-        }
-    }
-    shared_mid_q8_0_preq_warp8_exact_kernel<<<
-            ((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
-            (float *)mid->ptr,
-            (const unsigned char *)gate_w,
-            (const unsigned char *)up_w,
-            xq,
-            xscale,
-            in_dim,
-            out_dim,
-            blocks,
-            clamp,
-            selected ? (const int32_t *)selected->ptr : NULL,
-            expert_split,
-            home_rank,
-            cuda_q8_use_dp4a());
-    return cuda_ok(cudaGetLastError(), "shared mid q8 exact launch");
-}
 extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
     if (!out || !a || !b ||
         out->bytes < (uint64_t)n * sizeof(float) ||
@@ -3518,52 +3021,6 @@ extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, 
     return cuda_ok(cudaGetLastError(), "add launch");
 }
 
-#if 0
-extern "C" int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor *out,
-                                        const ds4_gpu_tensor *local,
-                                        const ds4_gpu_tensor *remote,
-                                        ds4_gpu_tensor *remote_tmp,
-                                        uint32_t n) {
-    if (!out || !local || !remote ||
-        out->bytes < (uint64_t)n * sizeof(float) ||
-        local->bytes < (uint64_t)n * sizeof(float) ||
-        remote->bytes < (uint64_t)n * sizeof(float)) return 0;
-    if (n == 0) return 1;
-
-    const int od = ds4_tensor_device_idx(out);
-    const int ld = ds4_tensor_device_idx(local);
-    const int rd = ds4_tensor_device_idx(remote);
-    if (od != ld) return 0;
-
-    const ds4_gpu_tensor *rhs = remote;
-    if (rd != od) {
-        if (!remote_tmp ||
-            remote_tmp->bytes < (uint64_t)n * sizeof(float) ||
-            ds4_tensor_device_idx(remote_tmp) != od) return 0;
-        if (!ds4_gpu_tensor_copy_xdev(remote_tmp, remote,
-                                      (uint64_t)n * sizeof(float))) return 0;
-        rhs = remote_tmp;
-    }
-
-    int ok = 0;
-    WITH_DEVICE(g_gpu[od].device_id) {
-        cudaStream_t s = (cudaStream_t)g_gpu[od].stream;
-        add_kernel<<<(n + 255u) / 256u, 256, 0, s>>>(
-                (float *)out->ptr,
-                (const float *)local->ptr,
-                (const float *)rhs->ptr,
-                n);
-        ok = cuda_ok(cudaGetLastError(), "xdev add launch");
-        cudaEvent_t e = (cudaEvent_t)g_gpu[od].boundary_event;
-        if (ok) ok = cuda_ok(cudaEventRecord(e, s), "xdev add event record");
-        if (ok) ok = cuda_ok(cudaStreamWaitEvent(0, e, 0), "xdev add default wait");
-        if (ok && g_xdev_sync_debug) {
-            ok = cuda_ok(cudaStreamSynchronize(s), "xdev add sync");
-        }
-    }
-    return ok;
-}
-#endif
 extern "C" int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,
@@ -3693,43 +3150,4 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                               hash_mode);
     }
     return cuda_ok(cudaGetLastError(), "router_select launch");
-}
-
-__device__ static DS4_CUDA_UNUSED void dev_dot_iq2_xxs_q8_K_block8(
-        const cuda_block_iq2_xxs *x,
-        const cuda_block_q8_K *y0,
-        const cuda_block_q8_K *y1,
-        const cuda_block_q8_K *y2,
-        const cuda_block_q8_K *y3,
-        const cuda_block_q8_K *y4,
-        const cuda_block_q8_K *y5,
-        const cuda_block_q8_K *y6,
-        const cuda_block_q8_K *y7,
-        uint32_t n,
-        float acc[8]) {
-    const float xd = dev_f16_to_f32(x->d);
-    const uint16_t *q2 = x->qs;
-    int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    const int8_t *q8[8] = {
-        y0 ? y0->qs : NULL, y1 ? y1->qs : NULL, y2 ? y2->qs : NULL, y3 ? y3->qs : NULL,
-        y4 ? y4->qs : NULL, y5 ? y5->qs : NULL, y6 ? y6->qs : NULL, y7 ? y7->qs : NULL,
-    };
-    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
-        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-        q2 += 4;
-        const uint32_t ls = 2u * (aux1 >> 28) + 1u;
-        const uint8_t a0 = (uint8_t)(aux0 & 0xffu);
-        const uint8_t a1 = (uint8_t)((aux0 >> 8) & 0xffu);
-        const uint8_t a2 = (uint8_t)((aux0 >> 16) & 0xffu);
-        const uint8_t a3 = (uint8_t)((aux0 >> 24) & 0xffu);
-        for (uint32_t p = 0; p < n; p++) {
-            int32_t sumi = 0;
-            sumi += dev_dot_iq2_pair_16(a0, (aux1 >> 0) & 127u, a1, (aux1 >> 7) & 127u, q8[p] + ib32 * 32);
-            sumi += dev_dot_iq2_pair_16(a2, (aux1 >> 14) & 127u, a3, (aux1 >> 21) & 127u, q8[p] + ib32 * 32 + 16);
-            bsum[p] += sumi * (int32_t)ls;
-        }
-    }
-    const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
-    for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
 }

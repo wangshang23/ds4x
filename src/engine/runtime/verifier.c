@@ -1,7 +1,6 @@
 #include "engine_internal.h"
 
 /* Verifier module. */
-#ifndef DS4_NO_GPU
 /* Greedy verifier helper.  Speculative decoding only needs the target model's
  * top token after most accepted draft rows; the full vocabulary row is needed
  * once, for the final committed state that normal sampling will continue from.
@@ -1311,5 +1310,3 @@ bool metal_graph_eval_dspark_stage_chain(
     }
     return true;
 }
-
-#endif /* !DS4_NO_GPU */

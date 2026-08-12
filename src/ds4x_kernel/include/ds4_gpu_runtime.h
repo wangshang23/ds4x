@@ -55,16 +55,11 @@ typedef struct {
     void *stream;
     void *cublas;
     int cublas_ready;
-    void *scratch;
-    size_t scratch_bytes;
-    size_t budget_bytes;
-    size_t used_bytes;
     void *boundary_event;
 } ds4_gpu_ctx;
 
 extern ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 extern int g_n_gpus;
-extern int g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 
 void ds4_gpu_cleanup(void);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int device_slot,
@@ -73,10 +68,6 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int device_slot,
                                                  uint64_t bytes);
 int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *tensor, int device_id,
                             uint64_t bytes);
-void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *tensor);
-int ds4_gpu_tensor_device(const ds4_gpu_tensor *tensor);
-int ds4_gpu_set_current_device(int device_slot);
-int ds4_gpu_set_current_device_fenced(int device_slot);
 int ds4_gpu_register_model_map_no_copy(const void *model_map,
                                        uint64_t model_size);
 

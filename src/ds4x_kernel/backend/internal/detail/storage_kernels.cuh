@@ -309,130 +309,6 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
 
 
 
-__device__ __forceinline__ static uint32_t q8_top1_float_ordered_key(float v) {
-    const uint32_t u = __float_as_uint(v);
-    return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
-}
-
-
-
-__device__ __forceinline__ static uint64_t q8_top1_pack_key(float v, uint32_t idx) {
-    return ((uint64_t)q8_top1_float_ordered_key(v) << 32u) |
-           (uint64_t)(0xffffffffu - idx);
-}
-
-
-
-__device__ __forceinline__ static float q8_top1_unpack_value(uint32_t ordered) {
-    const uint32_t u = (ordered & 0x80000000u)
-        ? (ordered ^ 0x80000000u)
-        : ~ordered;
-    return __uint_as_float(u);
-}
-
-
-
-__global__ static void matmul_q8_0_top1_preq_warp8_kernel(
-        unsigned long long *best_key,
-        const unsigned char *w,
-        const int8_t *xq,
-        const float *xscale,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks,
-        uint32_t index_offset,
-        int use_dp4a) {
-    const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + warp;
-    const bool valid = row < out_dim;
-    float acc = 0.0f;
-
-    if (valid) {
-        const unsigned char *wr = w + row * blocks * 34;
-        for (uint64_t b = lane; b < blocks; b += 32u) {
-            uint64_t i0 = b * 32;
-            uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
-            const __half *scale_h = (const __half *)(wr + b * 34);
-            const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
-            const int8_t *xqb = xq + b * 32;
-            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-            acc += __half2float(*scale_h) * xscale[b] * (float)dot;
-        }
-    }
-    acc = warp_sum_f32(acc);
-
-    __shared__ unsigned long long keys[8];
-    if (lane == 0u) {
-        keys[warp] = valid
-            ? (unsigned long long)q8_top1_pack_key(acc, index_offset + (uint32_t)row)
-            : 0ull;
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0u) {
-        unsigned long long block_best = keys[0];
-        #pragma unroll
-        for (uint32_t i = 1u; i < 8u; i++) {
-            if (keys[i] > block_best) block_best = keys[i];
-        }
-        (void)atomicMax(best_key, block_best);
-    }
-}
-
-
-
-__global__ static void matmul_q8_0_top1_unpack_kernel(
-        uint32_t *selected,
-        float *values,
-        const unsigned long long *best_key) {
-    if (threadIdx.x != 0u || blockIdx.x != 0u) return;
-    const uint64_t key = (uint64_t)best_key[0];
-    const uint32_t ordered = (uint32_t)(key >> 32u);
-    const uint32_t idx = 0xffffffffu - (uint32_t)key;
-    selected[0] = idx;
-    values[0] = q8_top1_unpack_value(ordered);
-}
-
-
-
-__global__ static void matmul_q8_0_kslice_preq_warp8_kernel(
-        float *out,
-        const unsigned char *w,
-        const int8_t *xq,
-        const float *xscale,
-        uint64_t slice_dim,
-        uint64_t out_dim,
-        uint64_t full_blocks,
-        uint64_t block_start,
-        uint64_t slice_blocks,
-        int use_dp4a) {
-    const uint64_t row =
-        (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
-    const uint64_t tok = blockIdx.y;
-    const uint32_t lane = threadIdx.x & 31u;
-    if (row >= out_dim) return;
-    out += tok * out_dim;
-    xq += tok * slice_blocks * 32u;
-    xscale += tok * slice_blocks;
-    const unsigned char *wr =
-        w + row * full_blocks * 34u + block_start * 34u;
-    float acc = 0.0f;
-    for (uint64_t b = lane; b < slice_blocks; b += 32u) {
-        uint64_t i0 = b * 32u;
-        uint64_t bn = slice_dim - i0 < 32u ? slice_dim - i0 : 32u;
-        const __half *scale_h = (const __half *)(wr + b * 34u);
-        const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
-        const int8_t *xqb = xq + b * 32u;
-        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
-    }
-    acc = warp_sum_f32(acc);
-    if (lane == 0) out[row] = acc;
-}
-
-
-
 __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
         float *out0,
         float *out1,
@@ -483,71 +359,6 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
 
 
 
-__global__ static void shared_mid_q8_0_preq_warp8_exact_kernel(
-        float *mid,
-        const unsigned char *gate_w,
-        const unsigned char *up_w,
-        const int8_t *xq,
-        const float *xscale,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks,
-        float clamp,
-        const int32_t *selected,
-        uint32_t expert_split,
-        bool home_rank,
-        int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
-    const uint32_t lane = threadIdx.x & 31u;
-    if (row >= out_dim) return;
-    if (selected) {
-        /* Complementary predicates select exactly one writer; ties stay on
-         * the home rank to avoid an unnecessary peer store. */
-        uint32_t home_count = 0u;
-        uint32_t peer_count = 0u;
-        #pragma unroll
-        for (uint32_t i = 0; i < 6u; i++) {
-            const int32_t expert = selected[i];
-            if (expert >= 0 && (uint32_t)expert < expert_split) {
-                home_count++;
-            } else if (expert >= 0 &&
-                       (uint32_t)expert < 2u * expert_split) {
-                peer_count++;
-            }
-        }
-        const bool assigned = home_rank
-            ? home_count <= peer_count : peer_count < home_count;
-        if (!assigned) return;
-    }
-    const unsigned char *gate_row = gate_w + row * blocks * 34u;
-    const unsigned char *up_row = up_w + row * blocks * 34u;
-    float gate = 0.0f;
-    float up = 0.0f;
-    for (uint64_t b = lane; b < blocks; b += 32u) {
-        const uint64_t i0 = b * 32u;
-        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-        const int8_t *xqb = xq + b * 32u;
-        const float xs = xscale[b];
-        const unsigned char *gb = gate_row + b * 34u;
-        const unsigned char *ub = up_row + b * 34u;
-        gate += __half2float(*(const __half *)gb) * xs *
-                (float)dot_i8_block((const int8_t *)(gb + 2u), xqb, bn,
-                                    use_dp4a);
-        up += __half2float(*(const __half *)ub) * xs *
-              (float)dot_i8_block((const int8_t *)(ub + 2u), xqb, bn,
-                                  use_dp4a);
-    }
-    gate = warp_sum_f32(gate);
-    up = warp_sum_f32(up);
-    if (lane == 0u) {
-        if (clamp > 1.0e-6f) {
-            gate = fminf(gate, clamp);
-            up = fminf(fmaxf(up, -clamp), clamp);
-        }
-        const float silu = gate / (1.0f + expf(-gate));
-        mid[row] = silu * up * 1.0f;
-    }
-}
 
 
 
@@ -715,9 +526,6 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         float *block_out,
         const float *block_add,
         const float *block_add2,
-        const float *owned_home_slots,
-        const float *owned_peer_packed,
-        const int32_t *owned_selected,
         const float *residual_hc,
         const float *split,
         const unsigned char *w,
@@ -730,8 +538,6 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         uint64_t blocks,
         int has_add,
         int has_add2,
-        int has_owned_slots,
-        uint32_t owned_expert_split,
         int use_dp4a) {
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
@@ -752,16 +558,7 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         const uint32_t d = (uint32_t)row;
         block_out[d] = acc;
         float block_v = acc;
-        if (has_owned_slots) {
-            const float routed = moe_owned_packed_combine_row(
-                    owned_home_slots,
-                    owned_peer_packed,
-                    owned_selected,
-                    d,
-                    (uint32_t)out_dim,
-                    owned_expert_split);
-            block_v = __fadd_rn(block_v, routed);
-        } else if (has_add) {
+        if (has_add) {
             float add_v = block_add[d];
             if (has_add2) add_v += block_add2[d];
             block_v += add_v;
@@ -1404,27 +1201,6 @@ __global__ static void dequant_q8_0_to_f16_kernel(
     const __half scale = *(const __half *)blk;
     const int8_t q = *(const int8_t *)(blk + 2 + j);
     out[gid] = __hmul(scale, __float2half((float)q));
-}
-
-
-
-__global__ static void dequant_q8_0_to_f32_kernel(
-        float *out,
-        const unsigned char *w,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks) {
-    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n = in_dim * out_dim;
-    if (gid >= n) return;
-    uint64_t row = gid / in_dim;
-    uint64_t i = gid - row * in_dim;
-    uint64_t b = i / 32;
-    uint64_t j = i - b * 32;
-    const unsigned char *blk = w + (row * blocks + b) * 34;
-    const float scale = __half2float(*(const __half *)blk);
-    const int8_t q = *(const int8_t *)(blk + 2 + j);
-    out[gid] = scale * (float)q;
 }
 
 

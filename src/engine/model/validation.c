@@ -20,15 +20,6 @@ static uint32_t required_u32(const ds4_model *m, const char *key) {
     return v;
 }
 
-static uint64_t required_u64_compat(const ds4_model *m, const char *key) {
-    uint64_t v = 0;
-    if (!model_get_u64_compat(m, key, &v)) {
-        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
-    }
-    return v;
-}
-
 static float required_f32(const ds4_model *m, const char *key) {
     float v = 0.0f;
     if (!model_get_f32_compat(m, key, &v)) {
@@ -155,24 +146,6 @@ static void tensor_expect_optional(
     if (t) tensor_expect_layout(t, type, ndim, d0, d1, d2);
 }
 
-static void tensor_expect_plain_layout(
-        const ds4_tensor *t,
-        uint32_t          ndim,
-        uint64_t          d0,
-        uint64_t          d1,
-        uint64_t          d2) {
-    if (!t) ds4_die("internal error: missing tensor while validating layout");
-    if (t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32) {
-        fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected F16 or F32\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type));
-        exit(1);
-    }
-    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
-}
-
 bool tensor_type_is_f16_or_q8_0(uint32_t type) {
     return type == DS4_TENSOR_F16 || type == DS4_TENSOR_Q8_0;
 }
@@ -200,26 +173,22 @@ bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K ||
-           type == DS4_TENSOR_Q5_K ||
-           type == DS4_TENSOR_Q6_K ||
            type == DS4_TENSOR_MXFP4;
 }
 
-static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
+static uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     case DS4_TENSOR_Q8_0:    return 34;
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
-    case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
-    case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
     case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
 }
 
-DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
+uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
     const gguf_type_info *info = tensor_type(t->type);
     if (!info || info->block_elems == 0) ds4_die("unsupported routed expert tensor type");
     if ((t->dim[0] % info->block_elems) != 0) ds4_die("routed expert row is not quant block aligned");
@@ -228,11 +197,6 @@ DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
 
 uint64_t ds4_add_sat_u64(uint64_t a, uint64_t b) {
     return a > UINT64_MAX - b ? UINT64_MAX : a + b;
-}
-
-static uint64_t ds4_mul_sat_u64(uint64_t a, uint64_t b) {
-    if (a != 0 && b > UINT64_MAX / a) return UINT64_MAX;
-    return a * b;
 }
 
 double ds4_bytes_to_gib(uint64_t bytes) {
@@ -346,16 +310,6 @@ bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
         return false;
     }
     if (il < DS4_N_HASH_LAYER && !l->ffn_gate_tid2eid) return false;
-    return true;
-}
-
-static bool weights_layers_bound(const ds4_weights *w, uint32_t layer_start, uint32_t layer_end) {
-    if (!w || layer_start >= DS4_N_LAYER) return false;
-    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
-    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) return false;
-    for (uint32_t il = layer_start; il <= layer_end; il++) {
-        if (!weights_layer_has_required(&w->layer[il], il)) return false;
-    }
     return true;
 }
 
@@ -885,13 +839,6 @@ static void config_expect_u32(const char *name, uint32_t got, uint32_t expected)
     exit(1);
 }
 
-static void config_expect_u64(const char *name, uint64_t got, uint64_t expected) {
-    if (got == expected) return;
-    fprintf(stderr, "ds4: expected %s=%" PRIu64 " for %s, got %" PRIu64 "\n",
-            name, expected, DS4_MODEL_SHAPE_NAME, got);
-    exit(1);
-}
-
 static void config_expect_f32(const char *name, float got, float expected) {
     const float scale = fabsf(expected) > 1.0f ? fabsf(expected) : 1.0f;
     if (fabsf(got - expected) <= scale * 1.0e-6f) return;
@@ -1139,170 +1086,4 @@ void weights_bind(
         weights_bind_layer(&w->layer[il], m, il);
     }
     weights_validate_layout(w, start, end, require_token_embd, require_output);
-}
-
-static void model_map_span_include_tensor(
-        const ds4_tensor *t,
-        uint64_t *lo,
-        uint64_t *hi,
-        uint64_t *max_tensor_bytes) {
-    if (!t || t->bytes == 0) return;
-    const uint64_t end = t->abs_offset + t->bytes;
-    if (*lo == UINT64_MAX || t->abs_offset < *lo) *lo = t->abs_offset;
-    if (end > *hi) *hi = end;
-    if (t->bytes > *max_tensor_bytes) *max_tensor_bytes = t->bytes;
-}
-
-static void model_map_span_vec_append(ds4_model_map_span_vec *spans, uint64_t lo, uint64_t hi, bool isolate) {
-    if (!spans || lo == UINT64_MAX || hi <= lo) return;
-    if (spans->len == spans->cap) {
-        uint32_t new_cap = spans->cap ? spans->cap * 2u : 16u;
-        spans->v = xrealloc(spans->v, (size_t)new_cap * sizeof(spans->v[0]));
-        spans->cap = new_cap;
-    }
-    spans->v[spans->len++] = (ds4_model_map_span){lo, hi, isolate};
-}
-
-static uint32_t model_map_q4_pro_group_views(void) {
-    uint32_t views = 1;
-    const char *env = getenv("DS4_METAL_Q4_PRO_MAP_GROUPS");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(env, &end, 10);
-        if (end != env && *end == '\0' && v > 0 && v <= 384 && (384u % (uint32_t)v) == 0) {
-            views = (uint32_t)v;
-        }
-    }
-    return views;
-}
-
-static void model_map_span_vec_include_one(ds4_model_map_span_vec *spans, const ds4_tensor *t) {
-    if (!t || t->bytes == 0) return;
-    const uint64_t q4_isolated_min_bytes = 2ull * 1024ull * 1024ull * 1024ull;
-    const uint32_t q4_pro_group_views = model_map_q4_pro_group_views();
-    if (t->type == DS4_TENSOR_Q4_K &&
-        t->ndim == 3 &&
-        t->dim[2] == 384 &&
-        t->bytes >= q4_isolated_min_bytes &&
-        (t->bytes % q4_pro_group_views) == 0)
-    {
-        /*
-         * PRO Q4 routed expert tensors are too large to hide inside broad
-         * layer spans. Isolate them so the default selected-expert path does
-         * not stack large aliases on top of layer-sized model views. Optional
-         * group splits are enabled by DS4_METAL_Q4_PRO_MAP_GROUPS for Metal
-         * experiments that bind stable grouped views.
-         */
-        const uint64_t group_bytes = t->bytes / q4_pro_group_views;
-        if (group_bytes > spans->max_tensor_bytes) spans->max_tensor_bytes = group_bytes;
-        for (uint32_t i = 0; i < q4_pro_group_views; i++) {
-            const uint64_t lo = t->abs_offset + (uint64_t)i * group_bytes;
-            model_map_span_vec_append(spans, lo, lo + group_bytes, true);
-        }
-        return;
-    }
-
-    uint64_t lo = UINT64_MAX, hi = 0;
-    model_map_span_include_tensor(t, &lo, &hi, &spans->max_tensor_bytes);
-    const bool isolate = (t->type == DS4_TENSOR_Q4_K ||
-                          t->type == DS4_TENSOR_MXFP4) &&
-                         t->bytes >= q4_isolated_min_bytes;
-    model_map_span_vec_append(spans, lo, hi, isolate);
-}
-
-static void model_map_span_vec_include_layer(ds4_model_map_span_vec *spans, const ds4_layer_weights *l) {
-#define DS4_INCLUDE_TENSOR(t_) model_map_span_vec_include_one(spans, (t_))
-    DS4_INCLUDE_TENSOR(l->hc_attn_fn);
-    DS4_INCLUDE_TENSOR(l->hc_attn_scale);
-    DS4_INCLUDE_TENSOR(l->hc_attn_base);
-    DS4_INCLUDE_TENSOR(l->attn_norm);
-    DS4_INCLUDE_TENSOR(l->attn_q_a);
-    DS4_INCLUDE_TENSOR(l->attn_q_a_norm);
-    DS4_INCLUDE_TENSOR(l->attn_q_b);
-    DS4_INCLUDE_TENSOR(l->attn_kv);
-    DS4_INCLUDE_TENSOR(l->attn_kv_a_norm);
-    DS4_INCLUDE_TENSOR(l->attn_sinks);
-    DS4_INCLUDE_TENSOR(l->attn_output_a);
-    DS4_INCLUDE_TENSOR(l->attn_output_b);
-    DS4_INCLUDE_TENSOR(l->attn_compressor_ape);
-    DS4_INCLUDE_TENSOR(l->attn_compressor_kv);
-    DS4_INCLUDE_TENSOR(l->attn_compressor_gate);
-    DS4_INCLUDE_TENSOR(l->attn_compressor_norm);
-    DS4_INCLUDE_TENSOR(l->indexer_attn_q_b);
-    DS4_INCLUDE_TENSOR(l->indexer_proj);
-    DS4_INCLUDE_TENSOR(l->indexer_compressor_ape);
-    DS4_INCLUDE_TENSOR(l->indexer_compressor_kv);
-    DS4_INCLUDE_TENSOR(l->indexer_compressor_gate);
-    DS4_INCLUDE_TENSOR(l->indexer_compressor_norm);
-    DS4_INCLUDE_TENSOR(l->hc_ffn_fn);
-    DS4_INCLUDE_TENSOR(l->hc_ffn_scale);
-    DS4_INCLUDE_TENSOR(l->hc_ffn_base);
-    DS4_INCLUDE_TENSOR(l->ffn_norm);
-    DS4_INCLUDE_TENSOR(l->ffn_gate_tid2eid);
-    DS4_INCLUDE_TENSOR(l->ffn_gate_inp);
-    DS4_INCLUDE_TENSOR(l->ffn_exp_probs_b);
-    DS4_INCLUDE_TENSOR(l->ffn_gate_exps);
-    DS4_INCLUDE_TENSOR(l->ffn_up_exps);
-    DS4_INCLUDE_TENSOR(l->ffn_down_exps);
-    DS4_INCLUDE_TENSOR(l->ffn_gate_shexp);
-    DS4_INCLUDE_TENSOR(l->ffn_up_shexp);
-    DS4_INCLUDE_TENSOR(l->ffn_down_shexp);
-#undef DS4_INCLUDE_TENSOR
-}
-
-static void model_map_span_vec_include_output(ds4_model_map_span_vec *spans, const ds4_weights *w) {
-    model_map_span_vec_include_one(spans, w->output_hc_base);
-    model_map_span_vec_include_one(spans, w->output_hc_fn);
-    model_map_span_vec_include_one(spans, w->output_hc_scale);
-    model_map_span_vec_include_one(spans, w->output_norm);
-    model_map_span_vec_include_one(spans, w->output);
-}
-
-static int model_map_span_cmp(const void *a, const void *b) {
-    const ds4_model_map_span *sa = a;
-    const ds4_model_map_span *sb = b;
-    if (sa->off < sb->off) return -1;
-    if (sa->off > sb->off) return 1;
-    if (sa->end < sb->end) return -1;
-    if (sa->end > sb->end) return 1;
-    return 0;
-}
-
-static bool model_map_span_vec_finish(ds4_model_map_span_vec *spans) {
-    if (!spans || spans->len == 0 || spans->max_tensor_bytes == 0) return false;
-
-    qsort(spans->v, spans->len, sizeof(spans->v[0]), model_map_span_cmp);
-    uint32_t out = 0;
-    for (uint32_t i = 0; i < spans->len; i++) {
-        if (out == 0 ||
-            spans->v[i].off > spans->v[out - 1u].end ||
-            spans->v[i].isolate ||
-            spans->v[out - 1u].isolate) {
-            spans->v[out++] = spans->v[i];
-        } else if (spans->v[i].end > spans->v[out - 1u].end) {
-            spans->v[out - 1u].end = spans->v[i].end;
-        }
-    }
-    spans->len = out;
-    return spans->len != 0;
-}
-
-static DS4_MAYBE_UNUSED bool weights_model_map_spans(
-        const ds4_weights *w,
-        uint32_t layer_start,
-        uint32_t layer_end,
-        bool include_output,
-        ds4_model_map_span_vec *spans) {
-    if (!w || !spans) return false;
-    if (layer_start >= DS4_N_LAYER) return false;
-    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
-    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) return false;
-
-    memset(spans, 0, sizeof(*spans));
-    if (layer_start == 0) model_map_span_vec_include_one(spans, w->token_embd);
-    for (uint32_t il = layer_start; il <= layer_end; il++) {
-        model_map_span_vec_include_layer(spans, &w->layer[il]);
-    }
-    if (include_output) model_map_span_vec_include_output(spans, w);
-    return model_map_span_vec_finish(spans);
 }

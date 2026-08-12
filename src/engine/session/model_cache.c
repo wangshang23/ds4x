@@ -87,11 +87,9 @@ static bool ds4_engine_map_model(ds4_engine *e,
             ? e->model.size - e->model.tensor_data_pos
             : 0;
 
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     (void)ds4_gpu_build_derived_artifacts(e->model.map,
                                           e->model.size,
                                           opt->model_path);
-#endif
     if (!ds4_gpu_set_model_map_range(e->model.map,
                                      e->model.size,
                                      e->model.tensor_data_pos,
@@ -189,14 +187,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 
     ds4_linux_graph_backend_set_oom_score(DS4_BACKEND_CUDA);
-    model_open(&e->model, opt->model_path, true, !opt->inspect_only);
+    model_open(&e->model, opt->model_path);
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model, false, 0, 0, false, false);
     vocab_load(&e->vocab, &e->model);
 
     if (opt->dspark_model_path && opt->dspark_model_path[0]) {
-        model_open(&e->support_model, opt->dspark_model_path, true, !opt->inspect_only);
+        model_open(&e->support_model, opt->dspark_model_path);
         ds4_dspark_summary summary = {0};
         e->support_kind =
             support_model_detect(&e->support_model, &e->support_stages, &summary);

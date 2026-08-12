@@ -25,31 +25,6 @@ float sigmoid_stable(float x) {
     return e / (1.0f + e);
 }
 
-static float softplus_stable(float x) {
-    if (x > 20.0f) return x;
-    if (x < -20.0f) return expf(x);
-    return log1pf(expf(x));
-}
-
-static void layer_hash_selected_experts(
-        int selected[DS4_MAX_EXPERT_USED],
-        const ds4_model *model,
-        const ds4_layer_weights *layer,
-        int token) {
-    const ds4_tensor *table_tensor = layer->ffn_gate_tid2eid;
-    if (!table_tensor || table_tensor->type != 26u ||
-        table_tensor->ndim != 2 ||
-        table_tensor->dim[0] != DS4_N_EXPERT_USED) {
-        ds4_die("hash routing table has an unexpected layout");
-    }
-    if (token < 0 || (uint64_t)token >= table_tensor->dim[1]) {
-        ds4_die("token id is outside the hash routing table");
-    }
-    const int32_t *table = tensor_data(model, table_tensor);
-    const int32_t *row = table + (uint64_t)token * DS4_N_EXPERT_USED;
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) selected[i] = row[i];
-}
-
 void quantize_q8_0_activation(const float *x,
                                      int8_t *xq,
                                      float *scale,

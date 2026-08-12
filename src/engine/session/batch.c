@@ -2,7 +2,6 @@
 
 /* Batch module. */
 
-#ifndef DS4_NO_GPU
 static int ds4_session_eval_dspark_speculative_argmax(
         ds4_session *s,
         int          n_accept,
@@ -382,7 +381,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
 #undef DS4_DSPARK_STATS_FINISH
     return n_accept;
 }
-#endif
 
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
@@ -415,8 +413,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         }
     }
 
-    if (ds4_session_eval_probe_tp(s, first_token, prepare_draft,
-                                  err, errlen) != 0) {
+    if (ds4_session_eval_probe_draft(s, first_token, prepare_draft,
+                                     err, errlen) != 0) {
         return -1;
     }
 

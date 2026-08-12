@@ -1,8 +1,7 @@
 #include "engine_internal.h"
 
 /* Output module. */
-#ifndef DS4_NO_GPU
-/* Encode the final HC collapse, output norm, and vocab projection on Metal. */
+/* Encode the final HC collapse, output norm, and vocab projection on CUDA. */
 bool metal_graph_encode_output_head(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -83,11 +82,11 @@ bool metal_graph_encode_output_head(
  * A target verifier only needs top-1 ids for intermediate draft rows and full
  * logits for the last accepted row.  Running the normal one-row output head in
  * a loop serializes the HC collapse, output norm, and Q8 vocab projection.  For
- * tiny MTP suffixes we instead process all rows together and let the GPU reduce
+ * tiny DSpark suffixes we instead process all rows together and let the GPU reduce
  * each row to a top id; the CPU reads back just those ids plus the last row's
  * logits needed to continue the exact target stream. */
-/* Shared vocab-head matmul: pads small batches to 8 rows for the exact-mma Q8
- * kernel and shards the vocabulary across output-TP tiers. */
+/* Shared vocab-head matmul pads small batches to 8 rows for the exact-mma Q8
+ * kernel. */
 bool metal_graph_output_logits_head_matmul(
         ds4_gpu_graph        *g,
         const ds4_model      *model,
@@ -240,7 +239,7 @@ bool metal_graph_matmul_plain_tensor(
                                            x,
                                            n_tok) != 0;
     }
-    fprintf(stderr, "ds4: Metal plain matmul does not support %s\n", tensor_type_name(w->type));
+    fprintf(stderr, "ds4: CUDA plain matmul does not support %s\n", tensor_type_name(w->type));
     return false;
 }
 
@@ -473,5 +472,3 @@ bool metal_graph_matmul_q8_0_named_tensor(
                                                 x,
                                                 n_tok);
 }
-
-#endif /* !DS4_NO_GPU */

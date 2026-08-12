@@ -167,8 +167,7 @@ extern "C" int ds4x_routed_moe_launch(
             args->expert_in_dim, args->expert_mid_dim, args->output_dim,
             args->selected, args->weights, args->total_experts,
             args->selected_experts, args->clamp, args->input,
-            args->add_input, args->layer,
-            args->force_resident);
+            args->add_input, args->layer);
 }
 
 extern "C" int ds4x_output_hc_supports(

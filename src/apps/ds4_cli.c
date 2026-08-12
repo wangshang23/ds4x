@@ -6,7 +6,7 @@
  *
  * One-shot mode builds a single model-family chat prompt and exits.  Interactive
  * mode keeps a rendered token transcript plus one ds4_session, so follow-up
- * turns reuse the live Metal KV checkpoint just like the server does.  The CLI
+ * turns reuse the live CUDA KV checkpoint.  The CLI
  * deliberately keeps policy here and leaves graph/cache mechanics inside the
  * engine API. */
 
@@ -112,16 +112,6 @@ static int parse_int(const char *s, const char *opt) {
     return (int)v;
 }
 
-static int parse_nonnegative_int(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT32_MAX) {
-        fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
 static uint64_t parse_u64(const char *s, const char *opt) {
     char *end = NULL;
     unsigned long long v = strtoull(s, &end, 10);
@@ -143,30 +133,14 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 }
 
 static ds4_backend parse_backend(const char *s) {
-    if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
-#else
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
-#endif
-    if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
-#ifdef DS4_ROCM_BUILD
-    fprintf(stderr, "ds4: valid backends are: metal, rocm, cpu\n");
-#else
-    fprintf(stderr, "ds4: valid backends are: metal, cuda, cpu\n");
-#endif
+    fprintf(stderr, "ds4: valid backend is: cuda\n");
     exit(2);
 }
 
 static ds4_backend default_backend(void) {
-#ifdef DS4_NO_GPU
-    return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
-#else
     return DS4_BACKEND_CUDA;
-#endif
 }
 
 static void log_context_memory(ds4_backend backend,
@@ -439,8 +413,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         fprintf(stderr, "ds4: sampled CLI generation requires a session backend\n");
         return 1;
     }
-    /* Pay the one-time first-submission GPU cost before the prefill timer
-     * starts (matches the TP worker's startup warmup). */
+    /* Pay the one-time first-submission GPU cost before the prefill timer. */
     ds4_session_gpu_warmup(session);
 
     char err[160];
@@ -486,7 +459,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     int generated = 0;
     const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
         ((ds4_engine_dspark_block_size(engine) > 1 &&
-          getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
+          getenv("DS4_DSPARK_SPEC_DISABLE") == NULL) ||
          cli_splitkv_spec_requested());
     const bool greedy_argmax = cfg->gen.temperature <= 0.0f &&
         cli_greedy_argmax_requested(speculative_argmax);
@@ -507,7 +480,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         int toks[17];
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f && ds4_engine_dspark_block_size(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            getenv("DS4_DSPARK_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -982,7 +955,7 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokenize_text(engine, text, &tokens);
     free(text);
 
-    /* Seed the graph with enough real context to stay on the normal Metal
+    /* Seed the graph with enough real context to stay on the normal CUDA
      * prefill path; scoring starts immediately after this fixed prefix. */
     const int prefix_len = 32;
     if (tokens.len <= prefix_len) {
@@ -1312,7 +1285,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     int generated = 0;
     const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
         ((ds4_engine_dspark_block_size(engine) > 1 &&
-          getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
+          getenv("DS4_DSPARK_SPEC_DISABLE") == NULL) ||
          cli_splitkv_spec_requested());
     const bool greedy_argmax = cfg->gen.temperature <= 0.0f &&
         cli_greedy_argmax_requested(speculative_argmax);
@@ -1337,7 +1310,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         int toks[17];
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f && ds4_engine_dspark_block_size(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            getenv("DS4_DSPARK_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,
@@ -1690,17 +1663,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
-        } else if (!strcmp(arg, "--cpu")) {
-            c.engine.backend = DS4_BACKEND_CPU;
-        } else if (!strcmp(arg, "--metal")) {
-            c.engine.backend = DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-        } else if (!strcmp(arg, "--rocm")) {
-            c.engine.backend = DS4_BACKEND_CUDA;
-#else
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
-#endif
         } else if (!strcmp(arg, "--dump-logits")) {
             c.gen.dump_logits_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logprobs")) {

@@ -11,21 +11,10 @@
  */
 
 const char *ds4_backend_name(ds4_backend backend) {
-    switch (backend) {
-    case DS4_BACKEND_METAL: return "metal";
-    case DS4_BACKEND_CUDA:
-#ifdef DS4_ROCM_BUILD
-        return "rocm";
-#else
-        return "cuda";
-#endif
-    case DS4_BACKEND_CPU:   return "cpu";
-    }
-    return "unknown";
+    return backend == DS4_BACKEND_CUDA ? "cuda" : "unknown";
 }
 
 void ds4_linux_graph_backend_set_oom_score(ds4_backend backend) {
-#if defined(__linux__) && !defined(DS4_NO_GPU)
     static bool attempted = false;
     if (attempted) return;
     attempted = true;
@@ -62,9 +51,6 @@ void ds4_linux_graph_backend_set_oom_score(ds4_backend backend) {
             "ds4: Linux %s backend set oom_score_adj=%d\n",
             ds4_backend_name(backend),
             score);
-#else
-    (void)backend;
-#endif
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
@@ -147,15 +133,6 @@ void ds4_acquire_instance_lock(void) {
     g_ds4_lock_fd = fd;
     atexit(ds4_release_instance_lock);
 }
-
-#ifndef DS4_NO_GPU
-
-
-#endif
-
-
-#ifndef DS4_NO_GPU
-
 
 void ds4_dspark_stats_note_len(
         uint64_t hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1u],
@@ -408,4 +385,3 @@ void ds4_session_dspark_scheduler_note(
     }
     ds4_session_dspark_scheduler_reset(s);
 }
-#endif

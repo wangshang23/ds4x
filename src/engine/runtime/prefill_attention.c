@@ -1,7 +1,6 @@
 #include "engine_internal.h"
 
 /* Prefill Attention module. */
-#ifndef DS4_NO_GPU
 bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -23,7 +22,6 @@ bool metal_graph_encode_layer_attention_batch(
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
     const bool spark_packed_prefill_batch =
-        g_n_gpus <= 1 &&
         getenv("DS4_CUDA_SPARK_PREFILL_REFERENCE") == NULL;
     const bool index_stage_profile =
         getenv("DS4_CUDA_INDEXER_STAGE_PROFILE") != NULL;
@@ -463,7 +461,7 @@ bool metal_graph_encode_layer_attention_batch(
         const bool have_attn_comp = layer->attn_compressor_kv && layer->attn_compressor_gate &&
                                     layer->attn_compressor_ape && layer->attn_compressor_norm;
         if (!have_attn_comp) {
-            fprintf(stderr, "ds4: Metal layer-major prefill needs attention compressor weights\n");
+            fprintf(stderr, "ds4: CUDA layer-major prefill needs attention compressor weights\n");
             ok = false;
         }
         if (ok) {
@@ -506,11 +504,11 @@ bool metal_graph_encode_layer_attention_batch(
         if (zero_prefix) {
             n_comp = n_tokens / ratio;
             if (ok && n_comp > g->layer_comp_cap[il]) {
-                fprintf(stderr, "ds4: Metal layer-major compressed KV cache capacity exceeded at layer %u\n", il);
+                fprintf(stderr, "ds4: CUDA layer-major compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
             if (ok && n_comp > g->attn_comp_stage_cap) {
-                fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
+                fprintf(stderr, "ds4: CUDA graph compressed KV staging capacity exceeded at layer %u\n", il);
                 ok = false;
             }
             ds4_gpu_tensor *attn_comp_target = NULL;
@@ -601,11 +599,11 @@ bool metal_graph_encode_layer_attention_batch(
                 const uint32_t comp_before = g->layer_n_comp[il];
                 const uint32_t comp_chunk = n_tokens / ratio;
                 if (comp_before + comp_chunk > g->layer_comp_cap[il]) {
-                    fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
+                    fprintf(stderr, "ds4: CUDA graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
                 if (ok && comp_chunk > g->attn_comp_stage_cap) {
-                    fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
+                    fprintf(stderr, "ds4: CUDA graph compressed KV staging capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
                 ds4_gpu_tensor *attn_comp_target =
@@ -710,7 +708,7 @@ bool metal_graph_encode_layer_attention_batch(
                     const uint32_t pos = pos0 + t;
                     const bool emit = ((pos + 1u) % ratio) == 0u;
                     if (emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) {
-                        fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
+                        fprintf(stderr, "ds4: CUDA graph compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
                         break;
                     }
@@ -781,7 +779,7 @@ bool metal_graph_encode_layer_attention_batch(
             if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
                 !layer->indexer_compressor_ape || !layer->indexer_compressor_norm ||
                 !layer->indexer_attn_q_b || !layer->indexer_proj) {
-                fprintf(stderr, "ds4: Metal layer-major prefill needs indexer weights\n");
+                fprintf(stderr, "ds4: CUDA layer-major prefill needs indexer weights\n");
                 ok = false;
             }
             if (ok) {
@@ -846,7 +844,7 @@ bool metal_graph_encode_layer_attention_batch(
                                                      n_tokens) != 0;
             if (zero_prefix) {
                 if (ok && n_comp > g->layer_comp_cap[il]) {
-                    fprintf(stderr, "ds4: Metal layer-major indexer cache capacity exceeded at layer %u\n", il);
+                    fprintf(stderr, "ds4: CUDA layer-major indexer cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
                 if (ok && n_comp > g->attn_comp_stage_cap) {
@@ -936,7 +934,7 @@ bool metal_graph_encode_layer_attention_batch(
                     const uint32_t index_before = g->layer_n_index_comp[il];
                     const uint32_t index_chunk = n_tokens / ratio;
                     if (index_before + index_chunk > g->layer_comp_cap[il]) {
-                        fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
+                        fprintf(stderr, "ds4: CUDA graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
                     }
                     if (ok && index_chunk > g->attn_comp_stage_cap) {
@@ -1031,7 +1029,7 @@ bool metal_graph_encode_layer_attention_batch(
                         const uint32_t pos = pos0 + t;
                         const bool emit = ((pos + 1u) % ratio) == 0u;
                         if (emit && g->layer_n_index_comp[il] >= g->layer_comp_cap[il]) {
-                            fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
+                            fprintf(stderr, "ds4: CUDA graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                             ok = false;
                             break;
                         }
@@ -1639,5 +1637,3 @@ bool metal_graph_encode_layer_attention_batch(
 #undef DS4_METAL_PROFILE_Q_STAGE
     return ok;
 }
-
-#endif /* !DS4_NO_GPU */

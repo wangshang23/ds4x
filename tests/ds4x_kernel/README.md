@@ -9,8 +9,6 @@ HTTP server.
 - `mmq/test_mmq_parity.cu` compares adapted quantized matrix kernels with CPU
   references.
 - `qkvo_fp4_probe.cu` is the isolated QKVO FP4 feasibility experiment.
-- `mmq/proto_*.cu` contains focused research probes and is not part of the
-  default regression target.
 
 Run the independent suite with:
 

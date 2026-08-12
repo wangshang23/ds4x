@@ -1,7 +1,6 @@
 #include "engine_internal.h"
 
 /* Dspark Verify module. */
-#ifndef DS4_NO_GPU
 /* Keep the support KV ring aligned while the scheduler skips proposals. */
 bool metal_graph_dspark_ring_maintain(
         ds4_gpu_graph            *g,
@@ -849,9 +848,8 @@ bool dspark_apply_markov_confidence_lazy_runtime(
         }
 
         int32_t token = -1;
-#ifndef __APPLE__
-        /* CUDA can apply the Markov bias and argmax without reading back the
-         * full logits row. Metal currently falls through to the CPU path. */
+        /* Apply the Markov bias and argmax without reading back the full
+         * logits row. */
         if (ok && !dspark_markov_bias_disabled() &&
             getenv("DS4_DSPARK_NO_GPU_MARKOV") == NULL &&
             g->dspark_draft_tokens &&
@@ -889,7 +887,6 @@ bool dspark_apply_markov_confidence_lazy_runtime(
                 continue;
             }
         }
-#endif
         if (ok) {
             ok = ds4_gpu_tensor_read(g->spec_logits,
                                      (uint64_t)draft * logits_bytes,
@@ -1022,5 +1019,3 @@ bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     }
     return true;
 }
-
-#endif /* !DS4_NO_GPU */

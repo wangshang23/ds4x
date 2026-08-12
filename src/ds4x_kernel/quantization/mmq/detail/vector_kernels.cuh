@@ -154,83 +154,6 @@ static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
     }
 }
 
-template <ggml_type type, int c_rows_per_block>
-static __global__ void ds4_mmq_moe_down_sum6_vec_kernel(
-        const void       * __restrict__ W,
-        const block_q8_1 * __restrict__ X_q8,
-        const int32_t    * __restrict__ ids,
-        float            * __restrict__ out,
-        const uint32_t ncols_x,
-        const uint32_t nrows_x,
-        const uint32_t n_tokens,
-        const uint32_t n_experts,
-        const uint32_t stride_row_x,
-        const uint32_t stride_col_y,
-        const uint32_t stride_channel_x) {
-
-    constexpr int top_k = 6;
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-
-    const uint32_t slot  = threadIdx.y;
-    const uint32_t token = blockIdx.y;
-    const uint32_t row0  = c_rows_per_block * blockIdx.x;
-
-    if (slot >= top_k || token >= n_tokens) {
-        return;
-    }
-
-    const uint32_t assignment = token * top_k + slot;
-    const int32_t  id_raw     = ids[assignment];
-    const bool     invalid_id = id_raw < 0 || (uint32_t)id_raw >= n_experts;
-    const uint32_t expert     = invalid_id ? 0u : (uint32_t)id_raw;
-
-    const int blocks_per_row_x = ncols_x / qk;
-    constexpr int blocks_per_iter = vdr * warp_size / qi;
-
-    const block_q8_1 * y = X_q8 + (uint64_t)assignment * stride_col_y;
-    const int kbx_offset = (int)(expert * stride_channel_x + row0 * stride_row_x);
-
-    float tmp[c_rows_per_block] = {0.0f};
-
-    for (int kbx = threadIdx.x / (qi / vdr); !invalid_id && kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk / QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi / vdr));
-
-#pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += ds4_mmq_vec_dot_q8_1<type>(
-                W, &y[kby], kbx_offset + i * stride_row_x + kbx, kqs);
-        }
-    }
-
-#pragma unroll
-    for (int i = 0; i < c_rows_per_block; ++i) {
-        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
-    }
-
-    __shared__ float partial[top_k][c_rows_per_block];
-    if (threadIdx.x < c_rows_per_block) {
-        const uint32_t row = row0 + threadIdx.x;
-        partial[slot][threadIdx.x] = row < nrows_x ? tmp[threadIdx.x] : 0.0f;
-    }
-    __syncthreads();
-
-    if (slot == 0 && threadIdx.x < c_rows_per_block) {
-        const uint32_t row = row0 + threadIdx.x;
-        if (row < nrows_x) {
-            float sum = 0.0f;
-#pragma unroll
-            for (int s = 0; s < top_k; ++s) {
-                sum += partial[s][threadIdx.x];
-            }
-            out[(uint64_t)token * nrows_x + row] = sum;
-        }
-    }
-}
-
 template <ggml_type type>
 int ds4_mmq_moe_down_sum6_vec_impl(
         const char    * tag,
@@ -319,160 +242,6 @@ int ds4_mmq_moe_down_sum6_vec_impl(
     return 0;
 }
 
-template <ggml_type type, int c_rows_per_block>
-static __global__ void ds4_mmq_moe_gate_up_mid_vec_kernel(
-        const void       * __restrict__ W_gate,
-        const void       * __restrict__ W_up,
-        const block_q8_1 * __restrict__ X_q8,
-        const int32_t    * __restrict__ ids,
-        const float      * __restrict__ weights,
-        float            * __restrict__ mid,
-        const uint32_t ncols_x,
-        const uint32_t nrows_x,
-        const uint32_t n_tokens,
-        const uint32_t n_experts,
-        const uint32_t stride_row_x,
-        const uint32_t stride_col_y,
-        const uint32_t stride_channel_x,
-        const float clamp) {
-
-    constexpr int top_k = 6;
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-
-    const uint32_t slot  = threadIdx.y;
-    const uint32_t token = blockIdx.y;
-    const uint32_t row0  = c_rows_per_block * blockIdx.x;
-
-    const uint32_t assignment = token * top_k + slot;
-    const int32_t  id_raw     = ids[assignment];
-    const bool     invalid_id = id_raw < 0 || (uint32_t)id_raw >= n_experts;
-    const uint32_t expert     = invalid_id ? 0u : (uint32_t)id_raw;
-
-    const int blocks_per_row_x = ncols_x / qk;
-    constexpr int blocks_per_iter = vdr * warp_size / qi;
-
-    const block_q8_1 * y = X_q8 + (uint64_t)token * stride_col_y;
-    const int kbx_offset = (int)(expert * stride_channel_x + row0 * stride_row_x);
-
-    float gate[c_rows_per_block] = {0.0f};
-    float up[c_rows_per_block]   = {0.0f};
-
-    for (int kbx = threadIdx.x / (qi / vdr); !invalid_id && kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk / QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi / vdr));
-
-#pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            const int row_kbx = kbx_offset + i * stride_row_x + kbx;
-            gate[i] += ds4_mmq_vec_dot_q8_1<type>(W_gate, &y[kby], row_kbx, kqs);
-            up[i]   += ds4_mmq_vec_dot_q8_1<type>(W_up,   &y[kby], row_kbx, kqs);
-        }
-    }
-
-#pragma unroll
-    for (int i = 0; i < c_rows_per_block; ++i) {
-        gate[i] = warp_reduce_sum<warp_size>(gate[i]);
-        up[i]   = warp_reduce_sum<warp_size>(up[i]);
-    }
-
-    if (threadIdx.x < c_rows_per_block) {
-        const uint32_t row = row0 + threadIdx.x;
-        if (row < nrows_x) {
-            float g = gate[threadIdx.x];
-            float u = up[threadIdx.x];
-            if (!isfinite(g)) g = 0.0f;
-            if (!isfinite(u)) u = 0.0f;
-            if (clamp > 1.0e-6f) {
-                if (g > clamp) g = clamp;
-                if (u > clamp) u = clamp;
-                if (u < -clamp) u = -clamp;
-            }
-            const float silu = g / (1.0f + expf(-g));
-            mid[(uint64_t)assignment * nrows_x + row] = silu * u * weights[assignment];
-        }
-    }
-}
-
-template <ggml_type type, int c_rows_per_block>
-static __global__ void ds4_mmq_moe_gate_up_mid_vec_by_slot_kernel(
-        const void       * __restrict__ W_gate,
-        const void       * __restrict__ W_up,
-        const block_q8_1 * __restrict__ X_q8,
-        const int32_t    * __restrict__ ids,
-        const float      * __restrict__ weights,
-        float            * __restrict__ mid,
-        const uint32_t ncols_x,
-        const uint32_t nrows_x,
-        const uint32_t n_experts,
-        const uint32_t stride_row_x,
-        const uint32_t stride_col_y,
-        const uint32_t stride_channel_x,
-        const uint32_t token0,
-        const float clamp) {
-
-    constexpr int top_k = 6;
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-
-    const uint32_t slot  = blockIdx.y;
-    const uint32_t token = token0 + threadIdx.y;
-    const uint32_t row0  = c_rows_per_block * blockIdx.x;
-
-    const uint32_t assignment = token * top_k + slot;
-    const int32_t  id_raw     = ids[assignment];
-    const bool     invalid_id = id_raw < 0 || (uint32_t)id_raw >= n_experts;
-    const uint32_t expert     = invalid_id ? 0u : (uint32_t)id_raw;
-
-    const int blocks_per_row_x = ncols_x / qk;
-    constexpr int blocks_per_iter = vdr * warp_size / qi;
-
-    const block_q8_1 * y = X_q8 + (uint64_t)token * stride_col_y;
-    const int kbx_offset = (int)(expert * stride_channel_x + row0 * stride_row_x);
-
-    float gate[c_rows_per_block] = {0.0f};
-    float up[c_rows_per_block]   = {0.0f};
-
-    for (int kbx = threadIdx.x / (qi / vdr); !invalid_id && kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk / QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi / vdr));
-
-#pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            const int row_kbx = kbx_offset + i * stride_row_x + kbx;
-            gate[i] += ds4_mmq_vec_dot_q8_1<type>(W_gate, &y[kby], row_kbx, kqs);
-            up[i]   += ds4_mmq_vec_dot_q8_1<type>(W_up,   &y[kby], row_kbx, kqs);
-        }
-    }
-
-#pragma unroll
-    for (int i = 0; i < c_rows_per_block; ++i) {
-        gate[i] = warp_reduce_sum<warp_size>(gate[i]);
-        up[i]   = warp_reduce_sum<warp_size>(up[i]);
-    }
-
-    if (threadIdx.x < c_rows_per_block) {
-        const uint32_t row = row0 + threadIdx.x;
-        if (row < nrows_x) {
-            float g = gate[threadIdx.x];
-            float u = up[threadIdx.x];
-            if (!isfinite(g)) g = 0.0f;
-            if (!isfinite(u)) u = 0.0f;
-            if (clamp > 1.0e-6f) {
-                if (g > clamp) g = clamp;
-                if (u > clamp) u = clamp;
-                if (u < -clamp) u = -clamp;
-            }
-            const float silu = g / (1.0f + expf(-g));
-            mid[(uint64_t)assignment * nrows_x + row] = silu * u * weights[assignment];
-        }
-    }
-}
-
 template <ggml_type type>
 int ds4_mmq_moe_gate_up_mid_vec_impl(
         const char    * tag,
@@ -518,11 +287,7 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
                                sizeof(block_q8_1) / QK8_1;
 
     ggml_cuda_pool_alloc<char> src1_q8_1_pool;
-    // M2-Inc2a: the fused HC stage may have emitted this activation's q8_1
-    // codes already (ffn_norm) -- take them and skip the quantize prelude.
-    char *src1_q8_1_ptr = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
-    cudaError_t err;
-    if (!src1_q8_1_ptr) {
+    char *src1_q8_1_ptr;
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         src1_q8_1_ptr = (char *)g_q81_scratch_ptr;
     } else {
@@ -537,14 +302,12 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
         /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
         stream);
 
-    err = cudaGetLastError();
+    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
                 tag, cudaGetErrorString(err));
         return -2;
     }
-    }
-
     const int64_t blck = ggml_blck_size(type);
     const uint32_t stride_row_x     = (uint32_t)((int64_t)K / blck);
     const uint32_t stride_col_y     = (uint32_t)(ne10_padded / QK8_1);
@@ -639,4 +402,3 @@ __global__ void iq2_xxs_aligned_derepack_kernel(
     const uint2 v = qs[blk * 8ull + p];
     memcpy(dst + 2u + (uint64_t)p * 8u, &v, 8u);
 }
-

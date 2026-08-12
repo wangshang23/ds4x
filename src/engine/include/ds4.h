@@ -11,9 +11,7 @@
 /* One GB10, one active request. A session owns the live KV cache and logits. */
 
 typedef enum {
-    DS4_BACKEND_METAL,
     DS4_BACKEND_CUDA,
-    DS4_BACKEND_CPU,
 } ds4_backend;
 
 typedef enum {
@@ -115,9 +113,7 @@ const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
-/* Stable id for cache compatibility.  0 is the original Flash shape, so old
- * KV files with the previously-zero reserved byte remain Flash-compatible;
- * Pro and later shapes must use nonzero ids. */
+/* Stable id for cache compatibility. Flash uses the original zero id. */
 int ds4_engine_model_id(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
@@ -125,8 +121,7 @@ const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
-/* Uses the active model shape selected by ds4_engine_open(); call after opening
- * the GGUF so Flash/Pro dimensions are known. */
+/* Uses the Flash shape validated by ds4_engine_open(). */
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size);
 ds4_context_memory ds4_context_memory_estimate_with_prefill(
         ds4_backend backend,
@@ -214,7 +209,6 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float *prob_scratch);
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
-uint64_t ds4_test_mixed_native_count(void);
 /* Seed a CUDA session at a synthetic decode frontier without replaying the
  * prefix. Intended only for long-context performance regression tests. */
 int ds4_test_session_seed_frontier(ds4_session *s, uint32_t pos,
@@ -224,8 +218,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
-/* Pay the one-time first-submission GPU cost outside any measured window;
- * used by the TP worker right after session create (no-op on CPU/GLM). */
+/* Pay the one-time CUDA submission cost outside measured prefill windows. */
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 

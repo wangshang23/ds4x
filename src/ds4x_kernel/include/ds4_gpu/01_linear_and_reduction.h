@@ -89,28 +89,6 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
-int ds4_gpu_indexer_top1_value_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *values,
-        const ds4_gpu_tensor *scores,
-        uint32_t              n_comp,
-        uint32_t              n_tokens,
-        uint32_t              index_offset);
-
-int ds4_gpu_matmul_q8_0_top1_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *values,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint64_t              in_dim,
-        uint64_t              out_dim,
-        const ds4_gpu_tensor *x,
-        uint32_t              index_offset);
-
-int ds4_gpu_set_decode_fast_attention(int enabled);
-int ds4_gpu_set_decode_score_vec4(int enabled);
-
 /* GPU argmax over n_vocab F32 logits. Writes the winning index as int32 at
  * out_idx[0]. Tie-break: lower index wins (matches host sample_argmax). */
 int ds4_gpu_argmax_tensor(

@@ -1,25 +1,12 @@
 #include "engine_internal.h"
 
 /* Decode Primitives module. */
-#ifndef DS4_NO_GPU
-/* =========================================================================
- * Metal Decode Release Helpers and Reference Fallbacks.
- * =========================================================================
- *
- * The normal generation path uses the fused helpers below.  The older unfused
- * kernels remain available as diagnostic reference paths selected only by the
- * DS4_METAL_DISABLE_*_FUSION environment switches.
- */
+/* Decode helpers and diagnostic fallbacks for the CUDA graph runtime. */
 
 static bool metal_graph_env_flag(const char *name, int *cache) {
     if (*cache == -1) {
-#ifdef DS4_ROCM_BUILD
-        (void)name;
-        *cache = 0;
-#else
         const char *env = getenv(name);
         *cache = env && env[0] && strcmp(env, "0") != 0;
-#endif
     }
     return *cache != 0;
 }
@@ -163,7 +150,6 @@ bool ds4x_graph_routed_moe(
         .input = metal_graph_ffn_norm(g),
         .add_input = NULL,
         .layer = layer_index,
-        .force_resident = false,
     };
     return ds4x_routed_moe_launch(metal_graph_runtime(g), &args) != 0;
 }
@@ -310,14 +296,12 @@ static float metal_graph_hc_norm_fusion_check_tolerance(void) {
     static float tolerance;
     if (initialized) return tolerance;
     tolerance = 2.0e-4f;
-#ifndef DS4_ROCM_BUILD
     const char *env = getenv("DS4_METAL_HC_NORM_FUSION_CHECK_TOL");
     if (env && env[0]) {
         char *end = NULL;
         const float v = strtof(env, &end);
         if (end != env && isfinite(v) && v > 0.0f) tolerance = v;
     }
-#endif
     initialized = 1;
     return tolerance;
 }
@@ -392,7 +376,7 @@ bool metal_graph_check_hc_norm_fusion(
         const float norm_rms = rms_abs_diff(fused_norm_cpu, ref_norm_cpu, n_embd);
         const float tol = metal_graph_hc_norm_fusion_check_tolerance();
         fprintf(stderr,
-                "ds4: Metal HC norm fusion check %s layer=%u pos=%u "
+                "ds4: CUDA HC norm fusion check %s layer=%u pos=%u "
                 "out_max=%g out_rms=%g norm_max=%g norm_rms=%g tol=%g\n",
                 label ? label : "hc",
                 il,
@@ -404,7 +388,7 @@ bool metal_graph_check_hc_norm_fusion(
                 tol);
         if (out_max > tol || norm_max > tol) {
             fprintf(stderr,
-                    "ds4: Metal HC norm fusion check failed for %s layer=%u pos=%u\n",
+                    "ds4: CUDA HC norm fusion check failed for %s layer=%u pos=%u\n",
                     label ? label : "hc",
                     il,
                     pos);
@@ -440,10 +424,6 @@ bool metal_graph_decode_kv_store(
                                              raw_row,
                                              DS4_N_HEAD_DIM,
                                              DS4_N_ROT) != 0;
-}
-
-static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
-    return DS4_SPARK_KV_ROW_BYTES;
 }
 
 uint32_t metal_graph_attn_comp_cache_format(void) {
@@ -604,5 +584,3 @@ uint32_t metal_graph_decode_indexer_sparse_threshold(
     }
     return 1024u;
 }
-
-#endif /* !DS4_NO_GPU */

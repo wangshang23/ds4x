@@ -40,7 +40,6 @@ typedef struct {
     const ds4_gpu_tensor *input;
     const ds4_gpu_tensor *add_input;
     uint32_t layer;
-    bool force_resident;
 } ds4x_routed_moe_args;
 
 int ds4x_routed_moe_supports(const ds4x_runtime_context *context,
